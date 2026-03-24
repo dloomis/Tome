@@ -1,0 +1,20 @@
+# Build artifacts
+Tome/.build/
+Tome/.swiftpm/
+dist/
+build/
+
+# macOS
+.DS_Store
+*.xcuserdata
+
+# IDE
+*.swp
+*~
+
+# Dev config
+CLAUDE.md
+AGENTS.md
+
+# Misc
+*.spec
