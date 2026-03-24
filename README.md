@@ -16,7 +16,7 @@
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v2, and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-app-vault.png" width="700" alt="Tome app with Obsidian vault graph view" />
+  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-app-vault.png?v=2" width="700" alt="Tome app with Obsidian vault graph view" />
 </p>
 
 ## Background
@@ -83,11 +83,11 @@ Tome does the first three. Your agent does the rest.
 ## Output
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-frontmatter.png" width="600" alt="Vault note with YAML frontmatter" />
+  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-frontmatter.png?v=2" width="600" alt="Vault note with YAML frontmatter" />
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-transcript.png" width="600" alt="Vault note transcript view" />
+  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-transcript.png?v=2" width="600" alt="Vault note transcript view" />
 </p>
 
 ```markdown
