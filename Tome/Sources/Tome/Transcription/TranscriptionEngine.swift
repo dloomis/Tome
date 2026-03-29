@@ -1,8 +1,97 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreAudio
 import FluidAudio
 import Observation
 import os
+import SpeakerKit
+import WhisperKit
+
+/// Offline re-transcriber: takes diarization segments and the system audio WAV,
+/// extracts each segment's audio, and runs Parakeet on it individually.
+final class SegmentReTranscriber: @unchecked Sendable {
+    private let asrManager: AsrManager
+    private let fileURL: URL
+    private let segments: [(speakerId: String, startTime: Float, endTime: Float)]
+
+    init(asrManager: AsrManager, fileURL: URL, segments: [(speakerId: String, startTime: Float, endTime: Float)]) {
+        self.asrManager = asrManager
+        self.fileURL = fileURL
+        self.segments = segments
+    }
+
+    func run() async -> [(speaker: String, text: String, startTime: Float)]? {
+        do {
+            let audioFile = try AVAudioFile(forReading: fileURL)
+            let sampleRate = audioFile.processingFormat.sampleRate
+            let totalFrames = AVAudioFrameCount(audioFile.length)
+
+            // Build friendly speaker labels
+            var speakerMap: [String: String] = [:]
+            var nextNum = 2
+            for seg in segments {
+                if speakerMap[seg.speakerId] == nil {
+                    speakerMap[seg.speakerId] = "Speaker \(nextNum)"
+                    nextNum += 1
+                }
+            }
+
+            // Merge consecutive segments from the same speaker
+            var merged: [(speakerId: String, startTime: Float, endTime: Float)] = []
+            for seg in segments {
+                if let last = merged.last, last.speakerId == seg.speakerId,
+                   seg.startTime - last.endTime < 0.5 {
+                    merged[merged.count - 1].endTime = seg.endTime
+                } else {
+                    merged.append(seg)
+                }
+            }
+
+            var output: [(speaker: String, text: String, startTime: Float)] = []
+
+            let minSamples = Int(sampleRate * 1.5) // 1.5 seconds to clear Parakeet's 1s minimum after resampling
+
+            for seg in merged {
+                var startFrame = AVAudioFramePosition(Double(seg.startTime) * sampleRate)
+                var endFrame = min(AVAudioFramePosition(Double(seg.endTime) * sampleRate), AVAudioFramePosition(totalFrames))
+                var frameCount = Int(endFrame - startFrame)
+
+                // Pad short segments to meet Parakeet's 1-second minimum
+                if frameCount < minSamples && frameCount > 0 {
+                    let deficit = minSamples - frameCount
+                    let padBefore = min(AVAudioFramePosition(deficit / 2), startFrame)
+                    let padAfter = min(deficit - Int(padBefore), Int(AVAudioFramePosition(totalFrames) - endFrame))
+                    startFrame -= padBefore
+                    endFrame += AVAudioFramePosition(padAfter)
+                    frameCount = Int(endFrame - startFrame)
+                }
+
+                guard frameCount > 0 else { continue }
+                let avFrameCount = AVAudioFrameCount(frameCount)
+
+                audioFile.framePosition = startFrame
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: avFrameCount) else { continue }
+                do {
+                    try audioFile.read(into: buffer, frameCount: avFrameCount)
+                    let result = try await asrManager.transcribe(buffer, source: .system)
+                    let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { continue }
+
+                    let label = speakerMap[seg.speakerId] ?? "Speaker 2"
+                    output.append((speaker: label, text: text, startTime: seg.startTime))
+                } catch {
+                    diagLog("[RETRANSCRIBE] Segment \(seg.startTime)-\(seg.endTime) failed: \(error.localizedDescription)")
+                    continue
+                }
+            }
+
+            diagLog("[RETRANSCRIBE] Produced \(output.count) segments from \(merged.count) merged diarization segments")
+            return output
+        } catch {
+            diagLog("[RETRANSCRIBE] FAILED: \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
 
 // Writes to /tmp/tome.log
 func diagLog(_ msg: String) {
@@ -30,6 +119,7 @@ final class TranscriptionEngine {
     private let systemCapture = SystemAudioCapture()
     private let micCapture = MicCapture()
     private let transcriptStore: TranscriptStore
+    private let settings: AppSettings
 
     /// Combined audio level from mic and system for the UI meter.
     var audioLevel: Float { max(micCapture.audioLevel, systemCapture.audioLevel) }
@@ -52,8 +142,9 @@ final class TranscriptionEngine {
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
-    init(transcriptStore: TranscriptStore) {
+    init(transcriptStore: TranscriptStore, settings: AppSettings) {
         self.transcriptStore = transcriptStore
+        self.settings = settings
     }
 
     func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil) async {
@@ -313,37 +404,91 @@ final class TranscriptionEngine {
         assetStatus = "Ready"
     }
 
-    /// Run offline diarization on the buffered system audio.
+    /// Run offline diarization on the buffered system audio using SpeakerKit (pyannote v4).
     /// Returns speaker segments (speakerId, startTime, endTime) or nil if no audio was buffered.
-    nonisolated func runPostSessionDiarization() async -> [(speakerId: String, startTime: Float, endTime: Float)]? {
+    nonisolated func runPostSessionDiarization(clusterThreshold: Float, numberOfSpeakers: Int) async -> [(speakerId: String, startTime: Float, endTime: Float)]? {
         guard let bufferURL = systemCapture.bufferFilePath,
               FileManager.default.fileExists(atPath: bufferURL.path) else {
             diagLog("[DIARIZE] No buffered system audio file found")
             return nil
         }
 
-        diagLog("[DIARIZE] Starting post-session diarization on \(bufferURL.lastPathComponent)")
+        diagLog("[DIARIZE] Starting SpeakerKit diarization on \(bufferURL.lastPathComponent)")
 
         do {
-            let diarizer = OfflineDiarizerManager()
+            // Load audio from WAV (resamples to 16kHz mono internally)
+            diagLog("[DIARIZE] Loading audio...")
+            let audioArray = try AudioProcessor.loadAudioAsFloatArray(fromPath: bufferURL.path)
 
-            diagLog("[DIARIZE] Preparing diarization models...")
-            try await diarizer.prepareModels()
+            // Initialize SpeakerKit (downloads pyannote v4 models on first run)
+            diagLog("[DIARIZE] Preparing SpeakerKit models...")
+            let speakerKit = try await SpeakerKit(PyannoteConfig())
 
-            diagLog("[DIARIZE] Processing audio...")
-            let result = try await diarizer.process(bufferURL)
+            // Configure diarization
+            let options = PyannoteDiarizationOptions(
+                numberOfSpeakers: numberOfSpeakers > 0 ? numberOfSpeakers : nil,
+                clusterDistanceThreshold: clusterThreshold
+            )
 
-            let segments = result.segments.map { seg in
-                (speakerId: seg.speakerId, startTime: seg.startTimeSeconds, endTime: seg.endTimeSeconds)
+            diagLog("[DIARIZE] Processing audio (clusterThreshold=\(clusterThreshold), numberOfSpeakers=\(numberOfSpeakers))...")
+            let result = try await speakerKit.diarize(audioArray: audioArray, options: options)
+
+            // Map SpeakerKit segments to Tome's data contract
+            let segments = result.segments.map { seg -> (speakerId: String, startTime: Float, endTime: Float) in
+                let id: String
+                switch seg.speaker {
+                case .speakerId(let speakerId):
+                    id = "SPEAKER_\(speakerId)"
+                case .multiple(let ids):
+                    id = "SPEAKER_\(ids.first ?? 0)"
+                case .noMatch:
+                    id = "SPEAKER_UNKNOWN"
+                }
+                return (speakerId: id, startTime: seg.startTime, endTime: seg.endTime)
             }
+
             diagLog("[DIARIZE] Found \(segments.count) segments, \(Set(segments.map(\.speakerId)).count) speakers")
 
-            systemCapture.cleanupBufferFile()
+            // NOTE: buffer file is NOT cleaned up here — re-transcription needs it.
             return segments
         } catch {
             diagLog("[DIARIZE] Failed: \(error.localizedDescription)")
             systemCapture.cleanupBufferFile()
             return nil
         }
+    }
+
+    /// Re-transcribe the system audio WAV using diarization segment boundaries.
+    /// Returns an array of (speakerLabel, text) tuples with one entry per diarization segment.
+    func reTranscribeWithDiarization(
+        segments: [(speakerId: String, startTime: Float, endTime: Float)]
+    ) async -> [(speaker: String, text: String, startTime: Float)]? {
+        guard let asrManager else {
+            diagLog("[RETRANSCRIBE] FAILED: No ASR manager available")
+            return nil
+        }
+        guard let bufferURL = systemCapture.bufferFilePath else {
+            diagLog("[RETRANSCRIBE] FAILED: No buffer file path set")
+            return nil
+        }
+        guard FileManager.default.fileExists(atPath: bufferURL.path) else {
+            diagLog("[RETRANSCRIBE] FAILED: Buffer file missing at \(bufferURL.path)")
+            return nil
+        }
+
+        diagLog("[RETRANSCRIBE] Starting re-transcription of \(segments.count) segments from \(bufferURL.lastPathComponent)")
+
+        let transcriber = SegmentReTranscriber(asrManager: asrManager, fileURL: bufferURL, segments: segments)
+        let results = await Task.detached {
+            await transcriber.run()
+        }.value
+
+        diagLog("[RETRANSCRIBE] Result: \(results?.count ?? -1) segments produced")
+        return results
+    }
+
+    /// Clean up the system audio buffer file.
+    func cleanupBuffer() {
+        systemCapture.cleanupBufferFile()
     }
 }

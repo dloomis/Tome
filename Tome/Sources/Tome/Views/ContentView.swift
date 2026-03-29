@@ -18,6 +18,7 @@ private let conferencingBundleIDs: [String: String] = [
 
 struct ContentView: View {
     @Bindable var settings: AppSettings
+    let apiServer: APIServer
     @State private var transcriptStore = TranscriptStore()
     @State private var transcriptionEngine: TranscriptionEngine?
     @State private var sessionStore = SessionStore()
@@ -91,8 +92,16 @@ struct ContentView: View {
                 showOnboarding = true
             }
             if transcriptionEngine == nil {
-                transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore)
+                transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore, settings: settings)
             }
+            apiServer.register(
+                transcriptStore: transcriptStore,
+                transcriptionEngine: transcriptionEngine!,
+                sessionStore: sessionStore,
+                onStart: { type in startSession(type: type) },
+                onStop: { stopSession() }
+            )
+            apiServer.start()
         }
         // Audio level polling
         .task {
@@ -121,6 +130,7 @@ struct ContentView: View {
                     continue
                 }
                 sessionElapsed += 1
+                apiServer.sessionElapsed = sessionElapsed
                 if audioLevel < 0.01 {
                     silenceSeconds += 1
                     if silenceSeconds >= 120 {
@@ -325,10 +335,22 @@ struct ContentView: View {
 
             if wasCallCapture {
                 transcriptionEngine?.assetStatus = "Identifying speakers..."
-                if let segments = await transcriptionEngine?.runPostSessionDiarization() {
-                    transcriptionEngine?.assetStatus = "Rewriting transcript..."
-                    await transcriptLogger.rewriteWithDiarization(segments: segments)
+                if let segments = await transcriptionEngine?.runPostSessionDiarization(
+                    clusterThreshold: Float(settings.diarizationClusterThreshold),
+                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                ) {
+                    transcriptionEngine?.assetStatus = "Re-transcribing with speaker labels..."
+                    diagLog("[STOP] Diarization found \(segments.count) segments, attempting re-transcription...")
+                    if let diarizedSegments = await transcriptionEngine?.reTranscribeWithDiarization(segments: segments) {
+                        diagLog("[STOP] Re-transcription succeeded with \(diarizedSegments.count) segments, rebuilding transcript")
+                        let sessionStart = await transcriptLogger.getLastSessionStartTime() ?? Date()
+                        await transcriptLogger.rebuildFromDiarizedSegments(diarizedSegments, sessionStartTime: sessionStart)
+                    } else {
+                        diagLog("[STOP] Re-transcription returned nil, falling back to relabel")
+                        await transcriptLogger.rewriteWithDiarization(segments: segments)
+                    }
                 }
+                transcriptionEngine?.cleanupBuffer()
             }
 
             transcriptionEngine?.assetStatus = "Finalizing..."

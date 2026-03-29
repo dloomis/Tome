@@ -28,6 +28,16 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(vaultVoicePath, forKey: "vaultVoicePath") }
     }
 
+    // MARK: - Diarization (SpeakerKit / pyannote v4)
+
+    var diarizationClusterThreshold: Double {
+        didSet { UserDefaults.standard.set(diarizationClusterThreshold, forKey: "diarizationClusterThreshold") }
+    }
+
+    var diarizationNumberOfSpeakers: Int {
+        didSet { UserDefaults.standard.set(diarizationNumberOfSpeakers, forKey: "diarizationNumberOfSpeakers") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -42,6 +52,15 @@ final class AppSettings {
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
+        // Diarization defaults (SpeakerKit)
+        self.diarizationClusterThreshold = defaults.object(forKey: "diarizationClusterThreshold") != nil
+            ? defaults.double(forKey: "diarizationClusterThreshold")
+            : (defaults.object(forKey: "diarizationThreshold") != nil
+                ? defaults.double(forKey: "diarizationThreshold") : 0.7)
+        self.diarizationNumberOfSpeakers = defaults.object(forKey: "diarizationNumberOfSpeakers") != nil
+            ? defaults.integer(forKey: "diarizationNumberOfSpeakers")
+            : (defaults.object(forKey: "diarizationMinSpeakers") != nil
+                ? defaults.integer(forKey: "diarizationMinSpeakers") : 0)
         // Default to true (hidden) if key has never been set
         if defaults.object(forKey: "hideFromScreenShare") == nil {
             self.hideFromScreenShare = true

@@ -66,6 +66,28 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
             }
 
+            Section("Speaker Diarization") {
+                HStack {
+                    Text("Cluster Distance Threshold")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text(String(format: "%.2f", settings.diarizationClusterThreshold))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, alignment: .trailing)
+                }
+                Slider(value: $settings.diarizationClusterThreshold, in: 0.3...1.0, step: 0.05)
+                Text("Lower = more speakers detected. Default: 0.70")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                Stepper("Number of Speakers: \(settings.diarizationNumberOfSpeakers)", value: $settings.diarizationNumberOfSpeakers, in: 0...10)
+                    .font(.system(size: 12))
+                Text("Expected speaker count. 0 = automatic. Default: 0")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Privacy") {
                 Toggle("Hide from screen sharing", isOn: $settings.hideFromScreenShare)
                     .font(.system(size: 12))
@@ -83,7 +105,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 450, height: 420)
+        .frame(width: 450, height: 540)
         .onAppear {
             inputDevices = MicCapture.availableInputDevices()
         }

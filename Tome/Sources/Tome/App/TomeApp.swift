@@ -7,10 +7,11 @@ struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
     private let updaterController = AppUpdaterController()
+    private let apiServer = APIServer()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(settings: settings)
+            ContentView(settings: settings, apiServer: apiServer)
                 .onAppear {
                     settings.applyScreenShareVisibility()
                 }

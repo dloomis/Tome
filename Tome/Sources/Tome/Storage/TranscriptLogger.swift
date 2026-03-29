@@ -27,6 +27,8 @@ actor TranscriptLogger {
     private var lastSpeakersDetected: Set<String> = []
     private var lastSessionContext: String = ""
 
+    func getLastSessionStartTime() -> Date? { lastSessionStartTime }
+
     func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture) throws {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
@@ -101,7 +103,9 @@ tags:
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
-        let label = labelForSpeaker(speaker)
+        // Keep "Them" as-is during recording so post-session diarization can find and replace it.
+        // "You" is always kept as "You".
+        let label = speaker == "You" ? "You" : "Them"
         speakersDetected.insert(label)
         utteranceBuffer.append((speaker: label, text: text, timestamp: timestamp))
         flushBuffer()  // Flush every utterance for crash safety
@@ -297,6 +301,103 @@ tags:
         }
     }
 
+    /// Rebuild the transcript by replacing all "Them" utterances with re-transcribed,
+    /// per-speaker segments from the diarization pipeline.
+    func rebuildFromDiarizedSegments(
+        _ diarizedSegments: [(speaker: String, text: String, startTime: Float)],
+        sessionStartTime: Date
+    ) {
+        guard let filePath = currentFilePath ?? lastSessionFilePath else { return }
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+
+        // Find the "## Transcript" section
+        guard let transcriptStart = content.range(of: "## Transcript\n") else { return }
+
+        // Separate the file into header (everything up to and including "## Transcript\n") and body
+        let header = String(content[..<transcriptStart.upperBound])
+
+        // Collect "You" utterances from the existing transcript body
+        let body = String(content[transcriptStart.upperBound...])
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm:ss"
+
+        // Parse existing You utterances to preserve them
+        let youPattern = #"\*\*You\*\* \((\d{2}:\d{2}:\d{2})\)\n(.*?)(?=\n\n|\z)"#
+        let youRegex = try? NSRegularExpression(pattern: youPattern, options: .dotMatchesLineSeparators)
+        var youUtterances: [(timestamp: Date, text: String)] = []
+        if let youRegex {
+            let nsBody = body as NSString
+            let youMatches = youRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
+            for match in youMatches {
+                let timeStr = nsBody.substring(with: match.range(at: 1))
+                let text = nsBody.substring(with: match.range(at: 2))
+                if let date = timeFmt.date(from: timeStr) {
+                    // Reconstruct full date from session start + time components
+                    let calendar = Calendar.current
+                    let timeComps = calendar.dateComponents([.hour, .minute, .second], from: date)
+                    var fullDate = calendar.dateComponents([.year, .month, .day], from: sessionStartTime)
+                    fullDate.hour = timeComps.hour
+                    fullDate.minute = timeComps.minute
+                    fullDate.second = timeComps.second
+                    if let reconstructed = calendar.date(from: fullDate) {
+                        youUtterances.append((timestamp: reconstructed, text: text))
+                    }
+                }
+            }
+        }
+
+        // Build combined timeline: diarized system segments + You utterances
+        struct TimelineEntry: Comparable {
+            let speaker: String
+            let text: String
+            let timestamp: Date
+            static func < (lhs: TimelineEntry, rhs: TimelineEntry) -> Bool {
+                lhs.timestamp < rhs.timestamp
+            }
+        }
+
+        var timeline: [TimelineEntry] = []
+
+        // Add diarized segments
+        let calendar = Calendar.current
+        for seg in diarizedSegments {
+            let segDate = sessionStartTime.addingTimeInterval(TimeInterval(seg.startTime))
+            timeline.append(TimelineEntry(speaker: seg.speaker, text: seg.text, timestamp: segDate))
+        }
+
+        // Add You utterances
+        for you in youUtterances {
+            timeline.append(TimelineEntry(speaker: "You", text: you.text, timestamp: you.timestamp))
+        }
+
+        timeline.sort()
+
+        // Rebuild transcript body
+        var newBody = ""
+        let allSpeakers = Set(timeline.map(\.speaker))
+        for entry in timeline {
+            newBody += "**\(entry.speaker)** (\(timeFmt.string(from: entry.timestamp)))\n"
+            newBody += "\(entry.text)\n\n"
+        }
+
+        // Update lastSpeakersDetected for finalizeFrontmatter
+        lastSpeakersDetected = allSpeakers
+
+        // Update speaker count in header
+        var updatedHeader = header
+        if let range = updatedHeader.range(of: #"\*\*Speakers:\*\* \d+"#, options: .regularExpression) {
+            updatedHeader.replaceSubrange(range, with: "**Speakers:** \(allSpeakers.count)")
+        }
+
+        content = updatedHeader + newBody
+
+        // Atomic write
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
+        try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: filePath)
+        try? FileManager.default.moveItem(at: tmpPath, to: filePath)
+    }
+
     /// Rewrite the transcript file, replacing "Them" labels with diarized speaker IDs.
     /// Segments are (speakerId, startTimeSeconds, endTimeSeconds) from the offline diarizer.
     func rewriteWithDiarization(segments: [(speakerId: String, startTime: Float, endTime: Float)]) {
@@ -324,40 +425,54 @@ tags:
         let nsContent = content as NSString
         let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
 
+        // Extract all utterance offsets so we can estimate end times
+        guard let sessionStart = sessionStartTime ?? lastSessionStartTime else { return }
+        let calendar = Calendar.current
+        let startComponents = calendar.dateComponents([.hour, .minute, .second], from: sessionStart)
+        let sessionStartSecs = (startComponents.hour ?? 0) * 3600 + (startComponents.minute ?? 0) * 60 + (startComponents.second ?? 0)
+
+        func offsetFor(_ timeStr: String) -> Float? {
+            guard let d = timeFmt.date(from: timeStr) else { return nil }
+            let c = calendar.dateComponents([.hour, .minute, .second], from: d)
+            let secs = (c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0)
+            return Float(secs - sessionStartSecs)
+        }
+
+        // Collect offsets for all matches
+        var matchOffsets: [Float] = []
+        for match in matches {
+            let timeStr = nsContent.substring(with: match.range(at: 1))
+            matchOffsets.append(offsetFor(timeStr) ?? 0)
+        }
+
         // Process in reverse so range offsets stay valid
-        for match in matches.reversed() {
-            let timeRange = match.range(at: 1)
-            let timeStr = nsContent.substring(with: timeRange)
+        for (idx, match) in matches.enumerated().reversed() {
+            let timeStr = nsContent.substring(with: match.range(at: 1))
+            let uttStart = matchOffsets[idx]
+            // Estimate end as start of next utterance, or start + 10s
+            let uttEnd = idx + 1 < matchOffsets.count ? matchOffsets[idx + 1] : uttStart + 10
 
-            // Parse the timestamp relative to session start
-            guard let sessionStart = sessionStartTime ?? lastSessionStartTime else { continue }
-            guard let utteranceDate = timeFmt.date(from: timeStr) else { continue }
-
-            // Calculate seconds from session start (timestamps are clock times on the same day)
-            let calendar = Calendar.current
-            let startComponents = calendar.dateComponents([.hour, .minute, .second], from: sessionStart)
-            let uttComponents = calendar.dateComponents([.hour, .minute, .second], from: utteranceDate)
-
-            let startSeconds = (startComponents.hour ?? 0) * 3600 + (startComponents.minute ?? 0) * 60 + (startComponents.second ?? 0)
-            let uttSeconds = (uttComponents.hour ?? 0) * 3600 + (uttComponents.minute ?? 0) * 60 + (uttComponents.second ?? 0)
-            let offsetSeconds = Float(uttSeconds - startSeconds)
-
-            // Find best matching segment
-            var bestMatch: String?
+            // Find dominant speaker across the utterance's time range
+            var speakerDurations: [String: Float] = [:]
             for seg in segments {
-                if offsetSeconds >= seg.startTime && offsetSeconds <= seg.endTime {
-                    bestMatch = diarSpeakerMap[seg.speakerId]
-                    break
+                let overlapStart = max(uttStart, seg.startTime)
+                let overlapEnd = min(uttEnd, seg.endTime)
+                if overlapStart < overlapEnd {
+                    let duration = overlapEnd - overlapStart
+                    let label = diarSpeakerMap[seg.speakerId] ?? seg.speakerId
+                    speakerDurations[label, default: 0] += duration
                 }
             }
 
-            // Also try closest segment if no exact overlap
+            var bestMatch = speakerDurations.max(by: { $0.value < $1.value })?.key
+
+            // Fallback: closest segment if no overlap found
             if bestMatch == nil {
                 var minDist: Float = .infinity
                 for seg in segments {
                     let midpoint = (seg.startTime + seg.endTime) / 2
-                    let dist = abs(offsetSeconds - midpoint)
-                    if dist < minDist && dist < 10 { // within 10 seconds
+                    let dist = abs(uttStart - midpoint)
+                    if dist < minDist && dist < 10 {
                         minDist = dist
                         bestMatch = diarSpeakerMap[seg.speakerId]
                     }
@@ -371,10 +486,22 @@ tags:
             }
         }
 
-        // Update speaker count in header and frontmatter
-        let allSpeakers = Set(diarSpeakerMap.values).union(["You"])
+        // Replace any remaining "Them" entries that weren't matched by diarization
+        // (fallback to "Speaker 2" if only one remote speaker or no segment match)
+        let fallbackLabel = diarSpeakerMap.isEmpty ? "Speaker 2" : diarSpeakerMap.values.sorted().first ?? "Speaker 2"
+        content = content.replacingOccurrences(of: "**Them**", with: "**\(fallbackLabel)**")
+
+        // Update lastSpeakersDetected so finalizeFrontmatter uses diarized names
+        let diarizedNames = Set(diarSpeakerMap.values)
+        let hasYou = lastSpeakersDetected.contains("You")
+        lastSpeakersDetected = diarizedNames
+        if hasYou { lastSpeakersDetected.insert("You") }
+        // Include fallback label if diarization found no speakers
+        if diarizedNames.isEmpty { lastSpeakersDetected.insert(fallbackLabel) }
+
+        // Update speaker count in header
         if let range = content.range(of: #"\*\*Speakers:\*\* \d+"#, options: .regularExpression) {
-            content.replaceSubrange(range, with: "**Speakers:** \(allSpeakers.count)")
+            content.replaceSubrange(range, with: "**Speakers:** \(lastSpeakersDetected.count)")
         }
 
         // Atomic write
