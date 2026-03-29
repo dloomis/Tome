@@ -176,6 +176,9 @@ final class APIServer {
         method: String, path: String, query: [String: String], body: Data?
     ) async -> (Int, String) {
         switch (method, path) {
+        case ("GET", "/"):
+            return (200, Self.openAPISpec)
+
         case ("GET", "/health"):
             return handleHealth()
 
@@ -650,6 +653,223 @@ final class APIServer {
         guard let data = try? jsonEncoder.encode(value) else { return "{}" }
         return String(data: data, encoding: .utf8) ?? "{}"
     }
+
+    // MARK: - OpenAPI Spec
+
+    // swiftlint:disable line_length
+    private static let openAPISpec = """
+    {
+      "openapi": "3.1.0",
+      "info": {
+        "title": "Tome API",
+        "description": "Local API for Tome, a macOS meeting transcription app. Binds to 127.0.0.1 only.",
+        "version": "1.0.0"
+      },
+      "servers": [
+        { "url": "http://127.0.0.1:{port}/api/v1", "description": "Local server (port written to ~/Library/Application Support/Tome/api-port)" }
+      ],
+      "paths": {
+        "/": {
+          "get": {
+            "summary": "OpenAPI specification",
+            "description": "Returns this OpenAPI spec as JSON.",
+            "responses": { "200": { "description": "OpenAPI JSON" } }
+          }
+        },
+        "/health": {
+          "get": {
+            "summary": "Health check",
+            "description": "Returns server status, whether models are loaded, and recording state.",
+            "responses": {
+              "200": {
+                "description": "Health status",
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
+              }
+            }
+          }
+        },
+        "/sessions": {
+          "get": {
+            "summary": "List sessions",
+            "description": "Returns completed and active sessions, newest first.",
+            "parameters": [
+              { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 50 }, "description": "Max sessions to return." },
+              { "name": "since", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "ISO 8601 date — only return sessions after this time." }
+            ],
+            "responses": {
+              "200": { "description": "Session list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionListResponse" } } } }
+            }
+          }
+        },
+        "/sessions/start": {
+          "post": {
+            "summary": "Start a recording session",
+            "requestBody": {
+              "required": true,
+              "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StartSessionRequest" } } }
+            },
+            "responses": {
+              "200": { "description": "Session started", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionStartResponse" } } } },
+              "400": { "description": "Invalid request body or session type" },
+              "409": { "description": "A session is already in progress" }
+            }
+          }
+        },
+        "/sessions/stop": {
+          "post": {
+            "summary": "Stop the active recording session",
+            "requestBody": {
+              "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StopSessionRequest" } } }
+            },
+            "responses": {
+              "200": { "description": "Session stopping", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionStopResponse" } } } },
+              "409": { "description": "No active session, or session ID mismatch" }
+            }
+          }
+        },
+        "/sessions/{sessionId}/status": {
+          "get": {
+            "summary": "Get session status",
+            "description": "Returns the current state of a session: loading, recording, diarizing, finalizing, or complete.",
+            "parameters": [
+              { "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }
+            ],
+            "responses": {
+              "200": { "description": "Session status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionStatusResponse" } } } },
+              "404": { "description": "Session not found" }
+            }
+          }
+        },
+        "/sessions/{sessionId}/transcript": {
+          "get": {
+            "summary": "Get session transcript",
+            "description": "Returns transcript lines, speaker info, and metadata. Works for both live and completed sessions.",
+            "parameters": [
+              { "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }
+            ],
+            "responses": {
+              "200": { "description": "Transcript data", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TranscriptResponse" } } } },
+              "404": { "description": "Session not found" }
+            }
+          }
+        }
+      },
+      "components": {
+        "schemas": {
+          "HealthResponse": {
+            "type": "object",
+            "properties": {
+              "status": { "type": "string", "example": "ok" },
+              "version": { "type": "string", "example": "1.0.0" },
+              "isRecording": { "type": "boolean" },
+              "modelsReady": { "type": "boolean" }
+            }
+          },
+          "StartSessionRequest": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": { "type": "string", "enum": ["callCapture", "voiceMemo"] },
+              "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
+            }
+          },
+          "MeetingContext": {
+            "type": "object",
+            "properties": {
+              "subject": { "type": "string" },
+              "attendees": { "type": "array", "items": { "type": "string" } },
+              "calendarEventId": { "type": "string" },
+              "startTime": { "type": "string", "format": "date-time" }
+            }
+          },
+          "StopSessionRequest": {
+            "type": "object",
+            "properties": {
+              "sessionId": { "type": "string", "description": "If provided, must match the active session." }
+            }
+          },
+          "SessionStartResponse": {
+            "type": "object",
+            "properties": {
+              "sessionId": { "type": "string" },
+              "status": { "type": "string", "enum": ["starting"] }
+            }
+          },
+          "SessionStopResponse": {
+            "type": "object",
+            "properties": {
+              "sessionId": { "type": "string" },
+              "status": { "type": "string", "enum": ["stopping"] }
+            }
+          },
+          "SessionStatusResponse": {
+            "type": "object",
+            "properties": {
+              "sessionId": { "type": "string" },
+              "status": { "type": "string", "enum": ["loading", "recording", "diarizing", "finalizing", "complete"] },
+              "elapsedSeconds": { "type": "integer" },
+              "speakerCount": { "type": "integer" },
+              "lineCount": { "type": "integer" }
+            }
+          },
+          "SessionListResponse": {
+            "type": "object",
+            "properties": {
+              "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/SessionSummary" } }
+            }
+          },
+          "SessionSummary": {
+            "type": "object",
+            "properties": {
+              "sessionId": { "type": "string" },
+              "title": { "type": "string" },
+              "recordingStart": { "type": "string", "format": "date-time" },
+              "dateCreated": { "type": "string", "format": "date-time" },
+              "durationSeconds": { "type": "integer" },
+              "speakerCount": { "type": "integer" },
+              "status": { "type": "string" }
+            }
+          },
+          "TranscriptResponse": {
+            "type": "object",
+            "properties": {
+              "lines": { "type": "array", "items": { "$ref": "#/components/schemas/TranscriptLine" } },
+              "metadata": { "$ref": "#/components/schemas/TranscriptMetadata" },
+              "speakers": { "type": "array", "items": { "$ref": "#/components/schemas/SpeakerInfo" } }
+            }
+          },
+          "TranscriptLine": {
+            "type": "object",
+            "properties": {
+              "speaker": { "type": "string" },
+              "text": { "type": "string" },
+              "startMs": { "type": "integer" }
+            }
+          },
+          "TranscriptMetadata": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string" },
+              "dateCreated": { "type": "string", "format": "date-time" },
+              "hasBeenDiarized": { "type": "boolean" },
+              "durationSec": { "type": "integer" },
+              "sourceApp": { "type": "string" }
+            }
+          },
+          "SpeakerInfo": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "id": { "type": "string" },
+              "isStub": { "type": "boolean", "description": "True if this speaker has not been identified by diarization." },
+              "lineCount": { "type": "integer" }
+            }
+          }
+        }
+      }
+    }
+    """
+    // swiftlint:enable line_length
 }
 
 // MARK: - String Helpers for Path Matching
