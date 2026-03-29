@@ -16,6 +16,12 @@ struct StartSessionRequest: Codable, Sendable {
     let meetingContext: MeetingContext?
 }
 
+/// Request body for POST /api/v1/start (WhisperCal integration)
+struct WhisperCalStartRequest: Codable, Sendable {
+    let suggestedFilename: String?
+    let meetingContext: MeetingContext?
+}
+
 /// Request body for POST /api/v1/sessions/stop
 struct StopSessionRequest: Codable, Sendable {
     let sessionId: String

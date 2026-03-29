@@ -21,8 +21,14 @@ actor TranscriptLogger {
     private var lastSessionStartTime: Date?
     private var lastSpeakersDetected: Set<String> = []
     private var lastSessionContext: String = ""
+    private var suggestedFilename: String?
+    private var lastSuggestedFilename: String?
 
     func getLastSessionStartTime() -> Date? { lastSessionStartTime }
+
+    func setSuggestedFilename(_ name: String?) {
+        suggestedFilename = name
+    }
 
     func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture) throws {
         self.sourceApp = sourceApp
@@ -178,12 +184,14 @@ tags:
         lastSessionStartTime = sessionStartTime
         lastSpeakersDetected = speakersDetected
         lastSessionContext = sessionContext
+        lastSuggestedFilename = suggestedFilename
 
         // Reset state immediately so next session can start
         currentFilePath = nil
         sessionStartTime = nil
         speakersDetected = []
         sessionContext = ""
+        suggestedFilename = nil
 
         // Frontmatter rewrite is NOT called here — caller must call
         // finalizeFrontmatter() AFTER diarization completes to avoid race.
@@ -200,11 +208,21 @@ tags:
             filePath: filePath,
             startTime: startTime,
             speakers: lastSpeakersDetected,
-            context: lastSessionContext
+            context: lastSessionContext,
+            suggestedFilename: lastSuggestedFilename
         )
 
         // Update lastSessionFilePath if the file was renamed
-        if !lastSessionContext.isEmpty {
+        if let suggested = lastSuggestedFilename, !suggested.isEmpty {
+            // WhisperCal provided a filename — use it directly
+            let sanitized = suggested
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+                .trimmingCharacters(in: .whitespaces)
+            let newFilename = "\(sanitized).md"
+            let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
+            lastSessionFilePath = newPath
+        } else if !lastSessionContext.isEmpty {
             let truncated = String(lastSessionContext.prefix(50))
                 .replacingOccurrences(of: "/", with: "-")
                 .replacingOccurrences(of: ":", with: "-")
@@ -221,6 +239,7 @@ tags:
         lastSessionStartTime = nil
         lastSpeakersDetected = []
         lastSessionContext = ""
+        lastSuggestedFilename = nil
         return savedPath
     }
 
@@ -228,7 +247,8 @@ tags:
         filePath: URL,
         startTime: Date,
         speakers: Set<String>,
-        context: String
+        context: String,
+        suggestedFilename: String? = nil
     ) {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
@@ -255,9 +275,22 @@ tags:
             content.replaceSubrange(range, with: "**Duration:** \(durationStr) | **Speakers:** \(speakers.count)")
         }
 
-        // Context-based file rename
+        // File rename: suggestedFilename takes precedence over context-based rename
         var finalPath = filePath
-        if !context.isEmpty {
+        if let suggested = suggestedFilename, !suggested.isEmpty {
+            let sanitized = suggested
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+                .trimmingCharacters(in: .whitespaces)
+            let newFilename = "\(sanitized).md"
+            let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
+
+            if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+                content.replaceSubrange(range, with: "source_file: \"\(newFilename)\"")
+            }
+
+            finalPath = newPath
+        } else if !context.isEmpty {
             let truncated = String(context.prefix(50))
                 .replacingOccurrences(of: "/", with: "-")
                 .replacingOccurrences(of: ":", with: "-")
@@ -269,7 +302,6 @@ tags:
             let newFilename = "\(datePrefix) \(truncated).md"
             let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 
-            // Update source_file in content
             if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
                 content.replaceSubrange(range, with: "source_file: \"\(newFilename)\"")
             }

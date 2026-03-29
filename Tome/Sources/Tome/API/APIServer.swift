@@ -1,6 +1,14 @@
 import Foundation
 import Network
 
+/// Lifecycle state for WhisperCal polling via GET /status.
+enum SessionLifecycleState: String, Codable, Sendable {
+    case idle
+    case recording
+    case transcribing
+    case complete
+}
+
 /// Local HTTP API server for WhisperCal integration.
 /// Binds to 127.0.0.1 only. Writes port to ~/Library/Application Support/Tome/api-port.
 @MainActor
@@ -19,14 +27,15 @@ final class APIServer {
     private weak var transcriptionEngine: TranscriptionEngine?
     private var sessionStore: SessionStore?
 
-    // Session control callbacks
-    private var onStartSession: ((SessionType, String, MeetingContext?) -> Void)?
+    // Session control callbacks (4th param is suggestedFilename from WhisperCal)
+    private var onStartSession: ((SessionType, String, MeetingContext?, String?) -> Void)?
     private var onStopSession: (() -> Void)?
 
     // Session tracking (written by ContentView, read by API handlers)
     private(set) var currentSessionId: String?
     var sessionElapsed: Int = 0
     private(set) var hasDiarizationCompleted: Bool = false
+    private(set) var lifecycleState: SessionLifecycleState = .idle
 
     init() {
         let appSupport = FileManager.default.urls(
@@ -42,7 +51,7 @@ final class APIServer {
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
-        onStart: @escaping (SessionType, String, MeetingContext?) -> Void,
+        onStart: @escaping (SessionType, String, MeetingContext?, String?) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.transcriptStore = transcriptStore
@@ -55,11 +64,22 @@ final class APIServer {
     /// Mark a session as started (called by ContentView after startSession succeeds).
     func sessionDidStart(id: String) {
         currentSessionId = id
+        lifecycleState = .recording
+    }
+
+    /// Mark that recording has stopped and post-processing has begun.
+    func sessionDidStop() {
+        lifecycleState = .transcribing
     }
 
     /// Mark diarization as complete for the current session.
     func diarizationDidComplete() {
         hasDiarizationCompleted = true
+    }
+
+    /// Mark that the transcript file has been finalized and written.
+    func sessionDidComplete() {
+        lifecycleState = .complete
     }
 
     // MARK: - Server Lifecycle
@@ -182,6 +202,17 @@ final class APIServer {
         case ("GET", "/health"):
             return handleHealth()
 
+        // WhisperCal simplified endpoints
+        case ("POST", "/start"):
+            return handleWhisperCalStart(body: body)
+
+        case ("POST", "/stop"):
+            return handleWhisperCalStop()
+
+        case ("GET", "/status"):
+            return handleWhisperCalStatus()
+
+        // Full session management endpoints
         case ("POST", "/sessions/start"):
             return handleStartSession(body: body)
 
@@ -221,6 +252,46 @@ final class APIServer {
         )))
     }
 
+    // MARK: - WhisperCal Handlers
+
+    private func handleWhisperCalStart(body: Data?) -> (Int, String) {
+        guard transcriptionEngine?.isRunning != true else {
+            return (409, #"{"error":"Already recording"}"#)
+        }
+
+        let req: WhisperCalStartRequest?
+        if let body, !body.isEmpty {
+            req = try? JSONDecoder().decode(WhisperCalStartRequest.self, from: body)
+        } else {
+            req = nil
+        }
+
+        let sessionId = SessionStore.generateSessionId()
+        currentSessionId = sessionId
+        sessionElapsed = 0
+        hasDiarizationCompleted = false
+
+        onStartSession?(.callCapture, sessionId, req?.meetingContext, req?.suggestedFilename)
+
+        return (200, #"{"ok":true}"#)
+    }
+
+    private func handleWhisperCalStop() -> (Int, String) {
+        guard transcriptionEngine?.isRunning == true || lifecycleState == .recording else {
+            return (409, #"{"error":"Not recording"}"#)
+        }
+
+        onStopSession?()
+
+        return (200, #"{"ok":true}"#)
+    }
+
+    private func handleWhisperCalStatus() -> (Int, String) {
+        return (200, #"{"state":"\#(lifecycleState.rawValue)"}"#)
+    }
+
+    // MARK: - Session Handlers
+
     private func handleStartSession(body: Data?) -> (Int, String) {
         guard let body,
               let req = try? JSONDecoder().decode(StartSessionRequest.self, from: body)
@@ -245,7 +316,7 @@ final class APIServer {
         sessionElapsed = 0
         hasDiarizationCompleted = false
 
-        onStartSession?(type, sessionId, req.meetingContext)
+        onStartSession?(type, sessionId, req.meetingContext, nil)
 
         return (200, encode(SessionStartResponse(
             sessionId: sessionId, status: "starting"
@@ -688,6 +759,41 @@ final class APIServer {
             }
           }
         },
+        "/start": {
+          "post": {
+            "summary": "Start call capture (WhisperCal)",
+            "description": "Starts a new call capture recording. Returns 409 if already recording.",
+            "requestBody": {
+              "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WhisperCalStartRequest" } } }
+            },
+            "responses": {
+              "200": { "description": "Recording started", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+              "409": { "description": "Already recording" }
+            }
+          }
+        },
+        "/stop": {
+          "post": {
+            "summary": "Stop recording (WhisperCal)",
+            "description": "Stops the active recording. Returns 409 if not recording.",
+            "responses": {
+              "200": { "description": "Recording stopped", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+              "409": { "description": "Not recording" }
+            }
+          }
+        },
+        "/status": {
+          "get": {
+            "summary": "Session lifecycle state (WhisperCal)",
+            "description": "Returns the lifecycle state of the current or most recent session. WhisperCal polls this after calling /stop, waiting for 'complete'.",
+            "responses": {
+              "200": {
+                "description": "Lifecycle state",
+                "content": { "application/json": { "schema": { "type": "object", "properties": { "state": { "type": "string", "enum": ["idle", "recording", "transcribing", "complete"] } } } } }
+              }
+            }
+          }
+        },
         "/sessions": {
           "get": {
             "summary": "List sessions",
@@ -763,6 +869,13 @@ final class APIServer {
               "version": { "type": "string", "example": "1.0.0" },
               "isRecording": { "type": "boolean" },
               "modelsReady": { "type": "boolean" }
+            }
+          },
+          "WhisperCalStartRequest": {
+            "type": "object",
+            "properties": {
+              "suggestedFilename": { "type": "string", "description": "Output filename (without extension) for matching the transcript back to the meeting note." },
+              "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
             }
           },
           "StartSessionRequest": {

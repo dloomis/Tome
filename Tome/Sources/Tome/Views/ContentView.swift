@@ -99,7 +99,7 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: sessionStore,
-                onStart: { type, sessionId, context in startSession(type: type, sessionId: sessionId, meetingContext: context) },
+                onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
             apiServer.start()
@@ -262,7 +262,7 @@ struct ContentView: View {
 
     // MARK: - Actions
 
-    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil) {
+    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil) {
         transcriptStore.clear()
         silenceSeconds = 0
         sessionElapsed = 0
@@ -310,6 +310,11 @@ struct ContentView: View {
                 return
             }
 
+            // Forward suggested filename from WhisperCal to the logger
+            if let suggestedFilename {
+                await transcriptLogger.setSuggestedFilename(suggestedFilename)
+            }
+
             // Forward meeting context from API callers to the transcript
             if let ctx = meetingContext, let subject = ctx.subject {
                 await transcriptLogger.updateContext(subject)
@@ -337,6 +342,7 @@ struct ContentView: View {
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
+        apiServer.sessionDidStop()
 
         Task {
             await transcriptionEngine?.stop()
@@ -367,6 +373,7 @@ struct ContentView: View {
             transcriptionEngine?.assetStatus = "Finalizing..."
             let savedPath = await transcriptLogger.finalizeFrontmatter()
             transcriptionEngine?.assetStatus = "Ready"
+            apiServer.sessionDidComplete()
 
             if activeSessionType == nil, let savedPath {
                 savedFileURL = savedPath
