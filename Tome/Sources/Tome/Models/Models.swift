@@ -19,6 +19,21 @@ struct Utterance: Identifiable, Codable, Sendable {
     }
 }
 
+// MARK: - Speaker Labels
+
+/// Maps raw diarization speaker IDs to friendly labels ("Speaker 2", "Speaker 3", etc.).
+/// Numbering starts at 2 because "You" is always the implicit first speaker.
+/// Labels are assigned in encounter order.
+func speakerLabels(from orderedIds: some Sequence<String>) -> [String: String] {
+    var map: [String: String] = [:]
+    var next = 2
+    for id in orderedIds where map[id] == nil {
+        map[id] = "Speaker \(next)"
+        next += 1
+    }
+    return map
+}
+
 // MARK: - Session Record
 
 /// Codable record for JSONL session persistence

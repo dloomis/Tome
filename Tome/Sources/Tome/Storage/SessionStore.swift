@@ -15,10 +15,15 @@ actor SessionStore {
         encoder.dateEncodingStrategy = .iso8601
     }
 
-    func startSession() {
+    /// Generate a timestamp-based session ID matching the JSONL filename stem.
+    static func generateSessionId() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let filename = "session_\(formatter.string(from: Date())).jsonl"
+        return "session_\(formatter.string(from: Date()))"
+    }
+
+    func startSession(sessionId: String) {
+        let filename = "\(sessionId).jsonl"
         currentFile = sessionsDirectory.appendingPathComponent(filename)
 
         FileManager.default.createFile(atPath: currentFile!.path, contents: nil)

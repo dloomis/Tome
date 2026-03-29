@@ -16,11 +16,6 @@ actor TranscriptLogger {
     private var sourceApp: String = "manual"
     private var sessionContext: String = ""
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
-    private var speakerCounter: Int = 1  // starts at 1, "You" is implicit
-
-    // Map from raw speaker identity to display label
-    private var speakerLabels: [String: String] = [:]
-
     // Retained from last session for post-session diarization and frontmatter finalization
     private var lastSessionFilePath: URL?
     private var lastSessionStartTime: Date?
@@ -33,8 +28,6 @@ actor TranscriptLogger {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []
-        self.speakerLabels = [:]
-        self.speakerCounter = 1
         self.sessionContext = ""
         self.utteranceBuffer = []
 
@@ -165,8 +158,7 @@ tags:
         // Atomic write
         let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        try? FileManager.default.removeItem(at: filePath)
-        try? FileManager.default.moveItem(at: tmpPath, to: filePath)
+        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
 
         // Reopen file handle
         fileHandle = try? FileHandle(forWritingTo: filePath)
@@ -192,8 +184,6 @@ tags:
         sessionStartTime = nil
         speakersDetected = []
         sessionContext = ""
-        speakerLabels = [:]
-        speakerCounter = 1
 
         // Frontmatter rewrite is NOT called here — caller must call
         // finalizeFrontmatter() AFTER diarization completes to avoid race.
@@ -206,7 +196,7 @@ tags:
         guard let filePath = lastSessionFilePath,
               let startTime = lastSessionStartTime else { return nil }
 
-        await Self.rewriteFrontmatter(
+        Self.rewriteFrontmatter(
             filePath: filePath,
             startTime: startTime,
             speakers: lastSpeakersDetected,
@@ -239,7 +229,7 @@ tags:
         startTime: Date,
         speakers: Set<String>,
         context: String
-    ) async {
+    ) {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
         // Calculate duration
@@ -292,12 +282,11 @@ tags:
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
 
         if finalPath != filePath {
-            // Rename: remove old, move tmp to new name
-            try? FileManager.default.removeItem(at: filePath)
-            try? FileManager.default.moveItem(at: tmpPath, to: finalPath)
+            // Rename: atomically replace original, then move to new name
+            _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+            try? FileManager.default.moveItem(at: filePath, to: finalPath)
         } else {
-            try? FileManager.default.removeItem(at: filePath)
-            try? FileManager.default.moveItem(at: tmpPath, to: filePath)
+            _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
         }
     }
 
@@ -359,7 +348,6 @@ tags:
         var timeline: [TimelineEntry] = []
 
         // Add diarized segments
-        let calendar = Calendar.current
         for seg in diarizedSegments {
             let segDate = sessionStartTime.addingTimeInterval(TimeInterval(seg.startTime))
             timeline.append(TimelineEntry(speaker: seg.speaker, text: seg.text, timestamp: segDate))
@@ -394,8 +382,7 @@ tags:
         // Atomic write
         let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        try? FileManager.default.removeItem(at: filePath)
-        try? FileManager.default.moveItem(at: tmpPath, to: filePath)
+        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
     }
 
     /// Rewrite the transcript file, replacing "Them" labels with diarized speaker IDs.
@@ -405,14 +392,7 @@ tags:
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
         // Build a map of unique diarization speaker IDs → friendly labels (Speaker 2, 3, etc.)
-        var diarSpeakerMap: [String: String] = [:]
-        var nextSpeakerNum = 2
-        for seg in segments {
-            if diarSpeakerMap[seg.speakerId] == nil {
-                diarSpeakerMap[seg.speakerId] = "Speaker \(nextSpeakerNum)"
-                nextSpeakerNum += 1
-            }
-        }
+        let diarSpeakerMap = speakerLabels(from: segments.map(\.speakerId))
 
         // Parse transcript lines and re-attribute "Them" utterances based on timestamp overlap
         let timeFmt = DateFormatter()
@@ -507,23 +487,7 @@ tags:
         // Atomic write
         let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        try? FileManager.default.removeItem(at: filePath)
-        try? FileManager.default.moveItem(at: tmpPath, to: filePath)
+        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
     }
 
-    private func labelForSpeaker(_ rawSpeaker: String) -> String {
-        // "You" always maps to "You"
-        if rawSpeaker.lowercased() == "you" { return "You" }
-
-        // Check if we already assigned a label
-        if let existing = speakerLabels[rawSpeaker] {
-            return existing
-        }
-
-        // Assign new label
-        speakerCounter += 1
-        let label = "Speaker \(speakerCounter)"
-        speakerLabels[rawSpeaker] = label
-        return label
-    }
 }

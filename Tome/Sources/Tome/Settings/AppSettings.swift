@@ -52,21 +52,25 @@ final class AppSettings {
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
-        // Diarization defaults (SpeakerKit)
-        self.diarizationClusterThreshold = defaults.object(forKey: "diarizationClusterThreshold") != nil
-            ? defaults.double(forKey: "diarizationClusterThreshold")
-            : (defaults.object(forKey: "diarizationThreshold") != nil
-                ? defaults.double(forKey: "diarizationThreshold") : 0.7)
-        self.diarizationNumberOfSpeakers = defaults.object(forKey: "diarizationNumberOfSpeakers") != nil
-            ? defaults.integer(forKey: "diarizationNumberOfSpeakers")
-            : (defaults.object(forKey: "diarizationMinSpeakers") != nil
-                ? defaults.integer(forKey: "diarizationMinSpeakers") : 0)
-        // Default to true (hidden) if key has never been set
-        if defaults.object(forKey: "hideFromScreenShare") == nil {
-            self.hideFromScreenShare = true
-        } else {
-            self.hideFromScreenShare = defaults.bool(forKey: "hideFromScreenShare")
-        }
+        self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
+        self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
+        self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
+            ? true
+            : defaults.bool(forKey: "hideFromScreenShare")
+    }
+
+    // MARK: - Legacy Key Migration
+
+    private static func migratedDouble(_ defaults: UserDefaults, key: String, legacyKey: String, fallback: Double) -> Double {
+        if defaults.object(forKey: key) != nil { return defaults.double(forKey: key) }
+        if defaults.object(forKey: legacyKey) != nil { return defaults.double(forKey: legacyKey) }
+        return fallback
+    }
+
+    private static func migratedInt(_ defaults: UserDefaults, key: String, legacyKey: String, fallback: Int) -> Int {
+        if defaults.object(forKey: key) != nil { return defaults.integer(forKey: key) }
+        if defaults.object(forKey: legacyKey) != nil { return defaults.integer(forKey: legacyKey) }
+        return fallback
     }
 
     /// Apply current screen-share visibility to all app windows.

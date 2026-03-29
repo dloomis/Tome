@@ -92,13 +92,14 @@ struct ContentView: View {
                 showOnboarding = true
             }
             if transcriptionEngine == nil {
-                transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore, settings: settings)
+                transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore)
             }
+            guard let engine = transcriptionEngine else { return }
             apiServer.register(
                 transcriptStore: transcriptStore,
-                transcriptionEngine: transcriptionEngine!,
+                transcriptionEngine: engine,
                 sessionStore: sessionStore,
-                onStart: { type in startSession(type: type) },
+                onStart: { type, sessionId, context in startSession(type: type, sessionId: sessionId, meetingContext: context) },
                 onStop: { stopSession() }
             )
             apiServer.start()
@@ -261,12 +262,14 @@ struct ContentView: View {
 
     // MARK: - Actions
 
-    private func startSession(type: SessionType) {
+    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil) {
         transcriptStore.clear()
         silenceSeconds = 0
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
+
+        let sid = sessionId ?? SessionStore.generateSessionId()
 
         // Determine output folder and app bundle ID based on session type
         let outputPath: String
@@ -293,7 +296,8 @@ struct ContentView: View {
 
         Task {
             transcriptionEngine?.lastError = nil
-            await sessionStore.startSession()
+            await sessionStore.startSession(sessionId: sid)
+            apiServer.sessionDidStart(id: sid)
             do {
                 try await transcriptLogger.startSession(
                     sourceApp: sourceApp,
@@ -305,6 +309,12 @@ struct ContentView: View {
                 transcriptionEngine?.lastError = error.localizedDescription
                 return
             }
+
+            // Forward meeting context from API callers to the transcript
+            if let ctx = meetingContext, let subject = ctx.subject {
+                await transcriptLogger.updateContext(subject)
+            }
+
             activeSessionType = type
             detectedAppName = resolvedAppName
             if type == .callCapture {
@@ -351,6 +361,7 @@ struct ContentView: View {
                     }
                 }
                 transcriptionEngine?.cleanupBuffer()
+                apiServer.diarizationDidComplete()
             }
 
             transcriptionEngine?.assetStatus = "Finalizing..."

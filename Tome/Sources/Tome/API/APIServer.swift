@@ -3,7 +3,6 @@ import Network
 
 /// Local HTTP API server for WhisperCal integration.
 /// Binds to 127.0.0.1 only. Writes port to ~/Library/Application Support/Tome/api-port.
-@Observable
 @MainActor
 final class APIServer {
     private var listener: NWListener?
@@ -13,6 +12,7 @@ final class APIServer {
         e.dateEncodingStrategy = .iso8601
         return e
     }()
+    private let iso8601 = ISO8601DateFormatter()
 
     // References to app state (set via register())
     private weak var transcriptStore: TranscriptStore?
@@ -20,12 +20,13 @@ final class APIServer {
     private var sessionStore: SessionStore?
 
     // Session control callbacks
-    private var onStartSession: ((SessionType) -> Void)?
+    private var onStartSession: ((SessionType, String, MeetingContext?) -> Void)?
     private var onStopSession: (() -> Void)?
 
     // Session tracking (written by ContentView, read by API handlers)
     private(set) var currentSessionId: String?
     var sessionElapsed: Int = 0
+    private(set) var hasDiarizationCompleted: Bool = false
 
     init() {
         let appSupport = FileManager.default.urls(
@@ -41,7 +42,7 @@ final class APIServer {
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
-        onStart: @escaping (SessionType) -> Void,
+        onStart: @escaping (SessionType, String, MeetingContext?) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.transcriptStore = transcriptStore
@@ -56,10 +57,9 @@ final class APIServer {
         currentSessionId = id
     }
 
-    /// Mark a session as ended (called by ContentView after stopSession).
-    func sessionDidEnd() {
-        // Keep currentSessionId so status/transcript can still be queried.
-        // It will be overwritten on next session start.
+    /// Mark diarization as complete for the current session.
+    func diarizationDidComplete() {
+        hasDiarizationCompleted = true
     }
 
     // MARK: - Server Lifecycle
@@ -187,7 +187,7 @@ final class APIServer {
 
         case ("GET", let p) where p.matchesPattern("/sessions/", suffix: "/status"):
             let id = p.extractSegment(prefix: "/sessions/", suffix: "/status")
-            return handleSessionStatus(sessionId: id)
+            return await handleSessionStatus(sessionId: id)
 
         case ("GET", let p) where p.matchesPattern("/sessions/", suffix: "/transcript"):
             let id = p.extractSegment(prefix: "/sessions/", suffix: "/transcript")
@@ -229,21 +229,37 @@ final class APIServer {
             return (409, #"{"error":"A session is already in progress"}"#)
         }
 
-        let type: SessionType = req.type == "voiceMemo" ? .voiceMemo : .callCapture
-        let sessionId = UUID().uuidString
+        let type: SessionType
+        switch req.type {
+        case "voiceMemo": type = .voiceMemo
+        case "callCapture": type = .callCapture
+        default:
+            return (400, #"{"error":"Invalid session type. Must be \"callCapture\" or \"voiceMemo\"."}"#)
+        }
+
+        let sessionId = SessionStore.generateSessionId()
         currentSessionId = sessionId
         sessionElapsed = 0
+        hasDiarizationCompleted = false
 
-        onStartSession?(type)
+        onStartSession?(type, sessionId, req.meetingContext)
 
         return (200, encode(SessionStartResponse(
-            sessionId: sessionId, status: "recording"
+            sessionId: sessionId, status: "starting"
         )))
     }
 
     private func handleStopSession(body: Data?) -> (Int, String) {
         guard transcriptionEngine?.isRunning == true else {
             return (409, #"{"error":"No active session"}"#)
+        }
+
+        // Validate session ID if provided in the request body
+        if let body,
+           let req = try? JSONDecoder().decode(StopSessionRequest.self, from: body),
+           let current = currentSessionId,
+           req.sessionId != current {
+            return (409, encode(["error": "Session ID \"\(req.sessionId)\" does not match active session"]))
         }
 
         let sessionId = currentSessionId ?? "unknown"
@@ -254,12 +270,34 @@ final class APIServer {
         )))
     }
 
-    private func handleSessionStatus(sessionId: String) -> (Int, String) {
+    private func handleSessionStatus(sessionId: String) async -> (Int, String) {
+        let isCurrentSession = currentSessionId == sessionId
+
+        // If not the current session, verify it exists as a stored file
+        if !isCurrentSession {
+            guard let sessionStore else {
+                return (404, #"{"error":"Session not found"}"#)
+            }
+            let dir = await sessionStore.sessionsDirectoryURL
+            let file = dir.appendingPathComponent("\(sessionId).jsonl")
+            guard FileManager.default.fileExists(atPath: file.path) else {
+                return (404, #"{"error":"Session not found"}"#)
+            }
+            return (200, encode(SessionStatusResponse(
+                sessionId: sessionId,
+                status: "complete",
+                elapsedSeconds: 0,
+                speakerCount: 0,
+                lineCount: 0
+            )))
+        }
+
+        // Current session — report live status
         let isRecording = transcriptionEngine?.isRunning ?? false
         let assetStatus = transcriptionEngine?.assetStatus ?? "Ready"
 
         let status: String
-        if isRecording && currentSessionId == sessionId {
+        if isRecording {
             status = "recording"
         } else if assetStatus.contains("Identifying") || assetStatus.contains("Rewriting") {
             status = "diarizing"
@@ -327,7 +365,7 @@ final class APIServer {
         // Filter by since parameter
         let sinceDate: Date?
         if let sinceStr = query["since"] {
-            sinceDate = ISO8601DateFormatter().date(from: sinceStr)
+            sinceDate = iso8601.date(from: sinceStr)
         } else {
             sinceDate = nil
         }
@@ -336,7 +374,7 @@ final class APIServer {
         for file in jsonlFiles where sessions.count < limit {
             guard let summary = Self.parseSessionSummary(from: file) else { continue }
             if let since = sinceDate,
-               let summaryDate = ISO8601DateFormatter().date(from: summary.recordingStart),
+               let summaryDate = iso8601.date(from: summary.recordingStart),
                summaryDate < since
             {
                 continue
@@ -349,7 +387,7 @@ final class APIServer {
             let liveSummary = SessionSummary(
                 sessionId: sid,
                 title: nil,
-                recordingStart: ISO8601DateFormatter().string(from: Date()),
+                recordingStart: iso8601.string(from: Date()),
                 dateCreated: nil,
                 durationSeconds: sessionElapsed,
                 speakerCount: Set(transcriptStore?.utterances.map(\.speaker) ?? []).count,
@@ -386,11 +424,10 @@ final class APIServer {
             )
         }
 
-        let isRecording = transcriptionEngine?.isRunning ?? false
         let metadata = TranscriptMetadata(
             title: nil,
-            dateCreated: ISO8601DateFormatter().string(from: sessionStart),
-            hasBeenDiarized: !isRecording,
+            dateCreated: iso8601.string(from: sessionStart),
+            hasBeenDiarized: hasDiarizationCompleted,
             durationSec: sessionElapsed,
             sourceApp: nil
         )
@@ -443,10 +480,13 @@ final class APIServer {
             ? Int(records.last!.timestamp.timeIntervalSince(sessionStart))
             : nil
 
+        // Stored sessions are complete; diarization already ran if applicable.
+        // Check if diarized by looking for speaker labels beyond "you"/"them".
+        let hasDiarized = speakerCounts.keys.contains(where: { $0 != "You" && $0 != "Them" })
         let metadata = TranscriptMetadata(
             title: nil,
-            dateCreated: ISO8601DateFormatter().string(from: sessionStart),
-            hasBeenDiarized: true,
+            dateCreated: iso8601.string(from: sessionStart),
+            hasBeenDiarized: hasDiarized,
             durationSec: durationSec,
             sourceApp: nil
         )
@@ -489,7 +529,7 @@ final class APIServer {
         return SessionSummary(
             sessionId: stem,
             title: nil,
-            recordingStart: ISO8601DateFormatter().string(from: date),
+            recordingStart: ISO8601DateFormatter().string(from: date),  // static context — can't use instance formatter
             dateCreated: nil,
             durationSeconds: max(0, duration),
             speakerCount: speakers.count,
@@ -510,9 +550,17 @@ final class APIServer {
     private static func parseHTTP(_ data: Data) -> HTTPRequest? {
         guard let str = String(data: data, encoding: .utf8) else { return nil }
 
-        let parts = str.components(separatedBy: "\r\n\r\n")
-        let headerSection = parts[0]
-        let bodyStr = parts.count > 1 ? parts[1] : nil
+        // Split at first \r\n\r\n only — body may contain that sequence
+        let headerSection: String
+        let bodyStr: String?
+        if let separatorRange = str.range(of: "\r\n\r\n") {
+            headerSection = String(str[..<separatorRange.lowerBound])
+            let remainder = str[separatorRange.upperBound...]
+            bodyStr = remainder.isEmpty ? nil : String(remainder)
+        } else {
+            headerSection = str
+            bodyStr = nil
+        }
 
         let headerLines = headerSection.components(separatedBy: "\r\n")
         guard let requestLine = headerLines.first else { return nil }
