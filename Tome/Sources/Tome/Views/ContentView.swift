@@ -302,17 +302,13 @@ struct ContentView: View {
                 try await transcriptLogger.startSession(
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
-                    sessionType: type
+                    sessionType: type,
+                    suggestedFilename: suggestedFilename
                 )
             } catch {
                 await sessionStore.endSession()
                 transcriptionEngine?.lastError = error.localizedDescription
                 return
-            }
-
-            // Forward suggested filename from WhisperCal to the logger
-            if let suggestedFilename {
-                await transcriptLogger.setSuggestedFilename(suggestedFilename)
             }
 
             // Forward meeting context from API callers to the transcript

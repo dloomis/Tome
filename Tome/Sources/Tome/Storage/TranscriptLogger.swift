@@ -30,12 +30,13 @@ actor TranscriptLogger {
         suggestedFilename = name
     }
 
-    func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture) throws {
+    func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture, suggestedFilename: String? = nil) throws {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []
         self.sessionContext = ""
         self.utteranceBuffer = []
+        self.suggestedFilename = suggestedFilename
 
         let expandedPath = NSString(string: vaultPath).expandingTildeInPath
         let directory = URL(fileURLWithPath: expandedPath)
@@ -59,7 +60,16 @@ actor TranscriptLogger {
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
-        let filename = "\(fileFmt.string(from: now)) \(fileLabel).md"
+        let filename: String
+        if let suggested = suggestedFilename, !suggested.isEmpty {
+            let sanitized = suggested
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+                .trimmingCharacters(in: .whitespaces)
+            filename = "\(sanitized).md"
+        } else {
+            filename = "\(fileFmt.string(from: now)) \(fileLabel).md"
+        }
         currentFilePath = directory.appendingPathComponent(filename)
 
         let content = """
