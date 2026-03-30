@@ -6,13 +6,12 @@ import Sparkle
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
-    @State private var isRecording = false
     private let updaterController = AppUpdaterController()
     private let apiServer = APIServer()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(settings: settings, apiServer: apiServer, isRecording: $isRecording)
+            ContentView(settings: settings, apiServer: apiServer)
                 .onAppear {
                     settings.applyScreenShareVisibility()
                 }
@@ -36,30 +35,9 @@ struct TomeApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            MenuBarLabel(isRecording: isRecording)
+            Image(systemName: "book.closed")
+                .symbolRenderingMode(.monochrome)
         }
-    }
-}
-
-/// Menu bar icon that overlays a pulsating red recording dot when active.
-private struct MenuBarLabel: View {
-    let isRecording: Bool
-    @State private var pulse = false
-
-    var body: some View {
-        Image(systemName: isRecording ? "book.closed.circle.fill" : "book.closed")
-            .symbolRenderingMode(isRecording ? .palette : .monochrome)
-            .foregroundStyle(isRecording ? .red : .primary)
-            .opacity(isRecording && pulse ? 0.4 : 1.0)
-            .animation(
-                isRecording
-                    ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true)
-                    : .default,
-                value: pulse
-            )
-            .onChange(of: isRecording) { _, recording in
-                pulse = recording
-            }
     }
 }
 

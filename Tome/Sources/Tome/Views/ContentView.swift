@@ -19,7 +19,6 @@ private let conferencingBundleIDs: [String: String] = [
 struct ContentView: View {
     @Bindable var settings: AppSettings
     let apiServer: APIServer
-    @Binding var isRecording: Bool
     @State private var transcriptStore = TranscriptStore()
     @State private var transcriptionEngine: TranscriptionEngine?
     @State private var sessionStore = SessionStore()
@@ -318,7 +317,6 @@ struct ContentView: View {
             }
 
             activeSessionType = type
-            isRecording = true
             detectedAppName = resolvedAppName
             if type == .callCapture {
                 await transcriptionEngine?.start(
@@ -338,7 +336,6 @@ struct ContentView: View {
     private func stopSession() {
         let wasCallCapture = activeSessionType == .callCapture
         activeSessionType = nil
-        isRecording = false
         detectedAppName = nil
         silenceSeconds = 0
         apiServer.sessionDidStop()
