@@ -402,6 +402,9 @@ tags:
 
         timeline.sort()
 
+        // If the rebuilt timeline is empty, preserve the existing transcript
+        guard !timeline.isEmpty else { return }
+
         // Rebuild transcript body
         var newBody = ""
         let allSpeakers = Set(timeline.map(\.speaker))

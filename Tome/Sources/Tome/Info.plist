@@ -26,6 +26,12 @@
     <string>Tome needs screen capture permission to capture system audio from other participants.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
+    <key>LSRequiresNativeExecution</key>
+    <true/>
+    <key>LSSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
     <key>SUFeedURL</key>
     <string>https://raw.githubusercontent.com/Gremble-io/Tome/gh-pages/appcast.xml</string>
     <key>SUEnableAutomaticChecks</key>

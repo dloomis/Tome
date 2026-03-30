@@ -152,9 +152,37 @@ struct ContentView: View {
                 transcriptionEngine?.restartMic(inputDeviceID: settings.inputDeviceID)
             }
         }
-        .onChange(of: transcriptStore.utterances.count) {
+        .onChange(of: transcriptStore.utterances.count as Int) {
             handleNewUtterance()
         }
+        .focusedSceneValue(\.saveTranscript, saveTranscriptAction)
+    }
+
+    private var saveTranscriptAction: (() -> Void)? {
+        guard !transcriptStore.utterances.isEmpty else { return nil }
+        return { saveTranscriptToFile() }
+    }
+
+    private func saveTranscriptToFile() {
+        let panel = NSSavePanel()
+        panel.title = "Save Transcript"
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "Transcript.md"
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm:ss"
+
+        var md = "# Transcript\n\n"
+        for u in transcriptStore.utterances {
+            let speaker = u.speaker == .you ? "You" : "Them"
+            md += "**\(speaker)** (\(timeFmt.string(from: u.timestamp)))\n"
+            md += "\(u.text)\n\n"
+        }
+
+        try? md.write(to: url, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Top Bar
