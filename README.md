@@ -13,6 +13,8 @@
 
 ---
 
+> **Fork note:** This is a fork of [Gremble-io/Tome](https://github.com/Gremble-io/Tome). The upstream project is the original work — this fork adds a local API server, WhisperCal integration, and a few quality-of-life fixes. See [Fork Additions](#fork-additions) below.
+
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v2, and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
 <p align="center">
@@ -123,7 +125,7 @@ Voice memos use `type: fleeting` with a single speaker. Same structure, same fro
 **Requirements:** Apple Silicon Mac, macOS 26+, Xcode 26.3+
 
 ```bash
-git clone https://github.com/Gremble-io/Tome.git
+git clone https://github.com/dloomis/Tome.git
 cd Tome
 ./scripts/build_swift_app.sh
 ```
@@ -161,7 +163,11 @@ Tome/Sources/Tome/
 │   └── TranscriptStore.swift       # Observable transcript state
 ├── Transcription/
 │   ├── TranscriptionEngine.swift   # Dual-stream capture + diarization
-│   └── StreamingTranscriber.swift  # VAD + Parakeet ASR pipeline
+│   ├── StreamingTranscriber.swift  # VAD + Parakeet ASR pipeline
+│   └── SegmentReTranscriber.swift  # Per-speaker re-transcription after diarization
+├── API/
+│   ├── APIServer.swift             # Local HTTP server for WhisperCal integration
+│   └── APIModels.swift             # Request/response types and OpenAPI spec
 ├── Storage/
 │   ├── TranscriptLogger.swift      # .md output with YAML frontmatter
 │   └── SessionStore.swift          # Session metadata
@@ -191,6 +197,15 @@ Tome/Sources/Tome/
 - **Screen Recording re-prompts monthly.** OS limitation.
 - **Diarization is imperfect.** Works well with headset mics. Laptop speakers with crosstalk will give you worse speaker separation.
 - **No live speaker labels.** Diarization runs after the session ends. During the call, remote audio shows as a single stream.
+
+## Fork Additions
+
+This fork adds the following on top of upstream Tome:
+
+- **Local API server** — an HTTP server on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session state, and retrieving transcripts. Port is written to `~/Library/Application Support/Tome/api-port` on launch. An OpenAPI 3.1 spec is served at `GET /` for discoverability.
+- **WhisperCal integration** — purpose-built endpoints (`/start`, `/stop`, `/status`) so the [WhisperCal](https://github.com/dloomis/WhisperCal) Obsidian plugin can drive Tome's capture lifecycle and poll for transcript completion. Supports `suggestedFilename` so the output file lands with the name WhisperCal expects.
+- **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session.
+- **Bug fixes** — empty transcript guard for diarization, session ID mismatch in API responses, atomic file writes, dead code removal, and various code quality improvements.
 
 ## Credits
 
