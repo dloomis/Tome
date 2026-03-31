@@ -13,7 +13,7 @@
 
 ---
 
-> **Fork note:** This is a fork of [Gremble-io/Tome](https://github.com/Gremble-io/Tome). The upstream project is the original work — this fork adds a local API server, WhisperCal integration, and a few quality-of-life fixes. See [Fork Additions](#fork-additions) below.
+> **Fork note:** This is a fork of [Gremble-io/Tome](https://github.com/Gremble-io/Tome). The upstream project is the original work — this fork adds a local API server and a few quality-of-life fixes. See [Fork Additions](#fork-additions) below.
 
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v2, and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
@@ -202,8 +202,7 @@ Tome/Sources/Tome/
 
 This fork adds the following on top of upstream Tome:
 
-- **Local API server** — an HTTP server on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session state, and retrieving transcripts. Port is written to `~/Library/Application Support/Tome/api-port` on launch. An OpenAPI 3.1 spec is served at `GET /` for discoverability.
-- **WhisperCal integration** — purpose-built endpoints (`/start`, `/stop`, `/status`) so the [WhisperCal](https://github.com/dloomis/WhisperCal) Obsidian plugin can drive Tome's capture lifecycle and poll for transcript completion. Supports `suggestedFilename` so the output file lands with the name WhisperCal expects.
+- **Local API server** — an HTTP server on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session lifecycle, and retrieving transcripts. Accepts an optional `suggestedFilename` so callers can control output naming. Port is written to `~/Library/Application Support/Tome/api-port` on launch. An OpenAPI 3.1 spec is served at `GET /` for discoverability. Used by [WhisperCal](https://github.com/dloomis/WhisperCal) but any local client can call it.
 - **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session.
 - **Bug fixes** — empty transcript guard for diarization, session ID mismatch in API responses, atomic file writes, dead code removal, and various code quality improvements.
 
