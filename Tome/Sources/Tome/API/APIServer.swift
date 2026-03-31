@@ -80,6 +80,14 @@ final class APIServer {
     /// Mark that the transcript file has been finalized and written.
     func sessionDidComplete() {
         lifecycleState = .complete
+        // Reset to idle after a short delay so /status callers can see "complete"
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if lifecycleState == .complete {
+                lifecycleState = .idle
+                currentSessionId = nil
+            }
+        }
     }
 
     // MARK: - Server Lifecycle
@@ -255,7 +263,9 @@ final class APIServer {
     // MARK: - WhisperCal Handlers
 
     private func handleWhisperCalStart(body: Data?) -> (Int, String) {
-        guard transcriptionEngine?.isRunning != true else {
+        guard transcriptionEngine?.isRunning != true,
+              lifecycleState != .recording,
+              lifecycleState != .transcribing else {
             return (409, #"{"error":"Already recording"}"#)
         }
 
@@ -270,6 +280,7 @@ final class APIServer {
         currentSessionId = sessionId
         sessionElapsed = 0
         hasDiarizationCompleted = false
+        lifecycleState = .recording  // Set synchronously to prevent race with rapid duplicate requests
 
         onStartSession?(.callCapture, sessionId, req?.meetingContext, req?.suggestedFilename)
 
@@ -299,7 +310,9 @@ final class APIServer {
             return (400, #"{"error":"Invalid request body"}"#)
         }
 
-        guard transcriptionEngine?.isRunning != true else {
+        guard transcriptionEngine?.isRunning != true,
+              lifecycleState != .recording,
+              lifecycleState != .transcribing else {
             return (409, #"{"error":"A session is already in progress"}"#)
         }
 
@@ -315,6 +328,7 @@ final class APIServer {
         currentSessionId = sessionId
         sessionElapsed = 0
         hasDiarizationCompleted = false
+        lifecycleState = .recording  // Set synchronously to prevent race with rapid duplicate requests
 
         onStartSession?(type, sessionId, req.meetingContext, nil)
 
