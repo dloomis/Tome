@@ -331,6 +331,14 @@ final class TranscriptionEngine {
             diagLog("[DIARIZE] Loading audio...")
             let audioArray = try AudioProcessor.loadAudioAsFloatArray(fromPath: bufferURL.path)
 
+            // Need at least 2 seconds of audio at 16kHz for meaningful diarization
+            let minSamples = 32_000
+            guard audioArray.count >= minSamples else {
+                diagLog("[DIARIZE] Audio too short for diarization (\(audioArray.count) samples, need \(minSamples)), skipping")
+                systemCapture.cleanupBufferFile()
+                return nil
+            }
+
             // Initialize SpeakerKit (downloads pyannote v4 models on first run)
             diagLog("[DIARIZE] Preparing SpeakerKit models...")
             let speakerKit = try await SpeakerKit(PyannoteConfig())
