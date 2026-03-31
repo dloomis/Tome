@@ -202,6 +202,7 @@ Tome/Sources/Tome/
 
 This fork adds the following on top of upstream Tome:
 
+- **SpeakerKit diarization** — replaces upstream's FluidAudio offline diarizer with [SpeakerKit](https://github.com/argmaxinc/WhisperKit) (pyannote v4). After a session ends, system audio is re-processed for speaker segmentation and each segment is re-transcribed with per-speaker labels.
 - **Local API server** — an HTTP server on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session lifecycle, and retrieving transcripts. Accepts an optional `suggestedFilename` so callers can control output naming. Port is written to `~/Library/Application Support/Tome/api-port` on launch. An OpenAPI 3.1 spec is served at `GET /` for discoverability. Used by [WhisperCal](https://github.com/dloomis/WhisperCal) but any local client can call it.
 - **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session.
 - **Bug fixes** — empty transcript guard for diarization, session ID mismatch in API responses, atomic file writes, dead code removal, and various code quality improvements.
