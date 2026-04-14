@@ -98,7 +98,7 @@ final class APIServer {
         do {
             let params = NWParameters.tcp
             params.requiredLocalEndpoint = NWEndpoint.hostPort(
-                host: .ipv4(.loopback), port: .any
+                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: 27080)!
             )
             listener = try NWListener(using: params)
         } catch {
