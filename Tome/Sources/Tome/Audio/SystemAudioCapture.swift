@@ -11,14 +11,16 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     var audioLevel: Float { _audioLevel.value }
 
-    // Temp WAV for diarization
+    // Temp WAV for diarization. The instance tracks the currently-writing path so
+    // SCStream callbacks can find it; external callers receive the URL via `CaptureStreams`
+    // and own its lifetime (including cleanup) from that point forward.
     private let _bufferFilePath = OSAllocatedUnfairLock<URL?>(uncheckedState: nil)
-    var bufferFilePath: URL? { _bufferFilePath.withLock { $0 } }
 
     private let _audioFileWriter = OSAllocatedUnfairLock<AVAudioFile?>(uncheckedState: nil)
 
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
+        let bufferURL: URL
     }
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
@@ -68,7 +70,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _stream.withLock { $0 = scStream }
         try await scStream.startCapture()
 
-        return CaptureStreams(systemAudio: sysStream)
+        return CaptureStreams(systemAudio: sysStream, bufferURL: bufferURL)
     }
 
     func stop() async {
@@ -76,15 +78,14 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _stream.withLock { $0 = nil }
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
         _audioFileWriter.withLock { $0 = nil } // closes the file
+        _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
         _audioLevel.value = 0
     }
 
-    /// Remove the buffered audio file after diarization is complete
-    func cleanupBufferFile() {
-        if let path = _bufferFilePath.withLock({ $0 }) {
-            try? FileManager.default.removeItem(at: path)
-        }
-        _bufferFilePath.withLock { $0 = nil }
+    /// Remove a buffered audio file. Stateless — the caller owns the URL returned by
+    /// `bufferStream` and is responsible for calling this after post-processing completes.
+    static func cleanupBufferFile(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
     }
 
     // MARK: - SCStreamOutput

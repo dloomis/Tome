@@ -41,9 +41,16 @@ final class TranscriptionEngine {
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
 
-    /// Shared FluidAudio instances
-    private var asrManager: AsrManager?
+    /// Shared, serialized ASR access. Injected so the same coordinator is shared with
+    /// `PostProcessingQueue` — live streaming and batch re-transcription must route
+    /// through one actor for safe interleaving.
+    let asrCoordinator: ASRCoordinator
     private var vadManager: VadManager?
+
+    /// The WAV buffer path for the currently-capturing session. The engine owns this URL
+    /// between start and stop; post-processing methods use it explicitly rather than
+    /// reaching into `SystemAudioCapture`.
+    private var currentBufferURL: URL?
 
     /// Tracks the resolved mic device ID currently in use.
     private var currentMicDeviceID: AudioDeviceID = 0
@@ -54,8 +61,9 @@ final class TranscriptionEngine {
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
-    init(transcriptStore: TranscriptStore) {
+    init(transcriptStore: TranscriptStore, asrCoordinator: ASRCoordinator) {
         self.transcriptStore = transcriptStore
+        self.asrCoordinator = asrCoordinator
     }
 
     func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil) async {
@@ -71,11 +79,9 @@ final class TranscriptionEngine {
         assetStatus = "Loading ASR model (~600MB first run)..."
         diagLog("[ENGINE-1] loading FluidAudio ASR models...")
         do {
-            let models = try await AsrModels.downloadAndLoad(version: .v2)
+            try await asrCoordinator.initialize()
             assetStatus = "Initializing ASR..."
-            let asr = AsrManager(config: .default)
-            try await asr.initialize(models: models)
-            self.asrManager = asr
+            await asrCoordinator.resetDecoderState()
 
             assetStatus = "Loading VAD model..."
             diagLog("[ENGINE-1b] loading VAD model...")
@@ -93,7 +99,7 @@ final class TranscriptionEngine {
             return
         }
 
-        guard let asrManager, let vadManager else { return }
+        guard let vadManager else { return }
 
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
@@ -107,6 +113,7 @@ final class TranscriptionEngine {
         let sysStreams: SystemAudioCapture.CaptureStreams?
         do {
             sysStreams = try await systemCapture.bufferStream(appBundleID: appBundleID)
+            currentBufferURL = sysStreams?.bufferURL
             diagLog("[ENGINE-5] system audio capture started OK")
         } catch {
             let msg = "Failed to start system audio: \(error.localizedDescription)"
@@ -118,7 +125,7 @@ final class TranscriptionEngine {
         // 4. Start mic transcription
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
-            asrManager: asrManager,
+            asrCoordinator: asrCoordinator,
             vadManager: vadManager,
             speaker: .you,
             audioSource: .microphone,
@@ -145,7 +152,7 @@ final class TranscriptionEngine {
         // 5. Start system audio transcription
         if let sysStream = sysStreams?.systemAudio {
             let sysTranscriber = StreamingTranscriber(
-                asrManager: asrManager,
+                asrCoordinator: asrCoordinator,
                 vadManager: vadManager,
                 speaker: .them,
                 audioSource: .system,
@@ -180,7 +187,7 @@ final class TranscriptionEngine {
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
     func restartMic(inputDeviceID: AudioDeviceID) {
-        guard isRunning, let asrManager, let vadManager else { return }
+        guard isRunning, let vadManager else { return }
 
         // Only update user selection when explicitly changed (not from OS listener)
         if inputDeviceID != 0 || userSelectedDeviceID != 0 {
@@ -205,7 +212,7 @@ final class TranscriptionEngine {
         let micStream = micCapture.bufferStream(deviceID: targetMicID)
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
-            asrManager: asrManager,
+            asrCoordinator: asrCoordinator,
             vadManager: vadManager,
             speaker: .you,
             audioSource: .microphone,
@@ -316,34 +323,48 @@ final class TranscriptionEngine {
     }
 
     /// Run offline diarization on the buffered system audio using SpeakerKit (pyannote v4).
-    /// Returns speaker segments (speakerId, startTime, endTime) or nil if no audio was buffered.
-    nonisolated func runPostSessionDiarization(clusterThreshold: Float, numberOfSpeakers: Int) async -> [(speakerId: String, startTime: Float, endTime: Float)]? {
-        guard let bufferURL = systemCapture.bufferFilePath,
-              FileManager.default.fileExists(atPath: bufferURL.path) else {
-            diagLog("[DIARIZE] No buffered system audio file found")
+    /// Uses the buffer URL captured when this session started. Returns speaker segments,
+    /// or nil if no audio was buffered / it was too short.
+    func runPostSessionDiarization(clusterThreshold: Float, numberOfSpeakers: Int) async -> [DiarizedSegment]? {
+        guard let bufferURL = currentBufferURL else {
+            diagLog("[DIARIZE] No buffer URL tracked for this session")
+            return nil
+        }
+        return await Self.runDiarization(
+            bufferURL: bufferURL,
+            clusterThreshold: clusterThreshold,
+            numberOfSpeakers: numberOfSpeakers
+        )
+    }
+
+    /// Stateless diarization: reads a WAV at `bufferURL` and returns speaker segments.
+    /// Intended for use by `PostProcessingJob` without reaching into engine state.
+    nonisolated static func runDiarization(
+        bufferURL: URL,
+        clusterThreshold: Float,
+        numberOfSpeakers: Int
+    ) async -> [DiarizedSegment]? {
+        guard FileManager.default.fileExists(atPath: bufferURL.path) else {
+            diagLog("[DIARIZE] No buffered system audio file at \(bufferURL.path)")
             return nil
         }
 
         diagLog("[DIARIZE] Starting SpeakerKit diarization on \(bufferURL.lastPathComponent)")
 
         do {
-            // Load audio from WAV (resamples to 16kHz mono internally)
             diagLog("[DIARIZE] Loading audio...")
             let audioArray = try AudioProcessor.loadAudioAsFloatArray(fromPath: bufferURL.path)
 
-            // Need at least 2 seconds of audio at 16kHz for meaningful diarization
+            // Need at least 2 seconds of 16kHz audio for meaningful diarization
             let minSamples = 32_000
             guard audioArray.count >= minSamples else {
                 diagLog("[DIARIZE] Audio too short for diarization (\(audioArray.count) samples, need \(minSamples)), skipping")
-                systemCapture.cleanupBufferFile()
                 return nil
             }
 
-            // Initialize SpeakerKit (downloads pyannote v4 models on first run)
             diagLog("[DIARIZE] Preparing SpeakerKit models...")
             let speakerKit = try await SpeakerKit(PyannoteConfig())
 
-            // Configure diarization
             let options = PyannoteDiarizationOptions(
                 numberOfSpeakers: numberOfSpeakers > 0 ? numberOfSpeakers : nil,
                 clusterDistanceThreshold: clusterThreshold
@@ -352,8 +373,7 @@ final class TranscriptionEngine {
             diagLog("[DIARIZE] Processing audio (clusterThreshold=\(clusterThreshold), numberOfSpeakers=\(numberOfSpeakers))...")
             let result = try await speakerKit.diarize(audioArray: audioArray, options: options)
 
-            // Map SpeakerKit segments to Tome's data contract
-            let segments = result.segments.map { seg -> (speakerId: String, startTime: Float, endTime: Float) in
+            let segments = result.segments.map { seg -> DiarizedSegment in
                 let id: String
                 switch seg.speaker {
                 case .speakerId(let speakerId):
@@ -363,33 +383,36 @@ final class TranscriptionEngine {
                 case .noMatch:
                     id = "SPEAKER_UNKNOWN"
                 }
-                return (speakerId: id, startTime: seg.startTime, endTime: seg.endTime)
+                return DiarizedSegment(speakerId: id, startTime: seg.startTime, endTime: seg.endTime)
             }
 
             diagLog("[DIARIZE] Found \(segments.count) segments, \(Set(segments.map(\.speakerId)).count) speakers")
-
-            // NOTE: buffer file is NOT cleaned up here — re-transcription needs it.
             return segments
         } catch {
             diagLog("[DIARIZE] Failed: \(error.localizedDescription)")
-            systemCapture.cleanupBufferFile()
             return nil
         }
     }
 
-    /// Re-transcribe the system audio WAV using diarization segment boundaries.
-    /// Returns an array of (speakerLabel, text) tuples with one entry per diarization segment.
+    /// Re-transcribe the session's buffered WAV using diarization segment boundaries.
     func reTranscribeWithDiarization(
-        segments: [(speakerId: String, startTime: Float, endTime: Float)]
-    ) async -> [(speaker: String, text: String, startTime: Float)]? {
-        guard let asrManager else {
-            diagLog("[RETRANSCRIBE] FAILED: No ASR manager available")
+        segments: [DiarizedSegment]
+    ) async -> [ReTranscribedSegment]? {
+        guard let bufferURL = currentBufferURL else {
+            diagLog("[RETRANSCRIBE] FAILED: No buffer URL tracked")
             return nil
         }
-        guard let bufferURL = systemCapture.bufferFilePath else {
-            diagLog("[RETRANSCRIBE] FAILED: No buffer file path set")
-            return nil
-        }
+        return await Self.reTranscribe(asrCoordinator: asrCoordinator, bufferURL: bufferURL, segments: segments)
+    }
+
+    /// Stateless re-transcription: runs `SegmentReTranscriber` against `bufferURL`,
+    /// routing through the shared `ASRCoordinator` for safe interleaving with live streaming.
+    /// `nonisolated` so heavy file I/O from background jobs doesn't block the main actor.
+    nonisolated static func reTranscribe(
+        asrCoordinator: ASRCoordinator,
+        bufferURL: URL,
+        segments: [DiarizedSegment]
+    ) async -> [ReTranscribedSegment]? {
         guard FileManager.default.fileExists(atPath: bufferURL.path) else {
             diagLog("[RETRANSCRIBE] FAILED: Buffer file missing at \(bufferURL.path)")
             return nil
@@ -397,17 +420,26 @@ final class TranscriptionEngine {
 
         diagLog("[RETRANSCRIBE] Starting re-transcription of \(segments.count) segments from \(bufferURL.lastPathComponent)")
 
-        let transcriber = SegmentReTranscriber(asrManager: asrManager, fileURL: bufferURL, segments: segments)
-        let results = await Task.detached {
-            await transcriber.run()
-        }.value
+        let transcriber = SegmentReTranscriber(
+            asrCoordinator: asrCoordinator,
+            fileURL: bufferURL,
+            segments: segments
+        )
+        let results = await transcriber.run()
 
         diagLog("[RETRANSCRIBE] Result: \(results?.count ?? -1) segments produced")
         return results
     }
 
-    /// Clean up the system audio buffer file.
+    /// Clean up the system audio buffer file for the current session and forget its URL.
     func cleanupBuffer() {
-        systemCapture.cleanupBufferFile()
+        if let url = currentBufferURL {
+            SystemAudioCapture.cleanupBufferFile(url)
+        }
+        currentBufferURL = nil
     }
+
+    /// The WAV buffer URL for the currently-live (or most recently live) capture.
+    /// Callers can snapshot this at stop time before starting a new session.
+    var activeBufferURL: URL? { currentBufferURL }
 }

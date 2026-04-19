@@ -19,6 +19,7 @@ private let conferencingBundleIDs: [String: String] = [
 struct ContentView: View {
     @Bindable var settings: AppSettings
     let apiServer: APIServer
+    let services: AppServices
     @State private var transcriptStore = TranscriptStore()
     @State private var transcriptionEngine: TranscriptionEngine?
     @State private var sessionStore = SessionStore()
@@ -32,6 +33,10 @@ struct ContentView: View {
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
+    /// Identity of the session currently being captured, carried through to the
+    /// `PostProcessingJob` at stop time so the job can be tracked by session id.
+    @State private var currentSessionId: String?
+    @State private var currentSourceApp: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,7 +97,10 @@ struct ContentView: View {
                 showOnboarding = true
             }
             if transcriptionEngine == nil {
-                transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore)
+                transcriptionEngine = TranscriptionEngine(
+                    transcriptStore: transcriptStore,
+                    asrCoordinator: services.asrCoordinator
+                )
             }
             guard let engine = transcriptionEngine else { return }
             apiServer.register(
@@ -154,6 +162,10 @@ struct ContentView: View {
         }
         .onChange(of: transcriptStore.utterances.count as Int) {
             handleNewUtterance()
+        }
+        .onChange(of: services.postProcessingQueue.lastCompletion) { _, new in
+            guard let new else { return }
+            handleJobCompleted(jobId: new.jobId, savedURL: new.savedURL, sessionType: new.sessionType)
         }
         .focusedSceneValue(\.saveTranscript, saveTranscriptAction)
     }
@@ -222,6 +234,8 @@ struct ContentView: View {
             return formatTime(sessionElapsed)
         } else if savedFileURL != nil {
             return "\(formatTime(sessionElapsed)) · Done"
+        } else if services.postProcessingQueue.isAnyJobRunning {
+            return "Finalizing…"
         } else {
             return "Ready"
         }
@@ -346,6 +360,8 @@ struct ContentView: View {
 
             activeSessionType = type
             detectedAppName = resolvedAppName
+            currentSessionId = sid
+            currentSourceApp = sourceApp
             if type == .callCapture {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
@@ -363,49 +379,65 @@ struct ContentView: View {
 
     private func stopSession() {
         let wasCallCapture = activeSessionType == .callCapture
+        let sessionId = currentSessionId ?? SessionStore.generateSessionId()
+        let sourceApp = currentSourceApp ?? "Call"
+        let sessionType: SessionType = wasCallCapture ? .callCapture : .voiceMemo
+
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
-        apiServer.sessionDidStop()
+        currentSessionId = nil
+        currentSourceApp = nil
+        apiServer.sessionDidStop(id: sessionId)
 
         Task {
+            // Snapshot the buffer URL BEFORE tearing down the engine, since the engine
+            // may begin a new session (which reuses `SystemAudioCapture`) immediately.
+            let bufferURL: URL? = wasCallCapture ? transcriptionEngine?.activeBufferURL : nil
+
             await transcriptionEngine?.stop()
             await sessionStore.endSession()
-            await transcriptLogger.endSession()
-
-            if wasCallCapture {
-                transcriptionEngine?.assetStatus = "Identifying speakers..."
-                if let segments = await transcriptionEngine?.runPostSessionDiarization(
-                    clusterThreshold: Float(settings.diarizationClusterThreshold),
-                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
-                ) {
-                    transcriptionEngine?.assetStatus = "Re-transcribing with speaker labels..."
-                    diagLog("[STOP] Diarization found \(segments.count) segments, attempting re-transcription...")
-                    if let diarizedSegments = await transcriptionEngine?.reTranscribeWithDiarization(segments: segments) {
-                        diagLog("[STOP] Re-transcription succeeded with \(diarizedSegments.count) segments, rebuilding transcript")
-                        let sessionStart = await transcriptLogger.getLastSessionStartTime() ?? Date()
-                        await transcriptLogger.rebuildFromDiarizedSegments(diarizedSegments, sessionStartTime: sessionStart)
-                    } else {
-                        diagLog("[STOP] Re-transcription returned nil, falling back to relabel")
-                        await transcriptLogger.rewriteWithDiarization(segments: segments)
-                    }
-                }
-                transcriptionEngine?.cleanupBuffer()
-                apiServer.diarizationDidComplete()
+            guard let transcriptSnapshot = await transcriptLogger.endSession() else {
+                transcriptionEngine?.assetStatus = "Ready"
+                apiServer.sessionDidComplete(id: sessionId)
+                return
             }
 
-            transcriptionEngine?.assetStatus = "Finalizing..."
-            let savedPath = await transcriptLogger.finalizeFrontmatter()
-            transcriptionEngine?.assetStatus = "Ready"
-            apiServer.sessionDidComplete()
+            // Build the immutable handle and hand it off to the background queue.
+            // The engine and logger are now free for the next recording.
+            let handle = SessionHandle(
+                id: sessionId,
+                sessionType: sessionType,
+                sourceApp: sourceApp,
+                wavBufferPath: bufferURL,
+                transcript: transcriptSnapshot
+            )
+            let job = PostProcessingJob(
+                handle: handle,
+                clusterThreshold: Float(settings.diarizationClusterThreshold),
+                numberOfSpeakers: settings.diarizationNumberOfSpeakers
+            )
 
-            if activeSessionType == nil, let savedPath {
-                savedFileURL = savedPath
-                bannerDismissTask?.cancel()
-                bannerDismissTask = Task {
-                    try? await Task.sleep(for: .seconds(8))
-                    if !Task.isCancelled { savedFileURL = nil }
-                }
+            services.postProcessingQueue.enqueue(job)
+            transcriptionEngine?.assetStatus = "Ready"
+        }
+    }
+
+    /// Fired from `onChange(of: services.postProcessingQueue.lastCompletion)`.
+    /// Shows the save banner only if no new session is currently active; otherwise
+    /// the active recording's UI takes precedence and a system notification handles it.
+    private func handleJobCompleted(jobId: String, savedURL: URL, sessionType: SessionType) {
+        apiServer.diarizationDidComplete()
+        apiServer.sessionDidComplete(id: jobId)
+
+        Task { await NotificationPresenter.shared.postCompletion(savedURL: savedURL, sessionType: sessionType) }
+
+        if activeSessionType == nil {
+            savedFileURL = savedURL
+            bannerDismissTask?.cancel()
+            bannerDismissTask = Task {
+                try? await Task.sleep(for: .seconds(8))
+                if !Task.isCancelled { savedFileURL = nil }
             }
         }
     }

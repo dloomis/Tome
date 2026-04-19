@@ -48,3 +48,48 @@ struct SessionRecord: Codable {
         self.timestamp = timestamp
     }
 }
+
+// MARK: - Transcript Session Snapshot
+
+/// Immutable snapshot of a session's on-disk and metadata state at `endSession()` time.
+/// Passed to `TranscriptFinalizer` functions so post-processing runs without reaching
+/// back into a live `TranscriptLogger` actor — which is critical when a new session
+/// has already claimed the logger for its own recording.
+///
+/// `speakersDetected` is `var` so finalization steps can update it as diarization
+/// replaces "Them" with specific speaker labels.
+struct TranscriptSessionSnapshot: Sendable {
+    let filePath: URL
+    let sessionStartTime: Date
+    var speakersDetected: Set<String>
+    let sourceApp: String
+    let sessionContext: String
+    let suggestedFilename: String?
+}
+
+// MARK: - Session Handle
+
+/// Immutable identity + resources for one session. Handed off at stop time to a
+/// `PostProcessingJob`, which finalizes in the background while a new session may
+/// already be recording. `transcript` is `var` so finalization can flow updated
+/// speaker information through the diarization → rebuild → finalize pipeline.
+struct SessionHandle: Sendable {
+    let id: String
+    let sessionType: SessionType
+    let sourceApp: String
+    /// Path to the buffered system audio WAV. Nil when the session did not capture
+    /// system audio (e.g. voice memos), which signals the job to skip diarization.
+    let wavBufferPath: URL?
+    var transcript: TranscriptSessionSnapshot
+}
+
+// MARK: - Post-Processing Error
+
+/// Typed errors from a `PostProcessingJob.run()`. A closed set — callers must
+/// handle each case.
+enum PostProcessingError: Error, Sendable {
+    case diarizeFailed(String)
+    case reTranscribeFailed(String)
+    case markdownWriteFailed(String)
+    case cancelled
+}

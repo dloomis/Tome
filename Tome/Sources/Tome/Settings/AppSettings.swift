@@ -3,7 +3,7 @@ import Foundation
 import Observation
 import CoreAudio
 
-enum SessionType: String {
+enum SessionType: String, Sendable, Codable {
     case callCapture
     case voiceMemo
 }

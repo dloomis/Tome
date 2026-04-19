@@ -35,6 +35,10 @@ final class APIServer {
     private(set) var currentSessionId: String?
     var sessionElapsed: Int = 0
     private(set) var hasDiarizationCompleted: Bool = false
+    /// Per-session state so `/sessions/{id}/status` can answer correctly even when
+    /// a newer session is already recording. The top-level `lifecycleState` tracks
+    /// the most recent session for `/status` backwards compatibility.
+    private(set) var sessionStates: [String: SessionLifecycleState] = [:]
     private(set) var lifecycleState: SessionLifecycleState = .idle
 
     init() {
@@ -64,28 +68,47 @@ final class APIServer {
     /// Mark a session as started (called by ContentView after startSession succeeds).
     func sessionDidStart(id: String) {
         currentSessionId = id
+        sessionStates[id] = .recording
         lifecycleState = .recording
+        hasDiarizationCompleted = false
     }
 
-    /// Mark that recording has stopped and post-processing has begun.
-    func sessionDidStop() {
-        lifecycleState = .transcribing
+    /// Mark that recording has stopped for a specific session — its post-processing
+    /// has been handed off to the background queue. The `id` is required because a
+    /// newer session may already be starting concurrently.
+    func sessionDidStop(id: String) {
+        sessionStates[id] = .transcribing
+        if currentSessionId == id {
+            lifecycleState = .transcribing
+        }
     }
 
-    /// Mark diarization as complete for the current session.
+    /// Mark diarization as complete for the most recent session. Kept for the
+    /// `hasBeenDiarized` field on live transcript responses.
     func diarizationDidComplete() {
         hasDiarizationCompleted = true
     }
 
-    /// Mark that the transcript file has been finalized and written.
-    func sessionDidComplete() {
-        lifecycleState = .complete
-        // Reset to idle after a short delay so /status callers can see "complete"
-        Task {
+    /// Mark that a specific session's transcript file has been finalized. The `id`
+    /// is required because a different session may be recording when this fires
+    /// from the background queue's completion event.
+    func sessionDidComplete(id: String) {
+        sessionStates[id] = .complete
+        // Only advance the top-level lifecycle if this is the most recent session.
+        // A newer session's `.recording` takes precedence.
+        if lifecycleState != .recording {
+            lifecycleState = .complete
+        }
+        Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
-            if lifecycleState == .complete {
+            guard let self else { return }
+            sessionStates.removeValue(forKey: id)
+            if lifecycleState == .complete && currentSessionId == id {
                 lifecycleState = .idle
                 currentSessionId = nil
+            } else if lifecycleState == .complete {
+                // This was an older session's completion; don't touch currentSessionId.
+                lifecycleState = .idle
             }
         }
     }
@@ -263,9 +286,10 @@ final class APIServer {
     // MARK: - WhisperCal Handlers
 
     private func handleWhisperCalStart(body: Data?) -> (Int, String) {
+        // `.transcribing` is NOT a blocker anymore — post-processing of a previous
+        // session runs in the background so a new recording can start immediately.
         guard transcriptionEngine?.isRunning != true,
-              lifecycleState != .recording,
-              lifecycleState != .transcribing else {
+              lifecycleState != .recording else {
             return (409, #"{"error":"Already recording"}"#)
         }
 
@@ -310,9 +334,10 @@ final class APIServer {
             return (400, #"{"error":"Invalid request body"}"#)
         }
 
+        // `.transcribing` is NOT a blocker — previous session's post-processing runs
+        // in the background, not inline with the engine.
         guard transcriptionEngine?.isRunning != true,
-              lifecycleState != .recording,
-              lifecycleState != .transcribing else {
+              lifecycleState != .recording else {
             return (409, #"{"error":"A session is already in progress"}"#)
         }
 
@@ -361,7 +386,19 @@ final class APIServer {
     private func handleSessionStatus(sessionId: String) async -> (Int, String) {
         let isCurrentSession = currentSessionId == sessionId
 
-        // If not the current session, verify it exists as a stored file
+        // Per-session state takes precedence over file-based lookup — it reflects
+        // in-flight post-processing for sessions that just finished recording.
+        if let state = sessionStates[sessionId], !isCurrentSession {
+            return (200, encode(SessionStatusResponse(
+                sessionId: sessionId,
+                status: state.rawValue,  // "transcribing" or "complete"
+                elapsedSeconds: 0,
+                speakerCount: 0,
+                lineCount: 0
+            )))
+        }
+
+        // If not the current session and no in-flight state, verify it exists as a stored file
         if !isCurrentSession {
             guard let sessionStore else {
                 return (404, #"{"error":"Session not found"}"#)

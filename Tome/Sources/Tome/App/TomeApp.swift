@@ -19,15 +19,17 @@ extension FocusedValues {
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
+    @State private var services = AppServices()
     @FocusedValue(\.saveTranscript) private var saveTranscript
     private let updaterController = AppUpdaterController()
     private let apiServer = APIServer()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(settings: settings, apiServer: apiServer)
+            ContentView(settings: settings, apiServer: apiServer, services: services)
                 .onAppear {
                     settings.applyScreenShareVisibility()
+                    appDelegate.postProcessingQueue = services.postProcessingQueue
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -50,22 +52,37 @@ struct TomeApp: App {
         MenuBarExtra {
             Text("Tome")
                 .font(.headline)
+            if services.postProcessingQueue.isAnyJobRunning {
+                let count = services.postProcessingQueue.inFlightCount
+                Text(count == 1 ? "Finalizing 1 transcript…" : "Finalizing \(count) transcripts…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
             Divider()
             Button("Quit Tome") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
         } label: {
-            Image(systemName: "book.closed")
+            // Filled icon while any background finalization is in flight — gives a
+            // peripheral-vision cue without taking over the menu bar.
+            Image(systemName: services.postProcessingQueue.isAnyJobRunning ? "book.closed.fill" : "book.closed")
                 .symbolRenderingMode(.monochrome)
+                .symbolEffect(.pulse, options: .repeating, isActive: services.postProcessingQueue.isAnyJobRunning)
         }
     }
 }
 
-/// Observes new window creation and applies screen-share visibility setting.
+/// Observes new window creation, applies screen-share visibility, and blocks app
+/// termination while background finalization jobs are still running.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowObserver: Any?
+    private var quitWaitTask: Task<Void, Never>?
+
+    /// Set by `TomeApp` on launch. The termination handler observes this to decide
+    /// whether a quit needs to wait for finalization.
+    var postProcessingQueue: PostProcessingQueue?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let hidden = UserDefaults.standard.object(forKey: "hideFromScreenShare") == nil
@@ -93,5 +110,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // If any post-processing job is in flight, briefly block termination with a
+        // native alert and wait for the queue to drain (with a 60s cap). The
+        // per-utterance flush means the transcript is already safe on disk; we're
+        // only waiting for diarization + frontmatter finalization to complete.
+        guard let queue = postProcessingQueue, queue.isAnyJobRunning else {
+            return .terminateNow
+        }
+
+        let count = queue.inFlightCount
+        let alert = NSAlert()
+        alert.messageText = count == 1 ? "Finalizing 1 transcript…" : "Finalizing \(count) transcripts…"
+        alert.informativeText = "Tome is still applying speaker labels to recent recordings. Wait a moment, or quit now — the transcript itself is already saved."
+        alert.addButton(withTitle: "Wait")
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.alertStyle = .informational
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            return .terminateNow
+        }
+
+        // User chose to wait — poll until queue drains or timeout.
+        quitWaitTask?.cancel()
+        quitWaitTask = Task { @MainActor in
+            let deadline = Date().addingTimeInterval(60)
+            while queue.isAnyJobRunning && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
