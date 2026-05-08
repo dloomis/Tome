@@ -18,6 +18,13 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     private let _audioFileWriter = OSAllocatedUnfairLock<AVAudioFile?>(uncheckedState: nil)
 
+    /// Wall-clock time of the most recent sample buffer delivered by SCStream while
+    /// capture is active. `nil` when not capturing. The engine watchdog reads this to
+    /// detect when ScreenCaptureKit has silently paused (e.g., display sleep, app
+    /// permission revocation) — SCStream does not call `didStopWithError` in those cases.
+    private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
+
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
         let bufferURL: URL
@@ -68,6 +75,9 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         }
 
         _stream.withLock { $0 = scStream }
+        // Seed before startCapture so the watchdog grace period begins now, not on the
+        // first sample — avoids a false stall while SCK is initializing.
+        _lastSampleTime.withLock { $0 = Date() }
         try await scStream.startCapture()
 
         return CaptureStreams(systemAudio: sysStream, bufferURL: bufferURL)
@@ -79,6 +89,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
         _audioFileWriter.withLock { $0 = nil } // closes the file
         _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
+        _lastSampleTime.withLock { $0 = nil }
         _audioLevel.value = 0
     }
 
@@ -116,6 +127,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         // Update audio level for visualizer
         let rms = Self.normalizedRMS(from: pcmBuffer)
         _audioLevel.value = min(rms * 25, 1.0)
+        _lastSampleTime.withLock { $0 = Date() }
 
         // Diagnostic: log raw system audio levels periodically
         let count = _sampleCount.withLock { val -> Int in val += 1; return val }

@@ -48,7 +48,10 @@ final class PostProcessingJob: Identifiable {
         }
 
         // 1. Diarize + re-transcribe when we have a system-audio buffer (call captures).
+        diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
         if let bufferURL = handle.wavBufferPath {
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
+            diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
             phase = .diarizing
             diagLog("[JOB \(id)] diarizing \(bufferURL.lastPathComponent)")
             let segments = await TranscriptionEngine.runDiarization(
@@ -56,6 +59,7 @@ final class PostProcessingJob: Identifiable {
                 clusterThreshold: clusterThreshold,
                 numberOfSpeakers: numberOfSpeakers
             )
+            diagLog("[JOB \(id)] diarization returned: \(segments == nil ? "nil" : "\(segments!.count) segments")")
 
             if Task.isCancelled {
                 SystemAudioCapture.cleanupBufferFile(bufferURL)

@@ -8,7 +8,6 @@ import WhisperKit
 
 // Writes to /tmp/tome.log
 func diagLog(_ msg: String) {
-    #if DEBUG
     let line = "\(Date()): \(msg)\n"
     let path = "/tmp/tome.log"
     if let fh = FileHandle(forWritingAtPath: path) {
@@ -18,7 +17,6 @@ func diagLog(_ msg: String) {
     } else {
         FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
     }
-    #endif
 }
 
 /// Dual-stream mic + system audio transcription.
@@ -40,6 +38,17 @@ final class TranscriptionEngine {
     private var sysTask: Task<Void, Never>?
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
+
+    /// Polls `SystemAudioCapture.lastSampleTime` and surfaces a warning if SCStream
+    /// silently stops delivering samples (display sleep without our activity assertion,
+    /// permission revoked mid-session, captured app quit, etc.).
+    private var sysWatchdogTask: Task<Void, Never>?
+
+    /// Activity token preventing App Nap, idle system sleep, and idle display sleep
+    /// while a recording is live. Without this, ScreenCaptureKit pauses when the
+    /// display blanks and the engine appears stuck in "transcribing" while capturing
+    /// nothing.
+    private var liveActivity: (any NSObjectProtocol)?
 
     /// Shared, serialized ASR access. Injected so the same coordinator is shared with
     /// `PostProcessingQueue` — live streaming and batch re-transcription must route
@@ -74,6 +83,7 @@ final class TranscriptionEngine {
         guard await ensureMicrophonePermission() else { return }
 
         isRunning = true
+        beginLiveActivity()
 
         // 1. Load FluidAudio models
         assetStatus = "Loading ASR model (~600MB first run)..."
@@ -96,6 +106,7 @@ final class TranscriptionEngine {
             lastError = msg
             assetStatus = "Ready"
             isRunning = false
+            endLiveActivity()
             return
         }
 
@@ -175,6 +186,7 @@ final class TranscriptionEngine {
                     reportSysError("System audio transcription failed — restart session")
                 }
             }
+            startSystemAudioWatchdog()
         }
 
         assetStatus = "Transcribing (Parakeet-TDT v2)"
@@ -309,6 +321,8 @@ final class TranscriptionEngine {
     func stop() async {
         lastError = nil
         removeDefaultDeviceListener()
+        sysWatchdogTask?.cancel()
+        sysWatchdogTask = nil
         micTask?.cancel()
         sysTask?.cancel()
         micKeepAliveTask?.cancel()
@@ -320,6 +334,65 @@ final class TranscriptionEngine {
         currentMicDeviceID = 0
         isRunning = false
         assetStatus = "Ready"
+        endLiveActivity()
+    }
+
+    // MARK: - Activity assertion + system-audio watchdog
+
+    private func beginLiveActivity() {
+        guard liveActivity == nil else { return }
+        liveActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled, .idleDisplaySleepDisabled],
+            reason: "Tome live transcription"
+        )
+        diagLog("[ENGINE-ACTIVITY] begin (display + system sleep disabled)")
+    }
+
+    private func endLiveActivity() {
+        if let activity = liveActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            liveActivity = nil
+            diagLog("[ENGINE-ACTIVITY] end")
+        }
+    }
+
+    /// SCStream can pause silently (no `didStopWithError` callback) when the display
+    /// sleeps, the captured app quits, or capture permission is revoked. Poll the
+    /// last-sample timestamp; if the gap exceeds the threshold while running, surface
+    /// a visible warning so a future regression here is loud instead of silent.
+    private func startSystemAudioWatchdog() {
+        sysWatchdogTask?.cancel()
+        let capture = systemCapture
+        sysWatchdogTask = Task { [weak self] in
+            let stallThreshold: TimeInterval = 15
+            var warned = false
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                if Task.isCancelled { return }
+                let last = capture.lastSampleTime
+                await MainActor.run {
+                    guard let self else { return }
+                    guard self.isRunning else { return }
+                    guard let last else { return }
+                    let gap = Date().timeIntervalSince(last)
+                    if gap > stallThreshold {
+                        if !warned {
+                            let msg = "System audio capture stalled (\(Int(gap))s) — restart the session"
+                            self.lastError = msg
+                            diagLog("[WATCHDOG] system audio gap=\(Int(gap))s — \(msg)")
+                            warned = true
+                        }
+                    } else if warned {
+                        // Samples resumed flowing — clear the warning if we set it.
+                        if self.lastError?.hasPrefix("System audio capture stalled") == true {
+                            self.lastError = nil
+                        }
+                        warned = false
+                        diagLog("[WATCHDOG] system audio resumed")
+                    }
+                }
+            }
+        }
     }
 
     /// Run offline diarization on the buffered system audio using SpeakerKit (pyannote v4).
