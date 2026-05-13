@@ -82,33 +82,56 @@ final class PostProcessingJob: Identifiable {
                     throw .cancelled
                 }
 
-                if let results, !results.isEmpty {
-                    TranscriptFinalizer.rebuildFromDiarizedSegments(
-                        snapshot: &handle.transcript,
-                        diarizedSegments: results
-                    )
-                } else {
-                    diagLog("[JOB \(id)] re-transcription empty, falling back to relabel")
-                    TranscriptFinalizer.rewriteWithDiarization(
-                        snapshot: &handle.transcript,
-                        segments: segments
-                    )
+                do {
+                    if let results, !results.isEmpty {
+                        try TranscriptFinalizer.rebuildFromDiarizedSegments(
+                            snapshot: &handle.transcript,
+                            diarizedSegments: results
+                        )
+                    } else {
+                        diagLog("[JOB \(id)] re-transcription empty, falling back to relabel")
+                        try TranscriptFinalizer.rewriteWithDiarization(
+                            snapshot: &handle.transcript,
+                            segments: segments
+                        )
+                    }
+                } catch {
+                    handleDurableWriteFailure(bufferURL: bufferURL, error: error)
+                    phase = .failed(error)
+                    throw error
                 }
             }
-
-            SystemAudioCapture.cleanupBufferFile(bufferURL)
         }
 
-        // 2. Finalize frontmatter and rename the file as needed.
+        // 2. Finalize frontmatter and rename the file as needed. Only after this
+        //    succeeds do we delete the system-audio buffer — keeping the WAV around
+        //    means a write failure here is recoverable rather than permanently lost.
         phase = .finalizing
-        guard let savedPath = TranscriptFinalizer.finalizeFrontmatter(snapshot: handle.transcript) else {
-            let err = PostProcessingError.markdownWriteFailed("No transcript snapshot")
-            phase = .failed(err)
-            throw err
+        let savedPath: URL
+        do {
+            savedPath = try TranscriptFinalizer.finalizeFrontmatter(snapshot: handle.transcript)
+        } catch {
+            if let bufferURL = handle.wavBufferPath {
+                handleDurableWriteFailure(bufferURL: bufferURL, error: error)
+            }
+            phase = .failed(error)
+            throw error
+        }
+
+        if let bufferURL = handle.wavBufferPath {
+            SystemAudioCapture.cleanupBufferFile(bufferURL)
         }
 
         phase = .complete(savedPath)
         diagLog("[JOB \(id)] complete → \(savedPath.lastPathComponent)")
         return savedPath
+    }
+
+    /// Called when a TranscriptFinalizer write step throws. Moves the system-audio
+    /// WAV out of /var/folders (which macOS can purge) into a stable recovery dir
+    /// so the diarized transcript can be regenerated manually later.
+    private func handleDurableWriteFailure(bufferURL: URL, error: PostProcessingError) {
+        diagLog("[JOB \(id)] durable write failed: \(error) — preserving WAV for recovery")
+        SystemAudioCapture.moveBufferToRecovery(bufferURL, sessionId: id)
     }
 }

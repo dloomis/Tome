@@ -99,6 +99,29 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         try? FileManager.default.removeItem(at: url)
     }
 
+    /// Move a buffered audio file to `~/Library/Application Support/Tome/recovery/{sessionId}.wav`
+    /// when post-processing failed to durably write the diarized transcript. /var/folders is
+    /// purgeable by macOS, so the WAV needs a stable home if we want any chance at manual recovery.
+    @discardableResult
+    static func moveBufferToRecovery(_ bufferURL: URL, sessionId: String) -> URL? {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            diagLog("[RECOVERY] no application support dir — WAV left at \(bufferURL.path)")
+            return nil
+        }
+        let recoveryDir = appSupport.appendingPathComponent("Tome/recovery", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: recoveryDir, withIntermediateDirectories: true)
+            let dest = recoveryDir.appendingPathComponent("\(sessionId).wav")
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.moveItem(at: bufferURL, to: dest)
+            diagLog("[RECOVERY] moved \(bufferURL.lastPathComponent) → \(dest.path)")
+            return dest
+        } catch {
+            diagLog("[RECOVERY] move failed: \(error) — WAV left at \(bufferURL.path)")
+            return nil
+        }
+    }
+
     // MARK: - SCStreamOutput
 
     private let _sampleCount = OSAllocatedUnfairLock<Int>(uncheckedState: 0)

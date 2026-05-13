@@ -13,7 +13,7 @@ enum TranscriptFinalizer {
     static func rebuildFromDiarizedSegments(
         snapshot: inout TranscriptSessionSnapshot,
         diarizedSegments: [ReTranscribedSegment]
-    ) {
+    ) throws(PostProcessingError) {
         let filePath = snapshot.filePath
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
         guard let transcriptStart = content.range(of: "## Transcript\n") else { return }
@@ -87,10 +87,7 @@ enum TranscriptFinalizer {
 
         content = updatedHeader + newBody
 
-        // Atomic write
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
-        try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+        try atomicWrite(content, to: filePath, context: "rebuildFromDiarizedSegments")
     }
 
     /// Rewrite the transcript file, replacing "Them" labels with diarized speaker IDs.
@@ -99,7 +96,7 @@ enum TranscriptFinalizer {
     static func rewriteWithDiarization(
         snapshot: inout TranscriptSessionSnapshot,
         segments: [DiarizedSegment]
-    ) {
+    ) throws(PostProcessingError) {
         let filePath = snapshot.filePath
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
@@ -188,20 +185,19 @@ enum TranscriptFinalizer {
             content.replaceSubrange(range, with: "**Speakers:** \(updatedSpeakers.count)")
         }
 
-        // Atomic write
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_diar_tmp.md")
-        try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+        try atomicWrite(content, to: filePath, context: "rewriteWithDiarization")
     }
 
     /// Rewrite the YAML frontmatter with final duration, speaker count, and attendees.
     /// Renames the file if a suggested filename or context is present.
-    /// Returns the final (possibly renamed) path.
+    /// Returns the final (possibly renamed) path. Throws if the frontmatter content
+    /// write fails — the rename step is best-effort and only diagLog'd on failure
+    /// because content has already landed at the original path.
     @discardableResult
     static func finalizeFrontmatter(
         snapshot: TranscriptSessionSnapshot
-    ) -> URL? {
-        rewriteFrontmatter(
+    ) throws(PostProcessingError) -> URL {
+        try rewriteFrontmatter(
             filePath: snapshot.filePath,
             startTime: snapshot.sessionStartTime,
             speakers: snapshot.speakersDetected,
@@ -236,7 +232,7 @@ enum TranscriptFinalizer {
         speakers: Set<String>,
         context: String,
         suggestedFilename: String? = nil
-    ) {
+    ) throws(PostProcessingError) {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
         let elapsed = Date().timeIntervalSince(startTime)
@@ -292,15 +288,41 @@ enum TranscriptFinalizer {
             finalPath = newPath
         }
 
-        // Atomic write
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
-        try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
+        try atomicWrite(content, to: filePath, tmpName: ".tome_tmp.md", context: "rewriteFrontmatter")
 
+        // Best-effort rename — content has already landed at filePath atomically, so a
+        // rename failure does not lose data. Log and continue rather than throw.
         if finalPath != filePath {
-            _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
-            try? FileManager.default.moveItem(at: filePath, to: finalPath)
-        } else {
-            _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+            do {
+                try FileManager.default.moveItem(at: filePath, to: finalPath)
+            } catch {
+                diagLog("[FINALIZER] rename failed: \(filePath.lastPathComponent) → \(finalPath.lastPathComponent): \(error)")
+            }
+        }
+    }
+
+    /// Write `content` to `filePath` via a temp-file + atomic-replace dance. The
+    /// `try?` swallowing of these errors was the root cause of the silent
+    /// diarization data loss on iCloud-backed paths — surface them as throws now.
+    private static func atomicWrite(
+        _ content: String,
+        to filePath: URL,
+        tmpName: String = ".tome_diar_tmp.md",
+        context: String
+    ) throws(PostProcessingError) {
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(tmpName)
+        do {
+            try content.write(to: tmpPath, atomically: true, encoding: .utf8)
+        } catch {
+            diagLog("[FINALIZER] \(context): tmp write failed at \(tmpPath.path): \(error)")
+            throw .markdownWriteFailed("\(context): tmp write failed — \(error.localizedDescription)")
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+        } catch {
+            try? FileManager.default.removeItem(at: tmpPath)
+            diagLog("[FINALIZER] \(context): replaceItemAt failed for \(filePath.path): \(error)")
+            throw .markdownWriteFailed("\(context): replaceItemAt failed — \(error.localizedDescription)")
         }
     }
 }
