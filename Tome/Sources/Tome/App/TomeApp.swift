@@ -45,6 +45,15 @@ struct TomeApp: App {
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(saveTranscript == nil)
             }
+            CommandMenu("View") {
+                Button("Logs") {
+                    let path = "/tmp/tome.log"
+                    if !FileManager.default.fileExists(atPath: path) {
+                        FileManager.default.createFile(atPath: path, contents: nil)
+                    }
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+            }
         }
         Settings {
             SettingsView(settings: settings, updater: updaterController.updater)
