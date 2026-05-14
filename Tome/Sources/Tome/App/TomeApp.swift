@@ -94,6 +94,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var postProcessingQueue: PostProcessingQueue?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Tome is a single-window utility — disable AppKit's automatic window
+        // tabbing so the View menu doesn't sprout "Show Tab Bar / Show All Tabs"
+        // entries from a feature we never use.
+        NSWindow.allowsAutomaticWindowTabbing = false
+
         let hidden = UserDefaults.standard.object(forKey: "hideFromScreenShare") == nil
             ? true
             : UserDefaults.standard.bool(forKey: "hideFromScreenShare")
