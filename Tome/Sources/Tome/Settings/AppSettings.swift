@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import FluidAudio
 import Observation
 import CoreAudio
 
@@ -13,6 +14,14 @@ enum SessionType: String, Sendable, Codable {
 final class AppSettings {
     var transcriptionLocale: String {
         didSet { UserDefaults.standard.set(transcriptionLocale, forKey: "transcriptionLocale") }
+    }
+
+    /// ASR language hint passed to FluidAudio's Parakeet v3 for script-aware token
+    /// filtering. Stored as the raw two-letter code ("en", "es", ...). No Settings
+    /// UI yet — that lands with a future picker; today the value is effectively a
+    /// constant of `.english` for new installs.
+    var transcriptionLanguage: Language {
+        didSet { UserDefaults.standard.set(transcriptionLanguage.rawValue, forKey: "transcriptionLanguage") }
     }
 
     /// Stored as the AudioDeviceID integer. 0 means "use system default".
@@ -49,6 +58,7 @@ final class AppSettings {
     init() {
         let defaults = UserDefaults.standard
         self.transcriptionLocale = defaults.string(forKey: "transcriptionLocale") ?? "en-US"
+        self.transcriptionLanguage = (defaults.string(forKey: "transcriptionLanguage").flatMap(Language.init(rawValue:))) ?? .english
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath

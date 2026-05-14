@@ -92,6 +92,13 @@ struct ContentView: View {
                 hasCompletedOnboarding = true
             }
         }
+        .onChange(of: settings.transcriptionLanguage) {
+            // Push setting changes to the ASR actor so subsequent transcribe calls
+            // use the new language hint. No UI for this setting yet — the hook is
+            // here so the picker that lands next release works end-to-end.
+            let language = settings.transcriptionLanguage
+            Task { await services.asrCoordinator.setLanguage(language) }
+        }
         .task {
             if !hasCompletedOnboarding {
                 showOnboarding = true
@@ -103,6 +110,7 @@ struct ContentView: View {
                 )
             }
             guard let engine = transcriptionEngine else { return }
+            await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
             apiServer.register(
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
@@ -205,6 +213,20 @@ struct ContentView: View {
                 .font(.system(size: 14, weight: .heavy))
                 .tracking(3)
                 .foregroundStyle(Color.fg1)
+
+            // Active ASR language code. Driven by `AppSettings.transcriptionLanguage`
+            // so the future Settings picker auto-updates this label.
+            Text(settings.transcriptionLanguage.rawValue.uppercased())
+                .font(.system(size: 10, weight: .medium))
+                .tracking(1)
+                .foregroundStyle(Color.fg2)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(Color.fg2.opacity(0.35), lineWidth: 0.5)
+                )
+                .padding(.leading, 10)
 
             Spacer()
 

@@ -13,8 +13,17 @@ actor ASRCoordinator {
     private var asrManager: AsrManager?
     private var micDecoderState = TdtDecoderState.make()
     private var systemDecoderState = TdtDecoderState.make()
+    /// Pushed in from `AppSettings.transcriptionLanguage` whenever it changes.
+    /// Used by Parakeet v3 for script-aware token filtering (no-op on v2).
+    private var currentLanguage: Language = .english
 
     var isInitialized: Bool { asrManager != nil }
+
+    /// Update the language hint used by subsequent transcribe calls. Called from
+    /// `ContentView` on appear and on settings change.
+    func setLanguage(_ language: Language) {
+        currentLanguage = language
+    }
 
     /// Loads Parakeet-TDT v3 models and initializes the underlying `AsrManager`.
     /// Safe to call repeatedly — subsequent calls are no-ops.
@@ -37,9 +46,11 @@ actor ASRCoordinator {
         guard let asrManager else { throw ASRCoordinatorError.notInitialized }
         // Swift 6 prohibits passing an actor-isolated stored property `inout` across
         // an await suspension. Copy to a local, call, then write back — safe because
-        // TdtDecoderState is a value type and the actor serializes access.
+        // TdtDecoderState is a value type and the actor serializes access. The
+        // language hint is read from `currentLanguage`, which `ContentView` keeps
+        // in sync with `AppSettings.transcriptionLanguage`.
         var state = decoderState(for: source)
-        let result = try await asrManager.transcribe(samples, decoderState: &state)
+        let result = try await asrManager.transcribe(samples, decoderState: &state, language: currentLanguage)
         setDecoderState(state, for: source)
         return result
     }
@@ -47,7 +58,7 @@ actor ASRCoordinator {
     func transcribe(buffer: AVAudioPCMBuffer, source: AudioSource) async throws -> ASRResult {
         guard let asrManager else { throw ASRCoordinatorError.notInitialized }
         var state = decoderState(for: source)
-        let result = try await asrManager.transcribe(buffer, decoderState: &state)
+        let result = try await asrManager.transcribe(buffer, decoderState: &state, language: currentLanguage)
         setDecoderState(state, for: source)
         return result
     }
