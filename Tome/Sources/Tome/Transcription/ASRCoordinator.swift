@@ -1,18 +1,19 @@
 @preconcurrency import AVFoundation
 import FluidAudio
 
-/// Serializes all access to the shared `AsrManager` and owns the per-source
-/// `TdtDecoderState`. FluidAudio 0.14 removed AsrManager's internal per-source
-/// state and now requires the caller to thread `decoderState: inout` through
-/// every transcribe call. We keep one state per `AudioSource` so the
-/// streaming chunk-by-chunk linguistic context (TdtDecoderState.lastToken) is
-/// preserved across mid-utterance flushes — matching the pre-0.14 behavior.
+/// Serializes all access to the shared `AsrManager`. FluidAudio 0.14 removed
+/// AsrManager's internal decoder state and now requires the caller to thread
+/// `decoderState: inout TdtDecoderState` through every transcribe call.
+/// Each call gets a fresh state, matching FluidAudio 0.7.9's behavior where
+/// `transcribe()` auto-reset decoder state after every call — Tome's
+/// StreamingTranscriber hands the coordinator one VAD-bounded segment at a
+/// time, so cross-call state carry-over would mean the LSTM/lastToken from a
+/// previous utterance primes the decoder for an unrelated next utterance
+/// (Parakeet v3 is sensitive enough that this collapses output to "."/blank).
 /// All ASR — live `StreamingTranscriber` and batch `SegmentReTranscriber` —
 /// routes through this actor.
 actor ASRCoordinator {
     private var asrManager: AsrManager?
-    private var micDecoderState = TdtDecoderState.make()
-    private var systemDecoderState = TdtDecoderState.make()
     /// Pushed in from `AppSettings.transcriptionLanguage` whenever it changes.
     /// Used by Parakeet v3 for script-aware token filtering (no-op on v2).
     private var currentLanguage: Language = .english
@@ -35,46 +36,19 @@ actor ASRCoordinator {
         self.asrManager = asr
     }
 
-    /// Reset decoder state for both mic and system sources. Call at session start so
-    /// stale context from a prior session doesn't leak into the new one.
-    func resetDecoderState() {
-        micDecoderState = TdtDecoderState.make()
-        systemDecoderState = TdtDecoderState.make()
-    }
+    /// No-op retained for API compatibility — decoder state is created fresh per call.
+    func resetDecoderState() {}
 
     func transcribe(samples: [Float], source: AudioSource) async throws -> ASRResult {
         guard let asrManager else { throw ASRCoordinatorError.notInitialized }
-        // Swift 6 prohibits passing an actor-isolated stored property `inout` across
-        // an await suspension. Copy to a local, call, then write back — safe because
-        // TdtDecoderState is a value type and the actor serializes access. The
-        // language hint is read from `currentLanguage`, which `ContentView` keeps
-        // in sync with `AppSettings.transcriptionLanguage`.
-        var state = decoderState(for: source)
-        let result = try await asrManager.transcribe(samples, decoderState: &state, language: currentLanguage)
-        setDecoderState(state, for: source)
-        return result
+        var state = TdtDecoderState.make()
+        return try await asrManager.transcribe(samples, decoderState: &state, language: currentLanguage)
     }
 
     func transcribe(buffer: AVAudioPCMBuffer, source: AudioSource) async throws -> ASRResult {
         guard let asrManager else { throw ASRCoordinatorError.notInitialized }
-        var state = decoderState(for: source)
-        let result = try await asrManager.transcribe(buffer, decoderState: &state, language: currentLanguage)
-        setDecoderState(state, for: source)
-        return result
-    }
-
-    private func decoderState(for source: AudioSource) -> TdtDecoderState {
-        switch source {
-        case .microphone: return micDecoderState
-        case .system: return systemDecoderState
-        }
-    }
-
-    private func setDecoderState(_ state: TdtDecoderState, for source: AudioSource) {
-        switch source {
-        case .microphone: micDecoderState = state
-        case .system: systemDecoderState = state
-        }
+        var state = TdtDecoderState.make()
+        return try await asrManager.transcribe(buffer, decoderState: &state, language: currentLanguage)
     }
 }
 
