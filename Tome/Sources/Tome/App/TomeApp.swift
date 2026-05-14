@@ -45,7 +45,11 @@ struct TomeApp: App {
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(saveTranscript == nil)
             }
-            CommandGroup(after: .toolbar) {
+            // Replace the toolbar command group (Show/Hide Toolbar, Customize
+            // Toolbar, Enter Full Screen) with our own minimal contents. Tome
+            // has no toolbar and never needs full-screen; the only item we want
+            // in the View menu is Logs.
+            CommandGroup(replacing: .toolbar) {
                 Button("Logs") {
                     let path = "/tmp/tome.log"
                     if !FileManager.default.fileExists(atPath: path) {
