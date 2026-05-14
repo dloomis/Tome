@@ -45,7 +45,7 @@ struct TomeApp: App {
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(saveTranscript == nil)
             }
-            CommandMenu("View") {
+            CommandGroup(after: .toolbar) {
                 Button("Logs") {
                     let path = "/tmp/tome.log"
                     if !FileManager.default.fileExists(atPath: path) {
