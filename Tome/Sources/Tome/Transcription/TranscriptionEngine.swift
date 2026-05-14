@@ -189,7 +189,7 @@ final class TranscriptionEngine {
             startSystemAudioWatchdog()
         }
 
-        assetStatus = "Transcribing (Parakeet-TDT v2)"
+        assetStatus = "Transcribing (Parakeet-TDT v3)"
         diagLog("[ENGINE-6] all transcription tasks started")
 
         // Install CoreAudio listener for default input device changes
