@@ -45,11 +45,7 @@ struct TomeApp: App {
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(saveTranscript == nil)
             }
-            // Replace the toolbar command group (Show/Hide Toolbar, Customize
-            // Toolbar, Enter Full Screen) with our own minimal contents. Tome
-            // has no toolbar and never needs full-screen; the only item we want
-            // in the View menu is Logs.
-            CommandGroup(replacing: .toolbar) {
+            CommandGroup(after: .toolbar) {
                 Button("Logs") {
                     let path = "/tmp/tome.log"
                     if !FileManager.default.fileExists(atPath: path) {
@@ -110,7 +106,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         for window in NSApp.windows {
             window.sharingType = sharingType
-            AppDelegate.disableFullScreen(on: window)
         }
 
         // Watch for new windows being created (e.g. Settings window)
@@ -126,21 +121,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let type: NSWindow.SharingType = hide ? .none : .readOnly
                 for window in NSApp.windows {
                     window.sharingType = type
-                    AppDelegate.disableFullScreen(on: window)
                 }
             }
         }
-    }
-
-    /// Opt the window out of full-screen mode so AppKit drops "Enter Full Screen"
-    /// from the View menu. Tome's main window is 320x560 and full-screening it
-    /// makes no sense; the Settings window similarly shouldn't full-screen.
-    private static func disableFullScreen(on window: NSWindow) {
-        var behavior = window.collectionBehavior
-        behavior.remove(.fullScreenPrimary)
-        behavior.remove(.fullScreenAuxiliary)
-        behavior.insert(.fullScreenNone)
-        window.collectionBehavior = behavior
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
