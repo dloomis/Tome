@@ -25,7 +25,10 @@ struct TomeApp: App {
     private let apiServer = APIServer()
 
     var body: some Scene {
-        WindowGroup {
+        // Single-instance Window (not WindowGroup) — on macOS 26, WindowGroup
+        // adds a "+" pill to the toolbar that opens duplicate instances. Tome
+        // is a single-window utility, so the singleton Window scene is correct.
+        Window("Tome", id: "main") {
             ContentView(settings: settings, apiServer: apiServer, services: services)
                 .onAppear {
                     settings.applyScreenShareVisibility()
