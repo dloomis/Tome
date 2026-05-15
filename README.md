@@ -15,7 +15,7 @@
 
 > **Fork note:** This is a fork of [Gremble-io/Tome](https://github.com/Gremble-io/Tome). The upstream project is the original work — this fork adds a local API server and a few quality-of-life fixes. See [Fork Additions](#fork-additions) below.
 
-Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v2, and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
+Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-idle.png" width="350" alt="Tome — idle state" />
@@ -49,7 +49,7 @@ Tome does the first three. Your agent does the rest.
 
 ## Features
 
-- **Local transcription** via Parakeet-TDT v2 ([FluidAudio](https://github.com/FluidInference/FluidAudio)) on Apple Silicon. Nothing hits the network.
+- **Local transcription** via Parakeet-TDT v3 ([FluidAudio](https://github.com/FluidInference/FluidAudio)) on Apple Silicon. Nothing hits the network.
 - **Call Capture** grabs mic + system audio. Detects which conferencing app you're in (Teams, Zoom, Slack, etc.) and filters audio to just that app. Your Spotify and notification sounds stay out of the transcript.
 - **Voice Memo** is mic only. For quick thoughts, verbal notes, stream of consciousness. Saves to a separate folder so it doesn't clutter your meeting transcripts.
 - **Speaker diarization** runs after the call ends. pyannote splits the remote audio into Speaker 2, Speaker 3, Speaker 4. Not perfect, but way better than one wall of unattributed text.
@@ -65,7 +65,7 @@ Tome does the first three. Your agent does the rest.
 └─────────────┘     │  Tome            │     │  Obsidian     │
                     │  ┌────────────┐  │────▶│  Vault        │
 ┌─────────────┐     │  │ Parakeet   │  │     │  (.md files)  │
-│  System      │────▶│  │ TDT v2    │  │     │               │
+│  System      │────▶│  │ TDT v3    │  │     │               │
 │  Audio       │     │  └────────────┘  │     └───────┬───────┘
 └─────────────┘     └──────────────────┘             │
                                                      ▼
@@ -200,12 +200,45 @@ Tome/Sources/Tome/
 
 ## Fork Additions
 
-This fork adds the following on top of upstream Tome:
+This fork has diverged substantially from upstream Tome. Beyond what upstream ships, this fork adds:
 
-- **SpeakerKit diarization** — replaces upstream's FluidAudio offline diarizer with [SpeakerKit](https://github.com/argmaxinc/WhisperKit) (pyannote v4). After a session ends, system audio is re-processed for speaker segmentation and each segment is re-transcribed with per-speaker labels.
-- **Local API server** — an HTTP server on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session lifecycle, and retrieving transcripts. Accepts an optional `suggestedFilename` so callers can control output naming. Port is written to `~/Library/Application Support/Tome/api-port` on launch. An OpenAPI 3.1 spec is served at `GET /` for discoverability. Used by [WhisperCal](https://github.com/dloomis/WhisperCal) but any local client can call it.
-- **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session.
-- **Bug fixes** — empty transcript guard for diarization, session ID mismatch in API responses, atomic file writes, dead code removal, and various code quality improvements.
+### Diarization & transcription
+
+- **SpeakerKit diarization (pyannote v4)** — replaces upstream's FluidAudio offline diarizer with [SpeakerKit](https://github.com/argmaxinc/WhisperKit). After a session ends, system audio is re-processed for speaker segmentation and each segment is re-transcribed with per-speaker labels.
+- **Background post-session processing** — diarization + frontmatter finalization run on a serial background queue (`PostProcessingQueue`) so a new recording can start immediately after Stop. The menu bar icon pulses while finalization is in flight.
+- **Keep transcribing while the display sleeps** — capture and ASR are no longer interrupted by display sleep.
+- **Dynamic ASR language hint** — `AppSettings.transcriptionLanguage` flows through to the ASR coordinator at session start and on the fly; UI exposure ships in the next release.
+- **Fresh TDT decoder state per transcribe call** — eliminates cross-utterance state bleed that produced empty/duplicated outputs on FluidAudio 0.14.
+
+### Reliability & durability
+
+- **fsync on every disk write** — `TranscriptLogger` and `SessionStore` call `fileHandle.synchronize()` after every flush so the last 1–3 utterances survive kernel panic, SIGKILL, or sudden power loss (not just a process crash).
+- **Terminate flush** — `applicationShouldTerminate` flushes both the live markdown writer and the JSONL crash-recovery file before the OS reaps the process, with a 2s hard cap.
+- **Filename collision handling** — `TranscriptFinalizer` appends `-1`, `-2`, … instead of clobbering an existing file when context-based renames collide; the save banner reflects the resolved name.
+- **Visible failures instead of silent drops** — mic device-set OSStatus errors, system-audio WAV write errors (counted through to the post-processing job as a warning), short-segment drops, vault-disappeared state, and context-update reopen failures all surface to a `lastError` polled by the UI.
+- **Strict utterance ordering** — markdown and JSONL writes flow through a single-consumer `AsyncStream` instead of racing per-utterance Tasks.
+- **YAML-safe context** — frontmatter `context:` is fully escaped (newlines, tabs, quotes) so multi-line context strings can't break parsers.
+- **`[transcription failed]` placeholders** — re-transcription errors leave a visible hole in the final transcript instead of silently dropping the segment.
+- **Recovery WAV on diarization failure** — when post-processing fails to write a durable transcript, the system audio WAV is moved to `~/Library/Application Support/Tome/recovery/` so it can be reprocessed manually.
+
+### API & integration
+
+- **Local HTTP API server** — `APIServer` on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session lifecycle, and retrieving transcripts. Accepts an optional `suggestedFilename` and `MeetingContext` so callers can control output naming and seed the `## Context` body. Port is written to `~/Library/Application Support/Tome/api-port` on launch; an OpenAPI 3.1 spec is served at `GET /` for discoverability. State machine: `idle → recording → transcribing → complete → idle`. Used by [WhisperCal](https://github.com/dloomis/WhisperCal) but any local client can call it.
+- **Settings > Local API panel** — shows the fixed port and a reference of available endpoints.
+- **API race fix** — duplicate session-start requests are rejected instead of being honored in parallel.
+
+### UI quality of life
+
+- **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session via `NSSavePanel`.
+- **View > Logs** — opens `/tmp/tome.log` for quick diagnostic inspection.
+- **Window scene (single instance)** — replaces `WindowGroup` so macOS 26 stops adding the "+" duplicate-instance pill to the toolbar.
+- **Drop full-screen / tab-bar menu entries** — `NSWindow.allowsAutomaticWindowTabbing = false` and window opt-out of full-screen, so the View menu stays clean.
+
+### Other
+
+- **Atomic file writes** with `replaceItemAt` for the markdown rewrite paths (frontmatter, context updates, rebuild-from-diarization).
+- **Empty-transcript guard** for short sessions that previously got stuck on "Identifying speakers…".
+- **Code quality** — session ID mismatch fixes in API responses, dead-code removal, and assorted bug fixes.
 
 ## Credits
 
