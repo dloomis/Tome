@@ -65,7 +65,12 @@ struct SegmentReTranscriber: Sendable {
                     let label = speakerMap[seg.speakerId] ?? "Speaker 2"
                     output.append(ReTranscribedSegment(speaker: label, text: text, startTime: seg.startTime))
                 } catch {
+                    // Visible holes in the final transcript beat silent drops — the user can see
+                    // which segment failed and re-record. "[transcription failed]" is the agreed
+                    // placeholder convention; downstream rebuilders treat it as opaque text.
                     diagLog("[RETRANSCRIBE] Segment \(seg.startTime)-\(seg.endTime) failed: \(error.localizedDescription)")
+                    let label = speakerMap[seg.speakerId] ?? "Speaker 2"
+                    output.append(ReTranscribedSegment(speaker: label, text: "[transcription failed]", startTime: seg.startTime))
                     continue
                 }
             }

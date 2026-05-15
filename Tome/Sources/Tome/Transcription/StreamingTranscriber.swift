@@ -105,6 +105,7 @@ final class StreamingTranscriber: @unchecked Sendable {
                                     consecutiveErrors = 0
                                 }
                             } else {
+                                diagLog("[\(self.speaker.rawValue)] dropping short speech-end segment: samples=\(speechSamples.count) (<8000 ≈ 0.5s, Parakeet emits garbage below this threshold)")
                                 speechSamples.removeAll(keepingCapacity: true)
                             }
                         }
@@ -135,6 +136,8 @@ final class StreamingTranscriber: @unchecked Sendable {
 
         if speechSamples.count > 8000 {
             _ = await transcribeSegment(speechSamples)
+        } else if !speechSamples.isEmpty {
+            diagLog("[\(self.speaker.rawValue)] dropping short end-of-stream remnant: samples=\(speechSamples.count) (<8000 ≈ 0.5s)")
         }
 
         return consecutiveErrors > 10

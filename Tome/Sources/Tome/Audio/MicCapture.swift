@@ -33,6 +33,15 @@ final class MicCapture: @unchecked Sendable {
                     UInt32(MemoryLayout<AudioDeviceID>.size)
                 )
                 diagLog("[MIC-2] setInputDevice status=\(status) (0=ok)")
+                // Surface a real failure to the UI — historically the silent fallback
+                // to "system default" hid disconnected-USB-mic cases entirely.
+                guard status == noErr else {
+                    let msg = "Failed to set mic device \(id): OSStatus \(status)"
+                    diagLog("[MIC-2-FAIL] \(msg)")
+                    errorHolder.value = msg
+                    continuation.finish()
+                    return
+                }
             } else {
                 diagLog("[MIC-2] no deviceID, using system default")
             }

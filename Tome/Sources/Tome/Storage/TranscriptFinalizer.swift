@@ -204,26 +204,6 @@ enum TranscriptFinalizer {
             context: snapshot.sessionContext,
             suggestedFilename: snapshot.suggestedFilename
         )
-
-        if let suggested = snapshot.suggestedFilename, !suggested.isEmpty {
-            let sanitized = suggested
-                .replacingOccurrences(of: "/", with: "-")
-                .replacingOccurrences(of: ":", with: "-")
-                .trimmingCharacters(in: .whitespaces)
-            let newFilename = "\(sanitized).md"
-            return snapshot.filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
-        } else if !snapshot.sessionContext.isEmpty {
-            let truncated = String(snapshot.sessionContext.prefix(50))
-                .replacingOccurrences(of: "/", with: "-")
-                .replacingOccurrences(of: ":", with: "-")
-                .trimmingCharacters(in: .whitespaces)
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
-            let datePrefix = dateFmt.string(from: snapshot.sessionStartTime)
-            let newFilename = "\(datePrefix) \(truncated).md"
-            return snapshot.filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
-        }
-        return snapshot.filePath
     }
 
     private static func rewriteFrontmatter(
@@ -232,8 +212,8 @@ enum TranscriptFinalizer {
         speakers: Set<String>,
         context: String,
         suggestedFilename: String? = nil
-    ) throws(PostProcessingError) {
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+    ) throws(PostProcessingError) -> URL {
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return filePath }
 
         let elapsed = Date().timeIntervalSince(startTime)
         let minutes = Int(elapsed) / 60
@@ -292,12 +272,29 @@ enum TranscriptFinalizer {
 
         // Best-effort rename — content has already landed at filePath atomically, so a
         // rename failure does not lose data. Log and continue rather than throw.
-        if finalPath != filePath {
-            do {
-                try FileManager.default.moveItem(at: filePath, to: finalPath)
-            } catch {
-                diagLog("[FINALIZER] rename failed: \(filePath.lastPathComponent) → \(finalPath.lastPathComponent): \(error)")
+        guard finalPath != filePath else { return filePath }
+
+        // Resolve collisions by appending -1, -2, … so we never clobber an existing file.
+        var attempt = finalPath
+        var suffix = 1
+        while FileManager.default.fileExists(atPath: attempt.path) {
+            let stem = finalPath.deletingPathExtension().lastPathComponent
+            let ext = finalPath.pathExtension
+            attempt = finalPath.deletingLastPathComponent()
+                .appendingPathComponent("\(stem)-\(suffix).\(ext)")
+            suffix += 1
+            if suffix > 100 {
+                diagLog("[FINALIZER] gave up after 100 collision attempts for \(finalPath.lastPathComponent)")
+                return filePath
             }
+        }
+
+        do {
+            try FileManager.default.moveItem(at: filePath, to: attempt)
+            return attempt
+        } catch {
+            diagLog("[FINALIZER] rename failed: \(filePath.lastPathComponent) → \(attempt.lastPathComponent): \(error)")
+            return filePath
         }
     }
 

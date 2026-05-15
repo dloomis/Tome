@@ -15,9 +15,18 @@ final class AppServices {
     /// serially so new recordings can start immediately.
     let postProcessingQueue: PostProcessingQueue
 
+    /// Live transcript writer (Markdown into the vault). App-lifetime so the
+    /// terminate handler can reach it for an emergency flush.
+    let transcriptLogger: TranscriptLogger
+
+    /// Crash-recovery JSONL store. Same ownership rationale as `transcriptLogger`.
+    let sessionStore: SessionStore
+
     init() {
         let asr = ASRCoordinator()
         self.asrCoordinator = asr
         self.postProcessingQueue = PostProcessingQueue(asr: asr)
+        self.transcriptLogger = TranscriptLogger()
+        self.sessionStore = SessionStore()
     }
 }

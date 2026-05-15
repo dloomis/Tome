@@ -22,8 +22,6 @@ struct ContentView: View {
     let services: AppServices
     @State private var transcriptStore = TranscriptStore()
     @State private var transcriptionEngine: TranscriptionEngine?
-    @State private var sessionStore = SessionStore()
-    @State private var transcriptLogger = TranscriptLogger()
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var showOnboarding = false
     @State private var audioLevel: Float = 0
@@ -37,6 +35,19 @@ struct ContentView: View {
     /// `PostProcessingJob` at stop time so the job can be tracked by session id.
     @State private var currentSessionId: String?
     @State private var currentSourceApp: String?
+
+    /// Single-consumer channel that serializes utterance writes to the markdown
+    /// transcript and the JSONL crash-recovery file. Prevents the two stores from
+    /// drifting out of order when `handleNewUtterance` fires faster than the
+    /// individual Task closures can run.
+    @State private var utteranceContinuation: AsyncStream<UtteranceWrite>.Continuation?
+    @State private var utteranceWriterTask: Task<Void, Never>?
+
+    private struct UtteranceWrite: Sendable {
+        let speaker: Speaker
+        let text: String
+        let timestamp: Date
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -111,10 +122,27 @@ struct ContentView: View {
             }
             guard let engine = transcriptionEngine else { return }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
+
+            // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
+            if utteranceWriterTask == nil {
+                let (stream, cont) = AsyncStream.makeStream(of: UtteranceWrite.self)
+                utteranceContinuation = cont
+                let logger = services.transcriptLogger
+                let store = services.sessionStore
+                utteranceWriterTask = Task {
+                    defer { diagLog("[CHANNEL] utterance writer exited") }
+                    for await u in stream {
+                        let speakerName = u.speaker == .you ? "You" : "Them"
+                        await logger.append(speaker: speakerName, text: u.text, timestamp: u.timestamp)
+                        await store.appendRecord(SessionRecord(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
+                    }
+                }
+            }
+
             apiServer.register(
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
-                sessionStore: sessionStore,
+                sessionStore: services.sessionStore,
                 onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
@@ -160,7 +188,10 @@ struct ContentView: View {
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
-                await transcriptLogger.flushIfNeeded()
+                await services.transcriptLogger.flushIfNeeded()
+                if let err = await services.transcriptLogger.lastError {
+                    transcriptionEngine?.lastError = err
+                }
             }
         }
         .onChange(of: settings.inputDeviceID) {
@@ -360,24 +391,24 @@ struct ContentView: View {
 
         Task {
             transcriptionEngine?.lastError = nil
-            await sessionStore.startSession(sessionId: sid)
+            await services.sessionStore.startSession(sessionId: sid)
             apiServer.sessionDidStart(id: sid)
             do {
-                try await transcriptLogger.startSession(
+                try await services.transcriptLogger.startSession(
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
                     sessionType: type,
                     suggestedFilename: suggestedFilename
                 )
             } catch {
-                await sessionStore.endSession()
+                await services.sessionStore.endSession()
                 transcriptionEngine?.lastError = error.localizedDescription
                 return
             }
 
             // Forward meeting context from API callers to the transcript
             if let ctx = meetingContext, let subject = ctx.subject {
-                await transcriptLogger.updateContext(subject)
+                await services.transcriptLogger.updateContext(subject)
             }
 
             activeSessionType = type
@@ -416,10 +447,11 @@ struct ContentView: View {
             // Snapshot the buffer URL BEFORE tearing down the engine, since the engine
             // may begin a new session (which reuses `SystemAudioCapture`) immediately.
             let bufferURL: URL? = wasCallCapture ? transcriptionEngine?.activeBufferURL : nil
+            let wavWriteErrors = wasCallCapture ? (transcriptionEngine?.systemAudioWriteErrorCount ?? 0) : 0
 
             await transcriptionEngine?.stop()
-            await sessionStore.endSession()
-            guard let transcriptSnapshot = await transcriptLogger.endSession() else {
+            await services.sessionStore.endSession()
+            guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
                 transcriptionEngine?.assetStatus = "Ready"
                 apiServer.sessionDidComplete(id: sessionId)
                 return
@@ -432,7 +464,8 @@ struct ContentView: View {
                 sessionType: sessionType,
                 sourceApp: sourceApp,
                 wavBufferPath: bufferURL,
-                transcript: transcriptSnapshot
+                transcript: transcriptSnapshot,
+                wavWriteErrorCount: wavWriteErrors
             )
             let job = PostProcessingJob(
                 handle: handle,
@@ -466,24 +499,7 @@ struct ContentView: View {
 
     private func handleNewUtterance() {
         guard let last = transcriptStore.utterances.last else { return }
-
         silenceSeconds = 0
-
-        let speakerName = last.speaker == .you ? "You" : "Them"
-        Task {
-            await transcriptLogger.append(
-                speaker: speakerName,
-                text: last.text,
-                timestamp: last.timestamp
-            )
-        }
-
-        Task {
-            await sessionStore.appendRecord(SessionRecord(
-                speaker: last.speaker,
-                text: last.text,
-                timestamp: last.timestamp
-            ))
-        }
+        utteranceContinuation?.yield(UtteranceWrite(speaker: last.speaker, text: last.text, timestamp: last.timestamp))
     }
 }

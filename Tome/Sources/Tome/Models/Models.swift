@@ -81,6 +81,10 @@ struct SessionHandle: Sendable {
     /// system audio (e.g. voice memos), which signals the job to skip diarization.
     let wavBufferPath: URL?
     var transcript: TranscriptSessionSnapshot
+    /// Number of times the system-audio WAV writer threw on `write(from:)`. Non-zero
+    /// values are not fatal but indicate the diarization input may be incomplete —
+    /// the post-processing job logs a warning before diarizing.
+    var wavWriteErrorCount: Int = 0
 }
 
 // MARK: - Post-Processing Error

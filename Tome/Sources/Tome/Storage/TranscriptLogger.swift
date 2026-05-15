@@ -22,6 +22,11 @@ actor TranscriptLogger {
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
     private var suggestedFilename: String?
 
+    /// Set when a flush/synchronize/reopen path fails or when the underlying file
+    /// disappears (vault unmounted). Read by the UI through the periodic
+    /// `flushIfNeeded()` poll and surfaced via `TranscriptionEngine.lastError`.
+    var lastError: String?
+
     func setSuggestedFilename(_ name: String?) {
         suggestedFilename = name
     }
@@ -33,6 +38,7 @@ actor TranscriptLogger {
         self.sessionContext = ""
         self.utteranceBuffer = []
         self.suggestedFilename = suggestedFilename
+        self.lastError = nil
 
         let expandedPath = NSString(string: vaultPath).expandingTildeInPath
         let directory = URL(fileURLWithPath: expandedPath)
@@ -121,6 +127,10 @@ tags:
         if !utteranceBuffer.isEmpty {
             flushBuffer()
         }
+        // Vault-disappeared detection: surfaces unmount/eject within the timer cadence.
+        if let path = currentFilePath, !FileManager.default.fileExists(atPath: path.path) {
+            lastError = "Transcript file disappeared — vault may be unmounted"
+        }
     }
 
     private func flushBuffer() {
@@ -135,9 +145,16 @@ tags:
             lines += "\(entry.text)\n\n"
         }
 
-        if let data = lines.data(using: .utf8) {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(data)
+        guard let data = lines.data(using: .utf8) else { return }
+        fileHandle.seekToEndOfFile()
+        do {
+            try fileHandle.write(contentsOf: data)
+            try fileHandle.synchronize()
+        } catch {
+            // Keep buffered utterances so the next flush retries instead of losing them.
+            lastError = "Transcript write failed: \(error.localizedDescription)"
+            diagLog("[LOGGER] flushBuffer write failed: \(error)")
+            return
         }
 
         utteranceBuffer.removeAll()
@@ -147,8 +164,10 @@ tags:
         sessionContext = text
         guard let filePath = currentFilePath else { return }
 
-        // Flush any buffered utterances first
+        // Flush any buffered utterances first, then fsync before close so any
+        // pending pages are durable before the atomic-replace rewrites the file.
         flushBuffer()
+        try? fileHandle?.synchronize()
         try? fileHandle?.close()
         fileHandle = nil
 
@@ -156,8 +175,7 @@ tags:
 
         // Update frontmatter context field
         if let range = content.range(of: #"context: ".*""#, options: .regularExpression) {
-            let escaped = text.replacingOccurrences(of: "\"", with: "\\\"")
-            content.replaceSubrange(range, with: "context: \"\(escaped)\"")
+            content.replaceSubrange(range, with: "context: \(Self.yamlQuote(text))")
         }
 
         // Update ## Context body section
@@ -167,14 +185,39 @@ tags:
             content.replaceSubrange(replaceRange, with: "\n\(text)\n")
         }
 
-        // Atomic write
+        // Atomic write — fsync the tmp file before replace so it lands on disk
+        // before the rename. Without this, a crash between replace and the next
+        // sync can leave a zero-byte file.
         let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
         try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
+        if let tmpHandle = try? FileHandle(forUpdating: tmpPath) {
+            try? tmpHandle.synchronize()
+            try? tmpHandle.close()
+        }
         _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
 
-        // Reopen file handle
+        // Reopen file handle; surface a missing handle so the timer-driven UI banner notices.
         fileHandle = try? FileHandle(forWritingTo: filePath)
+        if fileHandle == nil {
+            lastError = "Lost transcript handle after context update"
+            diagLog("[LOGGER] reopen failed after updateContext")
+        }
         fileHandle?.seekToEndOfFile()
+    }
+
+    private static func yamlQuote(_ s: String) -> String {
+        var out = ""
+        for ch in s {
+            switch ch {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:   out.append(ch)
+            }
+        }
+        return "\"\(out)\""
     }
 
     /// Close the current session and return an immutable snapshot for post-processing.
@@ -182,6 +225,7 @@ tags:
     /// `TranscriptFinalizer` needs to finalize this session in the background.
     func endSession() -> TranscriptSessionSnapshot? {
         flushBuffer()
+        try? fileHandle?.synchronize()
         try? fileHandle?.close()
         fileHandle = nil
 

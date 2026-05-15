@@ -17,6 +17,11 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _bufferFilePath = OSAllocatedUnfairLock<URL?>(uncheckedState: nil)
 
     private let _audioFileWriter = OSAllocatedUnfairLock<AVAudioFile?>(uncheckedState: nil)
+    private let _writeErrors = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
+
+    /// Count of `AVAudioFile.write(from:)` failures during the current capture.
+    /// Read by the engine at stop time to seed `SessionHandle.wavWriteErrorCount`.
+    var writeErrorCount: Int { _writeErrors.withLock { $0 } }
 
     /// Wall-clock time of the most recent sample buffer delivered by SCStream while
     /// capture is active. `nil` when not capturing. The engine watchdog reads this to
@@ -55,6 +60,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         let bufferURL = FileManager.default.temporaryDirectory.appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
         _bufferFilePath.withLock { $0 = bufferURL }
         _audioFileWriter.withLock { $0 = nil } // will be created on first audio callback
+        _writeErrors.withLock { $0 = 0 }
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
@@ -165,7 +171,16 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
                 let wavFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
                 writer = try? AVAudioFile(forWriting: bufferPath, settings: wavFormat.settings)
             }
-            try? writer?.write(from: pcmBuffer)
+            if let w = writer {
+                do {
+                    try w.write(from: pcmBuffer)
+                } catch {
+                    let total = self._writeErrors.withLock { count -> Int in count += 1; return count }
+                    if total == 1 || total % 100 == 0 {
+                        diagLog("[SYS-WAV-FAIL] write #\(total) failed: \(error)")
+                    }
+                }
+            }
         }
 
         _ = _sysContinuation.withLock { $0?.yield(pcmBuffer) }

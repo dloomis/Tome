@@ -36,14 +36,16 @@ actor SessionStore {
         do {
             let data = try encoder.encode(record)
             fileHandle.seekToEndOfFile()
-            fileHandle.write(data)
-            fileHandle.write("\n".data(using: .utf8)!)
+            try fileHandle.write(contentsOf: data)
+            try fileHandle.write(contentsOf: "\n".data(using: .utf8)!)
+            try fileHandle.synchronize()
         } catch {
             print("SessionStore: failed to write record: \(error)")
         }
     }
 
     func endSession() {
+        try? fileHandle?.synchronize()
         try? fileHandle?.close()
         fileHandle = nil
         currentFile = nil

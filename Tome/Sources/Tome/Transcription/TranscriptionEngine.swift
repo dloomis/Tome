@@ -515,4 +515,8 @@ final class TranscriptionEngine {
     /// The WAV buffer URL for the currently-live (or most recently live) capture.
     /// Callers can snapshot this at stop time before starting a new session.
     var activeBufferURL: URL? { currentBufferURL }
+
+    /// Count of write failures on the system-audio WAV during the active capture.
+    /// Snapshot at stop time, before `stop()` resets the capture's internal counter.
+    var systemAudioWriteErrorCount: Int { systemCapture.writeErrorCount }
 }

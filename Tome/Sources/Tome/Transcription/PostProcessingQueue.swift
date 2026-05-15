@@ -39,8 +39,11 @@ final class PostProcessingQueue {
     init(asr: ASRCoordinator) {
         (jobStream, jobContinuation) = AsyncStream.makeStream()
         self.asr = asr
-        Task { [weak self] in
-            await self?.consume()
+        // Strong-self: the queue is an app-lifetime singleton on AppServices, so the
+        // retain cycle is bounded by app shutdown. A weak self made the consumer
+        // exit silently if any observer dropped its reference — losing jobs.
+        Task {
+            await self.consume()
         }
     }
 

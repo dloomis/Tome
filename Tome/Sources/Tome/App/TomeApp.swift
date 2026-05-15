@@ -33,6 +33,8 @@ struct TomeApp: App {
                 .onAppear {
                     settings.applyScreenShareVisibility()
                     appDelegate.postProcessingQueue = services.postProcessingQueue
+                    appDelegate.transcriptLogger = services.transcriptLogger
+                    appDelegate.sessionStore = services.sessionStore
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -96,6 +98,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// whether a quit needs to wait for finalization.
     var postProcessingQueue: PostProcessingQueue?
 
+    /// Set by `TomeApp` on launch so the terminate handler can flush + fsync the
+    /// live transcript before quitting. Without this, the last 1–2 utterances
+    /// buffered in `TranscriptLogger` would be lost on Cmd-Q during an active session.
+    var transcriptLogger: TranscriptLogger?
+    var sessionStore: SessionStore?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Tome is a single-window utility — disable AppKit's automatic window
         // tabbing so the View menu doesn't sprout "Show Tab Bar / Show All Tabs"
@@ -130,11 +138,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Emergency flush: if a session is live, drain its writer state so the last
+        // utterance and JSONL record reach disk before we exit. Hard 2s cap so a stuck
+        // FS doesn't block quit. The session's WAV in /var/folders is discarded — no
+        // diarization for the in-flight session, but the markdown transcript is durable.
+        if let logger = transcriptLogger, let store = sessionStore {
+            let sema = DispatchSemaphore(value: 0)
+            Task {
+                _ = await logger.endSession()
+                await store.endSession()
+                sema.signal()
+            }
+            _ = sema.wait(timeout: .now() + 2.0)
+        }
+
         // If any post-processing job is in flight, briefly block termination with a
         // native alert and wait for the queue to drain (with a 60s cap). The
         // per-utterance flush means the transcript is already safe on disk; we're
         // only waiting for diarization + frontmatter finalization to complete.
         guard let queue = postProcessingQueue, queue.isAnyJobRunning else {
+            postProcessingQueue?.shutdown()
             return .terminateNow
         }
 
@@ -148,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let response = alert.runModal()
         if response == .alertSecondButtonReturn {
+            queue.shutdown()
             return .terminateNow
         }
 
@@ -158,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             while queue.isAnyJobRunning && Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(250))
             }
+            queue.shutdown()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

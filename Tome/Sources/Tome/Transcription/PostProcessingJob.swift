@@ -49,6 +49,9 @@ final class PostProcessingJob: Identifiable {
 
         // 1. Diarize + re-transcribe when we have a system-audio buffer (call captures).
         diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
+        if handle.wavWriteErrorCount > 0 {
+            diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
+        }
         if let bufferURL = handle.wavBufferPath {
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
             diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
