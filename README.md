@@ -55,7 +55,8 @@ Tome does the first three. Your agent does the rest.
 - **Speaker diarization** runs after the call ends. pyannote splits the remote audio into Speaker 2, Speaker 3, Speaker 4. Not perfect, but way better than one wall of unattributed text.
 - **Vault-native output** writes `.md` with frontmatter: `type`, `created`, `attendees`, `tags`, `source_app`. Lands in your vault ready to process.
 - **Privacy.** Hidden from screen sharing by default. No audio saved. Transcripts only.
-- **Silence auto-stop.** 120 seconds of dead air and it stops itself.
+- **Silence auto-stop.** Stops itself after a configurable stretch of dead air (default 120s, slider in Settings, 0 disables).
+- **Configurable filenames.** Settings > Output exposes the date format and per-session-type labels so files land as `2026-05-20 14-30-00 Call Recording.md` or whatever pattern you prefer.
 
 ## How It Works
 
@@ -224,11 +225,14 @@ This fork has diverged substantially from upstream Tome. Beyond what upstream sh
 ### API & integration
 
 - **Local HTTP API server** — `APIServer` on `127.0.0.1` for programmatic session control. Endpoints for starting/stopping recordings, polling session lifecycle, and retrieving transcripts. Accepts an optional `suggestedFilename` and `MeetingContext` so callers can control output naming and seed the `## Context` body. Port is written to `~/Library/Application Support/Tome/api-port` on launch; an OpenAPI 3.1 spec is served at `GET /` for discoverability. State machine: `idle → recording → transcribing → complete → idle`. Used by [WhisperCal](https://github.com/dloomis/WhisperCal) but any local client can call it.
-- **Settings > Local API panel** — shows the fixed port and a reference of available endpoints.
+- **Settings > API tab** — shows the fixed port, a copy-to-clipboard button for the base URL, and the full endpoint reference.
 - **API race fix** — duplicate session-start requests are rejected instead of being honored in parallel.
 
-### UI quality of life
+### UI & customization
 
+- **Tabbed Settings window** — five panes (General · Audio · Transcription · Output · API) with SF Symbol icons replace the single scrolling Form. Per-tab state means device enumeration and the API port read only happen when you visit those tabs.
+- **Configurable silence auto-stop** — Settings > Audio slider (0–600s, 30s steps). 0 disables auto-stop entirely. Default 120s preserves prior behavior.
+- **Configurable filename template** — Settings > Output exposes the `DateFormatter` pattern plus per-session-type labels ("Call Recording", "Voice Memo" by default). Rename to "Scheduled Meetings", "Quick Notes", etc., or leave a label blank for date-only filenames. A shared sanitizer scrubs filesystem-hostile characters (`/ \ : ? * < > | "`, control chars, leading dots) so user-entered formats are always safe to commit to disk. The chosen format is snapshotted at session start so a mid-recording settings change doesn't shift the prefix on an in-flight session's post-processing rename.
 - **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session via `NSSavePanel`.
 - **View > Logs** — opens `/tmp/tome.log` for quick diagnostic inspection.
 - **Window scene (single instance)** — replaces `WindowGroup` so macOS 26 stops adding the "+" duplicate-instance pill to the toolbar.
