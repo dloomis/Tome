@@ -69,33 +69,9 @@ struct SettingsView: View {
             }
 
             Section("Filename Template") {
-                HStack {
-                    Text("Date Format")
-                        .font(.system(size: 12, weight: .medium))
-                    Spacer()
-                    TextField("yyyy-MM-dd HH-mm-ss", text: $settings.filenameDateFormat)
-                        .font(.system(size: 12, design: .monospaced))
-                        .frame(width: 180)
-                        .textFieldStyle(.roundedBorder)
-                }
-                HStack {
-                    Text("Call Capture Label")
-                        .font(.system(size: 12, weight: .medium))
-                    Spacer()
-                    TextField("Call Recording", text: $settings.filenameCallLabel)
-                        .font(.system(size: 12))
-                        .frame(width: 180)
-                        .textFieldStyle(.roundedBorder)
-                }
-                HStack {
-                    Text("Voice Memo Label")
-                        .font(.system(size: 12, weight: .medium))
-                    Spacer()
-                    TextField("Voice Memo", text: $settings.filenameVoiceLabel)
-                        .font(.system(size: 12))
-                        .frame(width: 180)
-                        .textFieldStyle(.roundedBorder)
-                }
+                filenameRow(label: "Date Format", binding: $settings.filenameDateFormat, monospaced: true)
+                filenameRow(label: "Call Capture Label", binding: $settings.filenameCallLabel)
+                filenameRow(label: "Voice Memo Label", binding: $settings.filenameVoiceLabel)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Preview")
                         .font(.system(size: 11))
@@ -232,6 +208,19 @@ struct SettingsView: View {
                 let portFile = appSupport.appendingPathComponent("Tome/api-port")
                 apiPort = try? String(contentsOf: portFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func filenameRow(label: String, binding: Binding<String>, monospaced: Bool = false) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 160, alignment: .leading)
+            TextField("", text: binding)
+                .font(.system(size: 12, design: monospaced ? .monospaced : .default))
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: .infinity)
         }
     }
 
