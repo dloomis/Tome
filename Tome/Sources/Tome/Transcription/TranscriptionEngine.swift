@@ -75,7 +75,12 @@ final class TranscriptionEngine {
         self.asrCoordinator = asrCoordinator
     }
 
-    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil) async {
+    func start(
+        locale: Locale,
+        inputDeviceID: AudioDeviceID = 0,
+        appBundleID: String? = nil,
+        recordingContext: SessionRecordingContext? = nil
+    ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
         lastError = nil
@@ -123,7 +128,10 @@ final class TranscriptionEngine {
         diagLog("[ENGINE-4] starting system audio capture...")
         let sysStreams: SystemAudioCapture.CaptureStreams?
         do {
-            sysStreams = try await systemCapture.bufferStream(appBundleID: appBundleID)
+            sysStreams = try await systemCapture.bufferStream(
+                appBundleID: appBundleID,
+                recordingContext: recordingContext
+            )
             currentBufferURL = sysStreams?.bufferURL
             diagLog("[ENGINE-5] system audio capture started OK")
         } catch {

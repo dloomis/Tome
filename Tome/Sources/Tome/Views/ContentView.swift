@@ -36,6 +36,10 @@ struct ContentView: View {
     @State private var currentSessionId: String?
     @State private var currentSourceApp: String?
 
+    /// Single-shot guard: the orphan scan runs at most once per launch, fired
+    /// either at the end of boot (no onboarding) or when onboarding dismisses.
+    @State private var hasScannedOrphans = false
+
     /// Single-consumer channel that serializes utterance writes to the markdown
     /// transcript and the JSONL crash-recovery file. Prevents the two stores from
     /// drifting out of order when `handleNewUtterance` fires faster than the
@@ -102,6 +106,9 @@ struct ContentView: View {
         .onChange(of: showOnboarding) {
             if !showOnboarding {
                 hasCompletedOnboarding = true
+                // First-launch path: onboarding just dismissed; safe to surface
+                // the orphan recovery prompt without overlapping dialogs.
+                Task { await checkForOrphanedSessionsOnce() }
             }
         }
         .onChange(of: settings.transcriptionLanguage) {
@@ -148,6 +155,16 @@ struct ContentView: View {
                 onStop: { stopSession() }
             )
             apiServer.start()
+
+            services.saveTranscriptAction = { saveTranscriptToFile() }
+            services.recoverFromWAVAction = { recoverFromWAV() }
+
+            // Returning users: onboarding never shows, so we surface the orphan
+            // prompt at the end of boot. First-launch users hit the onChange
+            // handler when onboarding closes.
+            if hasCompletedOnboarding {
+                await checkForOrphanedSessionsOnce()
+            }
         }
         // Audio level polling
         .task {
@@ -208,15 +225,13 @@ struct ContentView: View {
             guard let new else { return }
             handleJobCompleted(jobId: new.jobId, savedURL: new.savedURL, sessionType: new.sessionType)
         }
-        .focusedSceneValue(\.saveTranscript, saveTranscriptAction)
-    }
-
-    private var saveTranscriptAction: (() -> Void)? {
-        guard !transcriptStore.utterances.isEmpty else { return nil }
-        return { saveTranscriptToFile() }
     }
 
     private func saveTranscriptToFile() {
+        guard !transcriptStore.utterances.isEmpty else {
+            NSSound.beep()
+            return
+        }
         let panel = NSSavePanel()
         panel.title = "Save Transcript"
         panel.allowedContentTypes = [.plainText]
@@ -395,8 +410,9 @@ struct ContentView: View {
             transcriptionEngine?.lastError = nil
             await services.sessionStore.startSession(sessionId: sid)
             apiServer.sessionDidStart(id: sid)
+            let transcriptURL: URL
             do {
-                try await services.transcriptLogger.startSession(
+                transcriptURL = try await services.transcriptLogger.startSession(
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
                     sessionType: type,
@@ -421,16 +437,27 @@ struct ContentView: View {
             detectedAppName = resolvedAppName
             currentSessionId = sid
             currentSourceApp = sourceApp
+
+            let recordingContext = SessionRecordingContext(
+                sessionId: sid,
+                transcriptURL: transcriptURL,
+                sourceApp: sourceApp,
+                sessionType: type,
+                startedAt: Date()
+            )
+
             if type == .callCapture {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    appBundleID: appBundleID
+                    appBundleID: appBundleID,
+                    recordingContext: recordingContext
                 )
             } else {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
-                    inputDeviceID: settings.inputDeviceID
+                    inputDeviceID: settings.inputDeviceID,
+                    recordingContext: recordingContext
                 )
             }
         }
@@ -501,6 +528,244 @@ struct ContentView: View {
                 if !Task.isCancelled { savedFileURL = nil }
             }
         }
+    }
+
+    /// Surface leftover recordings from a previous launch (typically a crash or
+    /// force-quit). At most once per launch — gated by `hasScannedOrphans`. Runs
+    /// after boot init so `services.asrCoordinator` is reachable.
+    @MainActor
+    private func checkForOrphanedSessionsOnce() async {
+        guard !hasScannedOrphans else { return }
+        hasScannedOrphans = true
+
+        // Skip if a session is somehow already running (defensive — shouldn't
+        // happen on a fresh launch, but recording + recovery on the same ASR
+        // would race).
+        if transcriptionEngine?.isRunning == true { return }
+
+        let orphans = OrphanScanner.findOrphans()
+        guard !orphans.isEmpty else { return }
+        diagLog("[ORPHAN-SCAN] found \(orphans.count) orphan(s)")
+
+        let alert = NSAlert()
+        alert.messageText = orphans.count == 1
+            ? "Tome found 1 unfinished recording"
+            : "Tome found \(orphans.count) unfinished recordings"
+
+        var lines = orphans.prefix(5).map { "• \($0.summaryLine)" }
+        if orphans.count > 5 {
+            lines.append("• …and \(orphans.count - 5) more")
+        }
+        alert.informativeText = """
+        These recordings were left over from a session that didn't finish processing — likely a crash, force-quit, or post-processing failure.
+
+        \(lines.joined(separator: "\n"))
+
+        Recovery re-runs diarization on each WAV and updates its transcript.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: orphans.count == 1 ? "Recover" : "Recover All")
+        alert.addButton(withTitle: "Decide Later")
+        alert.addButton(withTitle: "Discard All")
+
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            await recoverOrphans(orphans)
+        case .alertThirdButtonReturn:
+            confirmAndDiscardOrphans(orphans)
+        default:
+            break  // Decide Later
+        }
+    }
+
+    @MainActor
+    private func recoverOrphans(_ orphans: [OrphanScanner.Orphan]) async {
+        let total = orphans.count
+        var recovered = 0
+        var failed: [String] = []
+
+        for (idx, orphan) in orphans.enumerated() {
+            transcriptionEngine?.assetStatus = "Recovering \(idx + 1) of \(total)…"
+
+            guard let sidecar = orphan.sidecar else {
+                failed.append("\(orphan.wavURL.lastPathComponent): no sidecar — use Cmd+Opt+R")
+                continue
+            }
+            let transcriptURL = sidecar.transcriptURL
+            if !FileManager.default.fileExists(atPath: transcriptURL.path) {
+                failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
+                continue
+            }
+
+            do {
+                _ = try await Recovery.run(
+                    wavURL: orphan.wavURL,
+                    transcriptURL: transcriptURL,
+                    asr: services.asrCoordinator,
+                    clusterThreshold: Float(settings.diarizationClusterThreshold),
+                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                )
+                OrphanScanner.discard(orphan)
+                recovered += 1
+            } catch {
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                failed.append("\(transcriptURL.lastPathComponent): \(msg)")
+            }
+        }
+
+        transcriptionEngine?.assetStatus = "Ready"
+
+        let done = NSAlert()
+        done.messageText = "Recovery complete"
+        var info = "\(recovered) of \(total) recovered."
+        if !failed.isEmpty {
+            info += "\n\nFailed:\n" + failed.joined(separator: "\n")
+            info += "\n\nFiles were left in place so you can retry via File → Recover from WAV…"
+        }
+        done.informativeText = info
+        done.alertStyle = failed.isEmpty ? .informational : .warning
+        done.addButton(withTitle: "OK")
+        done.runModal()
+    }
+
+    @MainActor
+    private func confirmAndDiscardOrphans(_ orphans: [OrphanScanner.Orphan]) {
+        let alert = NSAlert()
+        alert.messageText = orphans.count == 1
+            ? "Discard 1 unfinished recording?"
+            : "Discard \(orphans.count) unfinished recordings?"
+        alert.informativeText = "This permanently deletes the WAV files. The transcripts (with un-diarized \"Them\" lines) stay in your vault."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        for orphan in orphans {
+            OrphanScanner.discard(orphan)
+        }
+    }
+
+    /// User-driven recovery of an orphaned session via `Cmd+Opt+R`. Picks a WAV
+    /// and an existing transcript .md, then re-runs diarization → re-transcription
+    /// → body rebuild. See `Recovery.swift` for the pipeline rationale.
+    private func recoverFromWAV() {
+        if transcriptionEngine?.isRunning == true {
+            showAlert(
+                title: "Stop the current recording first",
+                message: "Recovery uses the same ASR model as the live recorder — please stop the active session before recovering an orphaned WAV.",
+                style: .warning
+            )
+            return
+        }
+        if services.postProcessingQueue.isAnyJobRunning {
+            showAlert(
+                title: "Finalization in progress",
+                message: "A previous session is still being finalized. Wait a moment and try again.",
+                style: .warning
+            )
+            return
+        }
+
+        let wavPanel = NSOpenPanel()
+        wavPanel.title = "Choose the orphaned WAV"
+        wavPanel.allowedContentTypes = [.wav]
+        wavPanel.allowsMultipleSelection = false
+        wavPanel.canChooseDirectories = false
+        wavPanel.directoryURL = FileManager.default.temporaryDirectory
+        guard wavPanel.runModal() == .OK, let wavURL = wavPanel.url else { return }
+
+        let wavInfo: Recovery.WAVInfo
+        do {
+            wavInfo = try Recovery.inspectWAV(wavURL)
+        } catch {
+            showAlert(title: "WAV unreadable", message: error.localizedDescription, style: .critical)
+            return
+        }
+
+        let mdPanel = NSOpenPanel()
+        mdPanel.title = "Choose the orphaned transcript"
+        mdPanel.allowedContentTypes = [.plainText]
+        mdPanel.allowsMultipleSelection = false
+        mdPanel.canChooseDirectories = false
+        if let meetingsURL = settings.vaultMeetingsURL {
+            mdPanel.directoryURL = meetingsURL
+        }
+        guard mdPanel.runModal() == .OK, let mdURL = mdPanel.url else { return }
+
+        let durMin = Int(wavInfo.durationSeconds) / 60
+        let durSec = Int(wavInfo.durationSeconds) % 60
+        let sizeMB = Double(wavInfo.sizeBytes) / 1_048_576
+
+        let confirm = NSAlert()
+        confirm.messageText = "Recover this session?"
+        confirm.informativeText = """
+            WAV: \(wavURL.lastPathComponent)
+            Duration: \(durMin):\(String(format: "%02d", durSec)) · Size: \(String(format: "%.0f", sizeMB)) MB
+
+            Transcript: \(mdURL.lastPathComponent)
+
+            Diarization + re-transcription will rewrite the transcript body and update the duration field. Frontmatter outside `duration:` is preserved.
+            """
+        confirm.alertStyle = .informational
+        confirm.addButton(withTitle: "Recover")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        transcriptionEngine?.assetStatus = "Recovering…"
+        transcriptionEngine?.lastError = nil
+
+        Task {
+            let result: Result<URL, Error>
+            do {
+                let saved = try await Recovery.run(
+                    wavURL: wavURL,
+                    transcriptURL: mdURL,
+                    asr: services.asrCoordinator,
+                    clusterThreshold: Float(settings.diarizationClusterThreshold),
+                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                )
+                result = .success(saved)
+            } catch {
+                result = .failure(error)
+            }
+
+            transcriptionEngine?.assetStatus = "Ready"
+
+            switch result {
+            case .success(let savedURL):
+                let done = NSAlert()
+                done.messageText = "Recovery complete"
+                done.informativeText = "\(savedURL.lastPathComponent) was re-transcribed with speaker labels.\n\nDelete the WAV (\(String(format: "%.0f", sizeMB)) MB) now?"
+                done.alertStyle = .informational
+                done.addButton(withTitle: "Delete WAV")
+                done.addButton(withTitle: "Keep")
+                done.addButton(withTitle: "Show in Finder")
+                let response = done.runModal()
+                switch response {
+                case .alertFirstButtonReturn:
+                    try? FileManager.default.removeItem(at: wavURL)
+                case .alertThirdButtonReturn:
+                    NSWorkspace.shared.selectFile(savedURL.path, inFileViewerRootedAtPath: savedURL.deletingLastPathComponent().path)
+                default:
+                    break
+                }
+            case .failure(let error):
+                showAlert(
+                    title: "Recovery failed",
+                    message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
+                    style: .critical
+                )
+                transcriptionEngine?.lastError = "Recovery failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func showAlert(title: String, message: String, style: NSAlert.Style) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = style
+        alert.runModal()
     }
 
     private func handleNewUtterance() {

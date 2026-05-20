@@ -34,6 +34,23 @@ func speakerLabels(from orderedIds: some Sequence<String>) -> [String: String] {
     return map
 }
 
+// MARK: - Session Recording Context
+
+/// Per-recording identity passed from `ContentView` down through
+/// `TranscriptionEngine.start` into `SystemAudioCapture.bufferStream`. Used to
+/// write the WAV sidecar (see `SessionSidecar`) so an orphaned WAV always knows
+/// which transcript and session it belongs to.
+///
+/// The engine doesn't otherwise care about this metadata — it's purely passed
+/// through to the audio capture for sidecar emission.
+struct SessionRecordingContext: Sendable {
+    let sessionId: String
+    let transcriptURL: URL
+    let sourceApp: String
+    let sessionType: SessionType
+    let startedAt: Date
+}
+
 // MARK: - Session Record
 
 /// Codable record for JSONL session persistence

@@ -32,6 +32,7 @@ actor TranscriptLogger {
         suggestedFilename = name
     }
 
+    @discardableResult
     func startSession(
         sourceApp: String,
         vaultPath: String,
@@ -39,7 +40,7 @@ actor TranscriptLogger {
         suggestedFilename: String? = nil,
         filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss",
         filenameTypeLabel: String? = nil
-    ) throws {
+    ) throws -> URL {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []
@@ -131,6 +132,7 @@ tags:
         guard created else { throw TranscriptLoggerError.cannotCreateFile(currentFilePath!.path) }
         fileHandle = try FileHandle(forWritingTo: currentFilePath!)
         fileHandle?.seekToEndOfFile()
+        return currentFilePath!
     }
 
     func append(speaker: String, text: String, timestamp: Date) {

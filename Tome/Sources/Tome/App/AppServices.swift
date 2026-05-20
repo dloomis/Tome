@@ -22,6 +22,17 @@ final class AppServices {
     /// Crash-recovery JSONL store. Same ownership rationale as `transcriptLogger`.
     let sessionStore: SessionStore
 
+    /// Action invoked by the `Save Transcript…` menu item. `ContentView` registers
+    /// this in its boot task so the menu can fire it without going through
+    /// `@FocusedValue` — that path triggers a main-menu rebuild on every focus
+    /// change, which crashes inside `NSContextMenuImpl` on macOS 26. See
+    /// `TomeApp.swift` and `CLAUDE.md` (Keyboard Shortcuts) for the rationale.
+    @ObservationIgnored var saveTranscriptAction: (() -> Void)?
+
+    /// Action invoked by the `Recover from WAV…` menu item. Same wiring rationale
+    /// as `saveTranscriptAction` — `ContentView` registers it during boot.
+    @ObservationIgnored var recoverFromWAVAction: (() -> Void)?
+
     init() {
         let asr = ASRCoordinator()
         self.asrCoordinator = asr

@@ -16,7 +16,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     // and own its lifetime (including cleanup) from that point forward.
     private let _bufferFilePath = OSAllocatedUnfairLock<URL?>(uncheckedState: nil)
 
-    private let _audioFileWriter = OSAllocatedUnfairLock<AVAudioFile?>(uncheckedState: nil)
+    private let _audioFileWriter = OSAllocatedUnfairLock<WAVStreamWriter?>(uncheckedState: nil)
     private let _writeErrors = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
 
     /// Count of `AVAudioFile.write(from:)` failures during the current capture.
@@ -36,7 +36,12 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     }
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
-    func bufferStream(appBundleID: String? = nil) async throws -> CaptureStreams {
+    /// `recordingContext` is required for the crash-recovery sidecar; when nil
+    /// (legacy / test paths), falls back to the old `$TMPDIR`-based unnamed WAV.
+    func bufferStream(
+        appBundleID: String? = nil,
+        recordingContext: SessionRecordingContext? = nil
+    ) async throws -> CaptureStreams {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
         guard let display = content.displays.first else {
@@ -56,8 +61,36 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             filter = SCContentFilter(display: display, excludingWindows: [])
         }
 
-        // Set up audio buffer file for post-session diarization
-        let bufferURL = FileManager.default.temporaryDirectory.appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
+        // Set up audio buffer file. With a recordingContext we write to a stable
+        // location in Application Support so the WAV survives temp-dir purges and
+        // we can pair it back to the session via the sidecar after a crash.
+        let bufferURL: URL
+        if let ctx = recordingContext {
+            let dir = try Self.sessionsDirectory()
+            bufferURL = dir.appendingPathComponent("\(ctx.sessionId).wav")
+            // Sidecar emitted before the first audio byte so a crash within the
+            // first second still leaves an identifiable pair on disk.
+            let sidecar = SessionSidecar(
+                schema: SessionSidecar.currentSchema,
+                sessionId: ctx.sessionId,
+                transcriptPath: ctx.transcriptURL.path,
+                startedAt: ctx.startedAt,
+                sourceApp: ctx.sourceApp,
+                sessionType: ctx.sessionType,
+                sampleRate: 48000,
+                channels: 1,
+                bitsPerSample: 32,
+                appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+            )
+            do {
+                try SessionSidecar.write(sidecar, to: SessionSidecar.sidecarURL(forWAV: bufferURL))
+                diagLog("[SIDECAR] wrote \(SessionSidecar.sidecarURL(forWAV: bufferURL).lastPathComponent)")
+            } catch {
+                diagLog("[SIDECAR] write failed: \(error) — orphan recovery for this session won't auto-pair")
+            }
+        } else {
+            bufferURL = FileManager.default.temporaryDirectory.appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
+        }
         _bufferFilePath.withLock { $0 = bufferURL }
         _audioFileWriter.withLock { $0 = nil } // will be created on first audio callback
         _writeErrors.withLock { $0 = 0 }
@@ -93,39 +126,36 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         try? await _stream.withLock { $0 }?.stopCapture()
         _stream.withLock { $0 = nil }
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
-        _audioFileWriter.withLock { $0 = nil } // closes the file
+        // Explicit close: flushes the final header refresh + synchronize so the
+        // WAV is durably finalized before the post-processing job starts reading it.
+        _audioFileWriter.withLock { writer in
+            writer?.close()
+            writer = nil
+        }
         _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
         _lastSampleTime.withLock { $0 = nil }
         _audioLevel.value = 0
     }
 
-    /// Remove a buffered audio file. Stateless — the caller owns the URL returned by
-    /// `bufferStream` and is responsible for calling this after post-processing completes.
+    /// Remove a buffered audio file and its sidecar. Stateless — the caller owns
+    /// the URL returned by `bufferStream` and is responsible for calling this
+    /// after post-processing completes.
     static func cleanupBufferFile(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
+        SessionSidecar.deleteIfExists(forWAV: url)
     }
 
-    /// Move a buffered audio file to `~/Library/Application Support/Tome/recovery/{sessionId}.wav`
-    /// when post-processing failed to durably write the diarized transcript. /var/folders is
-    /// purgeable by macOS, so the WAV needs a stable home if we want any chance at manual recovery.
-    @discardableResult
-    static func moveBufferToRecovery(_ bufferURL: URL, sessionId: String) -> URL? {
+    /// `~/Library/Application Support/Tome/sessions/` — the stable home for
+    /// system-audio WAVs and their sidecars. Co-located with `SessionStore`'s
+    /// JSONL crash files so a single directory contains everything we'd need to
+    /// reconstruct a session post-mortem.
+    static func sessionsDirectory() throws -> URL {
         guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            diagLog("[RECOVERY] no application support dir — WAV left at \(bufferURL.path)")
-            return nil
+            throw CaptureError.noApplicationSupport
         }
-        let recoveryDir = appSupport.appendingPathComponent("Tome/recovery", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: recoveryDir, withIntermediateDirectories: true)
-            let dest = recoveryDir.appendingPathComponent("\(sessionId).wav")
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.moveItem(at: bufferURL, to: dest)
-            diagLog("[RECOVERY] moved \(bufferURL.lastPathComponent) → \(dest.path)")
-            return dest
-        } catch {
-            diagLog("[RECOVERY] move failed: \(error) — WAV left at \(bufferURL.path)")
-            return nil
-        }
+        let dir = appSupport.appendingPathComponent("Tome/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     // MARK: - SCStreamOutput
@@ -164,16 +194,22 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             diagLog("[SYS-RAW] #\(count) frames=\(frameCount) sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) rms=\(rms)")
         }
 
-        // Buffer audio to disk for post-session diarization
+        // Buffer audio to disk for post-session diarization. WAVStreamWriter keeps
+        // the RIFF / data chunk sizes fresh on every write so a crash leaves a
+        // valid WAV — see WAVStreamWriter.swift for the rationale.
         let sampleRate = asbd.mSampleRate
         _audioFileWriter.withLock { writer in
             if writer == nil, let bufferPath = self._bufferFilePath.withLock({ $0 }) {
-                let wavFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
-                writer = try? AVAudioFile(forWriting: bufferPath, settings: wavFormat.settings)
+                do {
+                    writer = try WAVStreamWriter(url: bufferPath, sampleRate: sampleRate)
+                } catch {
+                    diagLog("[SYS-WAV-FAIL] could not open writer at \(bufferPath.path): \(error)")
+                    return
+                }
             }
             if let w = writer {
                 do {
-                    try w.write(from: pcmBuffer)
+                    try w.write(pcmBuffer)
                 } catch {
                     let total = self._writeErrors.withLock { count -> Int in count += 1; return count }
                     if total == 1 || total % 100 == 0 {
@@ -207,5 +243,6 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     enum CaptureError: Error {
         case noDisplay
+        case noApplicationSupport
     }
 }

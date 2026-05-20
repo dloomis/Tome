@@ -130,11 +130,11 @@ final class PostProcessingJob: Identifiable {
         return savedPath
     }
 
-    /// Called when a TranscriptFinalizer write step throws. Moves the system-audio
-    /// WAV out of /var/folders (which macOS can purge) into a stable recovery dir
-    /// so the diarized transcript can be regenerated manually later.
+    /// Called when a TranscriptFinalizer write step throws. The WAV already lives
+    /// in `~/Library/Application Support/Tome/sessions/` (see SystemAudioCapture)
+    /// so it's durable as-is — no move needed. The launch-time `OrphanScanner`
+    /// will pick it up next time Tome starts and offer to re-run diarization.
     private func handleDurableWriteFailure(bufferURL: URL, error: PostProcessingError) {
-        diagLog("[JOB \(id)] durable write failed: \(error) — preserving WAV for recovery")
-        SystemAudioCapture.moveBufferToRecovery(bufferURL, sessionId: id)
+        diagLog("[JOB \(id)] durable write failed: \(error) — WAV preserved at \(bufferURL.path)")
     }
 }

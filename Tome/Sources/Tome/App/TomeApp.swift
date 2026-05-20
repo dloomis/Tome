@@ -2,25 +2,11 @@ import SwiftUI
 import AppKit
 import Sparkle
 
-// MARK: - Focused Value for Save Transcript
-
-struct SaveTranscriptKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-extension FocusedValues {
-    var saveTranscript: (() -> Void)? {
-        get { self[SaveTranscriptKey.self] }
-        set { self[SaveTranscriptKey.self] = newValue }
-    }
-}
-
 @main
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
     @State private var services = AppServices()
-    @FocusedValue(\.saveTranscript) private var saveTranscript
     private let updaterController = AppUpdaterController()
     private let apiServer = APIServer()
 
@@ -44,11 +30,23 @@ struct TomeApp: App {
                 CheckForUpdatesView(updater: updaterController.updater)
             }
             CommandGroup(after: .saveItem) {
+                // Kept always-enabled (rather than `.disabled(...)` toggled by an
+                // `@FocusedValue`) because dynamic enable/disable forces SwiftUI to
+                // rebuild the main menu on focus changes, which crashes inside
+                // `NSContextMenuImpl` on macOS 26 (FB-pending). The action is a
+                // no-op when there's nothing to save — see `ContentView.saveTranscriptToFile`.
                 Button("Save Transcript...") {
-                    saveTranscript?()
+                    services.saveTranscriptAction?()
                 }
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(saveTranscript == nil)
+                Button("Recover from WAV...") {
+                    services.recoverFromWAVAction?()
+                }
+                // Cmd+Opt+R — Cmd+R and Cmd+Shift+R are already taken by Start
+                // Call Capture / Start Voice Memo in `ControlBar.swift`. The window
+                // shortcuts win when the main window is key, so the menu shortcut
+                // must avoid both.
+                .keyboardShortcut("r", modifiers: [.command, .option])
             }
             CommandGroup(after: .toolbar) {
                 Button("Logs") {

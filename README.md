@@ -57,6 +57,7 @@ Tome does the first three. Your agent does the rest.
 - **Privacy.** Hidden from screen sharing by default. No audio saved. Transcripts only.
 - **Silence auto-stop.** Stops itself after a configurable stretch of dead air (default 120s, slider in Settings, 0 disables).
 - **Configurable filenames.** Settings > Output exposes the date format and per-session-type labels so files land as `2026-05-20 14-30-00 Call Recording.md` or whatever pattern you prefer.
+- **Crash-safe recordings.** WAVs are written with a self-healing header and stored under `~/Library/Application Support/Tome/sessions/` — a crash mid-meeting leaves a readable file. On next launch, Tome detects orphaned sessions and offers one-click recovery (diarization + transcript rebuild) or a manual `File > Recover from WAV…` (Cmd+Opt+R) for legacy WAVs.
 
 ## How It Works
 
@@ -172,6 +173,11 @@ Tome/Sources/Tome/
 ├── Storage/
 │   ├── TranscriptLogger.swift      # .md output with YAML frontmatter
 │   └── SessionStore.swift          # Session metadata
+├── Recovery/
+│   ├── Recovery.swift              # Manual + automatic orphan recovery pipeline
+│   ├── WAVStreamWriter.swift       # Crash-resilient WAV writer (self-healing header)
+│   ├── SessionSidecar.swift        # Per-session {sessionId}.session.json metadata
+│   └── OrphanScanner.swift         # Launch-time scan + recovery prompt
 ├── Settings/
 │   └── AppSettings.swift
 └── Views/
@@ -220,7 +226,11 @@ This fork has diverged substantially from upstream Tome. Beyond what upstream sh
 - **Strict utterance ordering** — markdown and JSONL writes flow through a single-consumer `AsyncStream` instead of racing per-utterance Tasks.
 - **YAML-safe context** — frontmatter `context:` is fully escaped (newlines, tabs, quotes) so multi-line context strings can't break parsers.
 - **`[transcription failed]` placeholders** — re-transcription errors leave a visible hole in the final transcript instead of silently dropping the segment.
-- **Recovery WAV on diarization failure** — when post-processing fails to write a durable transcript, the system audio WAV is moved to `~/Library/Application Support/Tome/recovery/` so it can be reprocessed manually.
+- **Crash-resilient WAV writer** — `WAVStreamWriter` replaces `AVAudioFile` for system-audio capture. The RIFF + `data` chunk sizes are refreshed in place after every buffer write, with `synchronize()` throttled to ~1 Hz on the SCStream callback queue. A crash, force-quit, or power loss leaves a readable WAV up to ~1 second before the failure, instead of a 0-byte-data header (the previous failure mode silently zeroed out hours of audio on disk).
+- **Stable WAV storage** — system-audio WAVs live in `~/Library/Application Support/Tome/sessions/{sessionId}.wav` alongside the JSONL crash files. Out of `$TMPDIR`'s purge path. The success path of `PostProcessingJob` deletes the WAV, so anything left in `sessions/` is by definition an orphan.
+- **Per-session sidecar** — `SessionSidecar` writes `{sessionId}.session.json` next to each WAV at capture start, carrying `sessionId`, `transcriptPath`, `startedAt`, `sourceApp`, `sessionType`, and audio format. Orphan recovery becomes deterministic (the WAV unambiguously knows which transcript it belongs to) rather than heuristic time-matching.
+- **Launch-time orphan recovery** — on app boot, `OrphanScanner` enumerates `sessions/*.wav` and pairs each with its sidecar. If any are found, a consolidated alert surfaces with Recover All / Discard All / Decide Later. "Recover All" iterates through the diarization → re-transcription → body-rebuild pipeline and shows a summary; failures stay on disk for retry via the manual command.
+- **Manual recovery command** — `File > Recover from WAV…` (Cmd+Opt+R) pairs an arbitrary WAV and transcript through two open panels. Useful for legacy WAVs without a sidecar (e.g. `$TMPDIR` files from before the resilience work).
 
 ### API & integration
 
