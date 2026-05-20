@@ -400,7 +400,11 @@ struct ContentView: View {
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
                     sessionType: type,
-                    suggestedFilename: suggestedFilename
+                    suggestedFilename: suggestedFilename,
+                    filenameDateFormat: settings.filenameDateFormat,
+                    filenameTypeLabel: type == .voiceMemo
+                        ? settings.filenameVoiceLabel
+                        : settings.filenameCallLabel
                 )
             } catch {
                 await services.sessionStore.endSession()

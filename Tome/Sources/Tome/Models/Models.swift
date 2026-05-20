@@ -65,6 +65,10 @@ struct TranscriptSessionSnapshot: Sendable {
     let sourceApp: String
     let sessionContext: String
     let suggestedFilename: String?
+    /// `DateFormatter` pattern used when post-processing renames the file using
+    /// session context. Captured at session start so a user changing the setting
+    /// mid-recording doesn't shift the prefix on a session already in flight.
+    let filenameDateFormat: String
 }
 
 // MARK: - Session Handle

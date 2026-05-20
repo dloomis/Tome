@@ -202,7 +202,8 @@ enum TranscriptFinalizer {
             startTime: snapshot.sessionStartTime,
             speakers: snapshot.speakersDetected,
             context: snapshot.sessionContext,
-            suggestedFilename: snapshot.suggestedFilename
+            suggestedFilename: snapshot.suggestedFilename,
+            filenameDateFormat: snapshot.filenameDateFormat
         )
     }
 
@@ -211,7 +212,8 @@ enum TranscriptFinalizer {
         startTime: Date,
         speakers: Set<String>,
         context: String,
-        suggestedFilename: String? = nil
+        suggestedFilename: String? = nil,
+        filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss"
     ) throws(PostProcessingError) -> URL {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return filePath }
 
@@ -236,11 +238,8 @@ enum TranscriptFinalizer {
 
         // File rename: suggestedFilename takes precedence over context-based rename
         var finalPath = filePath
-        if let suggested = suggestedFilename, !suggested.isEmpty {
-            let sanitized = suggested
-                .replacingOccurrences(of: "/", with: "-")
-                .replacingOccurrences(of: ":", with: "-")
-                .trimmingCharacters(in: .whitespaces)
+        if let suggested = suggestedFilename,
+           let sanitized = FilenameSanitizer.sanitize(suggested) {
             let newFilename = "\(sanitized).md"
             let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 
@@ -249,15 +248,9 @@ enum TranscriptFinalizer {
             }
 
             finalPath = newPath
-        } else if !context.isEmpty {
-            let truncated = String(context.prefix(50))
-                .replacingOccurrences(of: "/", with: "-")
-                .replacingOccurrences(of: ":", with: "-")
-                .trimmingCharacters(in: .whitespaces)
-
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
-            let datePrefix = dateFmt.string(from: startTime)
+        } else if let truncated = FilenameSanitizer.sanitize(String(context.prefix(50))),
+                  !truncated.isEmpty {
+            let datePrefix = FilenameSanitizer.formattedDate(startTime, format: filenameDateFormat)
             let newFilename = "\(datePrefix) \(truncated).md"
             let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 

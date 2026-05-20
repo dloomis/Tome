@@ -21,6 +21,7 @@ actor TranscriptLogger {
     private var sessionContext: String = ""
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
     private var suggestedFilename: String?
+    private var filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss"
 
     /// Set when a flush/synchronize/reopen path fails or when the underlying file
     /// disappears (vault unmounted). Read by the UI through the periodic
@@ -31,13 +32,21 @@ actor TranscriptLogger {
         suggestedFilename = name
     }
 
-    func startSession(sourceApp: String, vaultPath: String, sessionType: SessionType = .callCapture, suggestedFilename: String? = nil) throws {
+    func startSession(
+        sourceApp: String,
+        vaultPath: String,
+        sessionType: SessionType = .callCapture,
+        suggestedFilename: String? = nil,
+        filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss",
+        filenameTypeLabel: String? = nil
+    ) throws {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
         self.speakersDetected = []
         self.sessionContext = ""
         self.utteranceBuffer = []
         self.suggestedFilename = suggestedFilename
+        self.filenameDateFormat = filenameDateFormat
         self.lastError = nil
 
         let expandedPath = NSString(string: vaultPath).expandingTildeInPath
@@ -45,8 +54,6 @@ actor TranscriptLogger {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let now = sessionStartTime!
-        let fileFmt = DateFormatter()
-        fileFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
 
         let dateFmt = DateFormatter()
         dateFmt.dateFormat = "yyyy-MM-dd"
@@ -57,20 +64,33 @@ actor TranscriptLogger {
         let timeStr = timeFmt.string(from: now)
 
         let isVoiceMemo = sessionType == .voiceMemo
-        let fileLabel = isVoiceMemo ? "Voice Memo" : "Call Recording"
+        // Heading label is purely cosmetic — keep the built-in names so the
+        // YAML/markdown stays predictable for downstream tools. Filename label
+        // is what the user actually sees in their vault, so use the override.
+        let headingLabel = isVoiceMemo ? "Voice Memo" : "Call Recording"
+        let defaultTypeLabel = headingLabel
+        let chosenLabel = filenameTypeLabel ?? defaultTypeLabel
+        // Empty override is valid ("date-only filenames"); preserve it. Sanitize
+        // only non-empty user input, falling back to the default if sanitization
+        // wipes everything (e.g. user typed only forbidden chars).
+        let sanitizedTypeLabel: String
+        if chosenLabel.isEmpty {
+            sanitizedTypeLabel = ""
+        } else {
+            sanitizedTypeLabel = FilenameSanitizer.sanitize(chosenLabel) ?? defaultTypeLabel
+        }
         let noteType = isVoiceMemo ? "fleeting" : "meeting"
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
         let filename: String
-        if let suggested = suggestedFilename, !suggested.isEmpty {
-            let sanitized = suggested
-                .replacingOccurrences(of: "/", with: "-")
-                .replacingOccurrences(of: ":", with: "-")
-                .trimmingCharacters(in: .whitespaces)
-            filename = "\(sanitized).md"
+        if let suggested = suggestedFilename,
+           let cleaned = FilenameSanitizer.sanitize(suggested) {
+            filename = "\(cleaned).md"
         } else {
-            filename = "\(fileFmt.string(from: now)) \(fileLabel).md"
+            let datePrefix = FilenameSanitizer.formattedDate(now, format: filenameDateFormat)
+            let stem = sanitizedTypeLabel.isEmpty ? datePrefix : "\(datePrefix) \(sanitizedTypeLabel)"
+            filename = "\(stem).md"
         }
         currentFilePath = directory.appendingPathComponent(filename)
 
@@ -91,7 +111,7 @@ tags:
   - source/tome
 ---
 
-# \(fileLabel) — \(dateStr) \(timeStr)
+# \(headingLabel) — \(dateStr) \(timeStr)
 
 **Duration:** 00:00 | **Speakers:** 0
 
@@ -240,7 +260,8 @@ tags:
             speakersDetected: speakersDetected,
             sourceApp: sourceApp,
             sessionContext: sessionContext,
-            suggestedFilename: suggestedFilename
+            suggestedFilename: suggestedFilename,
+            filenameDateFormat: filenameDateFormat
         )
 
         resetState()
@@ -253,5 +274,6 @@ tags:
         speakersDetected = []
         sessionContext = ""
         suggestedFilename = nil
+        filenameDateFormat = "yyyy-MM-dd HH-mm-ss"
     }
 }

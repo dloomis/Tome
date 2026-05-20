@@ -68,6 +68,53 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
             }
 
+            Section("Filename Template") {
+                HStack {
+                    Text("Date Format")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    TextField("yyyy-MM-dd HH-mm-ss", text: $settings.filenameDateFormat)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: 180)
+                        .textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("Call Capture Label")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    TextField("Call Recording", text: $settings.filenameCallLabel)
+                        .font(.system(size: 12))
+                        .frame(width: 180)
+                        .textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("Voice Memo Label")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    TextField("Voice Memo", text: $settings.filenameVoiceLabel)
+                        .font(.system(size: 12))
+                        .frame(width: 180)
+                        .textFieldStyle(.roundedBorder)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Preview")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(filenamePreview(label: settings.filenameCallLabel.isEmpty ? "Call Recording" : settings.filenameCallLabel))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text(filenamePreview(label: settings.filenameVoiceLabel.isEmpty ? "Voice Memo" : settings.filenameVoiceLabel))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Forbidden filesystem characters (/ : \\ ? * < > | \") are converted to dashes. Leave a label blank for date-only filenames.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Auto-Stop") {
                 HStack {
                     Text("Silence Timeout")
@@ -186,6 +233,13 @@ struct SettingsView: View {
                 apiPort = try? String(contentsOf: portFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
+    }
+
+    private func filenamePreview(label: String) -> String {
+        let datePrefix = FilenameSanitizer.formattedDate(Date(), format: settings.filenameDateFormat)
+        let sanitizedLabel = FilenameSanitizer.sanitize(label) ?? ""
+        let stem = sanitizedLabel.isEmpty ? datePrefix : "\(datePrefix) \(sanitizedLabel)"
+        return "\(stem).md"
     }
 
     private var apiBaseURL: String {

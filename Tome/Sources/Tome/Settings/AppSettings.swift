@@ -53,6 +53,25 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(silenceAutoStopSeconds, forKey: "silenceAutoStopSeconds") }
     }
 
+    // MARK: - Filename Template
+
+    /// `DateFormatter` pattern used as the date prefix on transcript filenames.
+    /// Output is sanitized for filesystem use, so format strings with `/` or `:`
+    /// are accepted but converted (e.g. `MM/dd/yy` → `MM-dd-yy`).
+    var filenameDateFormat: String {
+        didSet { UserDefaults.standard.set(filenameDateFormat, forKey: "filenameDateFormat") }
+    }
+
+    /// Label appended after the date for call-capture sessions. Empty string = no label.
+    var filenameCallLabel: String {
+        didSet { UserDefaults.standard.set(filenameCallLabel, forKey: "filenameCallLabel") }
+    }
+
+    /// Label appended after the date for voice-memo sessions. Empty string = no label.
+    var filenameVoiceLabel: String {
+        didSet { UserDefaults.standard.set(filenameVoiceLabel, forKey: "filenameVoiceLabel") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -73,6 +92,9 @@ final class AppSettings {
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil
             ? 120
             : defaults.integer(forKey: "silenceAutoStopSeconds")
+        self.filenameDateFormat = defaults.string(forKey: "filenameDateFormat") ?? "yyyy-MM-dd HH-mm-ss"
+        self.filenameCallLabel = defaults.string(forKey: "filenameCallLabel") ?? "Call Recording"
+        self.filenameVoiceLabel = defaults.string(forKey: "filenameVoiceLabel") ?? "Voice Memo"
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")
