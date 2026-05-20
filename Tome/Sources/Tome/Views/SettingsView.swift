@@ -68,6 +68,25 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .monospaced))
             }
 
+            Section("Auto-Stop") {
+                HStack {
+                    Text("Silence Timeout")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text(settings.silenceAutoStopSeconds == 0 ? "Off" : "\(settings.silenceAutoStopSeconds)s")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .trailing)
+                }
+                Slider(value: Binding(
+                    get: { Double(settings.silenceAutoStopSeconds) },
+                    set: { settings.silenceAutoStopSeconds = Int($0) }
+                ), in: 0...600, step: 30)
+                Text("Stop recording after this many seconds of silence (mic + system audio). 0 disables. Default: 120s")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Speaker Diarization") {
                 HStack {
                     Text("Cluster Distance Threshold")

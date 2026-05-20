@@ -19,6 +19,7 @@ struct ControlBar: View {
     let audioLevel: Float
     let detectedApp: String?
     let silenceSeconds: Int
+    let silenceAutoStopSeconds: Int
     let statusMessage: String?
     let errorMessage: String?
     let onStartCallCapture: () -> Void
@@ -78,8 +79,9 @@ struct ControlBar: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
 
-                if silenceSeconds >= 90 {
-                    Text("Silence — auto-stop in \(120 - silenceSeconds)s")
+                if silenceAutoStopSeconds > 0,
+                   silenceSeconds >= max(silenceAutoStopSeconds - 30, 1) {
+                    Text("Silence — auto-stop in \(silenceAutoStopSeconds - silenceSeconds)s")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)

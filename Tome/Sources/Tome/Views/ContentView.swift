@@ -82,6 +82,7 @@ struct ContentView: View {
                 audioLevel: audioLevel,
                 detectedApp: detectedAppName,
                 silenceSeconds: silenceSeconds,
+                silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
                 onStartCallCapture: { startSession(type: .callCapture) },
@@ -178,7 +179,8 @@ struct ContentView: View {
                 apiServer.sessionElapsed = sessionElapsed
                 if audioLevel < 0.01 {
                     silenceSeconds += 1
-                    if silenceSeconds >= 120 {
+                    let limit = settings.silenceAutoStopSeconds
+                    if limit > 0 && silenceSeconds >= limit {
                         stopSession()
                     }
                 }

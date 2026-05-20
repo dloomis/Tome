@@ -47,6 +47,12 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(diarizationNumberOfSpeakers, forKey: "diarizationNumberOfSpeakers") }
     }
 
+    /// Seconds of continuous silence (mic + system audio both below threshold) before
+    /// the active session auto-stops. 0 disables auto-stop entirely.
+    var silenceAutoStopSeconds: Int {
+        didSet { UserDefaults.standard.set(silenceAutoStopSeconds, forKey: "silenceAutoStopSeconds") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -64,6 +70,9 @@ final class AppSettings {
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
         self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
         self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
+        self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil
+            ? 120
+            : defaults.integer(forKey: "silenceAutoStopSeconds")
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")
