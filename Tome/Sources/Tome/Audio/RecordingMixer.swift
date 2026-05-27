@@ -42,7 +42,7 @@ enum RecordingMixer {
         }
 
         let engine = AVAudioEngine()
-        var scheduled: [(player: AVAudioPlayerNode, file: AVAudioFile, lead: AVAudioFramePosition)] = []
+        var scheduled: [(player: AVAudioPlayerNode, file: AVAudioFile, leadSeconds: Double)] = []
 
         for source in sources {
             let file = try AVAudioFile(forReading: source.url)
@@ -54,8 +54,7 @@ enum RecordingMixer {
             player.volume = perSourceGain
 
             let leadSeconds = max(0, source.firstSample.timeIntervalSince(sessionStart))
-            let lead = AVAudioFramePosition((leadSeconds * outputSampleRate).rounded())
-            scheduled.append((player, file, lead))
+            scheduled.append((player, file, leadSeconds))
         }
 
         guard !scheduled.isEmpty else { throw MixError.noSources }
@@ -70,12 +69,16 @@ enum RecordingMixer {
         // render rate) plus a small tail so the resampler/mixer can flush.
         var totalFrames: AVAudioFramePosition = 0
         for entry in scheduled {
+            // Latest end = lead + file duration, in real seconds → convert to output frames once.
             let fileSeconds = Double(entry.file.length) / entry.file.processingFormat.sampleRate
-            let renderFrames = AVAudioFramePosition((fileSeconds * outputSampleRate).rounded())
-            totalFrames = max(totalFrames, entry.lead + renderFrames)
+            totalFrames = max(totalFrames, AVAudioFramePosition(((entry.leadSeconds + fileSeconds) * outputSampleRate).rounded()))
 
-            let when = AVAudioTime(sampleTime: entry.lead, atRate: outputSampleRate)
-            entry.player.scheduleFile(entry.file, at: when)
+            // Schedule the lead in the FILE's own sample rate: the player node renders on its
+            // connection-format (file-rate) timeline, so a lead expressed at the output rate
+            // misplaces the onset of any source whose rate ≠ outputSampleRate (e.g. a 44.1 kHz mic).
+            let fileRate = entry.file.processingFormat.sampleRate
+            let leadFrames = AVAudioFramePosition((entry.leadSeconds * fileRate).rounded())
+            entry.player.scheduleFile(entry.file, at: AVAudioTime(sampleTime: leadFrames, atRate: fileRate))
             entry.player.play()
         }
         totalFrames += AVAudioFramePosition(maxFrames)
