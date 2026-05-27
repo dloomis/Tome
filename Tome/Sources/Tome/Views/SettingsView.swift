@@ -103,8 +103,17 @@ private struct TranscriptionTab: View {
     var body: some View {
         Form {
             Section("Language") {
-                TextField("Locale (e.g. en-US)", text: $settings.transcriptionLocale)
-                    .font(.system(size: 12, design: .monospaced))
+                // Read-only for now — locale switching isn't wired up yet, so show
+                // the active value rather than letting it be edited into a no-op.
+                HStack {
+                    Text("Locale")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text(settings.transcriptionLocale)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             }
 
             Section("Speaker Diarization") {
