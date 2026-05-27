@@ -30,11 +30,16 @@ final class PostProcessingJob: Identifiable {
     let clusterThreshold: Float
     let numberOfSpeakers: Int
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int) {
+    /// When set, the combined session audio is exported as `.m4a` into this folder
+    /// after the transcript is finalized. Nil = retention off.
+    let retention: RecordingRetentionConfig?
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
+        self.retention = retention
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -52,7 +57,7 @@ final class PostProcessingJob: Identifiable {
         if handle.wavWriteErrorCount > 0 {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
         }
-        if let bufferURL = handle.wavBufferPath {
+        if handle.sessionType == .callCapture, let bufferURL = handle.wavBufferPath {
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
             diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
             phase = .diarizing
@@ -65,7 +70,7 @@ final class PostProcessingJob: Identifiable {
             diagLog("[JOB \(id)] diarization returned: \(segments == nil ? "nil" : "\(segments!.count) segments")")
 
             if Task.isCancelled {
-                SystemAudioCapture.cleanupBufferFile(bufferURL)
+                cleanupCaptureFiles()
                 phase = .cancelled
                 throw .cancelled
             }
@@ -121,13 +126,79 @@ final class PostProcessingJob: Identifiable {
             throw error
         }
 
-        if let bufferURL = handle.wavBufferPath {
-            SystemAudioCapture.cleanupBufferFile(bufferURL)
+        // 3. Retain the combined recording before deleting the source WAVs. Failure
+        //    here is non-fatal — the transcript is already saved.
+        if let retention {
+            await exportRetainedRecording(to: retention.folder, transcriptPath: savedPath)
         }
+
+        cleanupCaptureFiles()
 
         phase = .complete(savedPath)
         diagLog("[JOB \(id)] complete → \(savedPath.lastPathComponent)")
         return savedPath
+    }
+
+    /// Combine the session's mic + system WAVs into one `.m4a` in `folder`, named to
+    /// match the transcript stem (with a numeric suffix on collision). Voice memos
+    /// export the mic track only.
+    private func exportRetainedRecording(to folder: URL, transcriptPath: URL) async {
+        let micArg: (url: URL, firstSample: Date)? = pair(handle.micWavPath, handle.micFirstSampleTime)
+        let systemArg: (url: URL, firstSample: Date)? = handle.sessionType == .callCapture
+            ? pair(handle.wavBufferPath, handle.systemFirstSampleTime)
+            : nil
+        guard micArg != nil || systemArg != nil else {
+            diagLog("[JOB \(id)] retention: no source audio to combine, skipping")
+            return
+        }
+
+        let sessionStart = handle.transcript.sessionStartTime
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            diagLog("[JOB \(id)] retention: could not create folder (non-fatal): \(error)")
+            return
+        }
+        let outputURL = uniqueURL(in: folder, stem: transcriptPath.deletingPathExtension().lastPathComponent, ext: "m4a")
+
+        // Offline render is CPU-heavy and synchronous — run it off the main actor so
+        // the UI stays responsive (mirrors how diarize / re-transcribe hop off-main).
+        await Task.detached(priority: .utility) {
+            do {
+                try RecordingMixer.produce(mic: micArg, system: systemArg, sessionStart: sessionStart, outputURL: outputURL)
+                diagLog("[JOB] retention: wrote \(outputURL.lastPathComponent)")
+            } catch {
+                diagLog("[JOB] retention: combine failed (non-fatal): \(error)")
+            }
+        }.value
+    }
+
+    /// Delete both transient capture WAVs (and the system sidecar) for this session,
+    /// regardless of session type or retention. Runs on the success and cancellation
+    /// paths so neither file is orphaned.
+    private func cleanupCaptureFiles() {
+        if let bufferURL = handle.wavBufferPath {
+            SystemAudioCapture.cleanupBufferFile(bufferURL)
+        }
+        if let micURL = handle.micWavPath {
+            try? FileManager.default.removeItem(at: micURL)
+        }
+    }
+
+    private func pair(_ url: URL?, _ date: Date?) -> (url: URL, firstSample: Date)? {
+        guard let url, let date else { return nil }
+        return (url, date)
+    }
+
+    private func uniqueURL(in folder: URL, stem: String, ext: String) -> URL {
+        let first = folder.appendingPathComponent("\(stem).\(ext)")
+        guard FileManager.default.fileExists(atPath: first.path) else { return first }
+        var n = 2
+        while true {
+            let candidate = folder.appendingPathComponent("\(stem) \(n).\(ext)")
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            n += 1
+        }
     }
 
     /// Called when a TranscriptFinalizer write step throws. The WAV already lives

@@ -61,6 +61,11 @@ final class TranscriptionEngine {
     /// reaching into `SystemAudioCapture`.
     private var currentBufferURL: URL?
 
+    /// The mic-track retention WAV path for the currently-capturing session, mirroring
+    /// `currentBufferURL`. Always set when a `recordingContext` is supplied (capture is
+    /// unconditional); the post-processing job decides whether to keep it.
+    private var currentMicBufferURL: URL?
+
     /// Tracks the resolved mic device ID currently in use.
     private var currentMicDeviceID: AudioDeviceID = 0
 
@@ -121,8 +126,11 @@ final class TranscriptionEngine {
         userSelectedDeviceID = inputDeviceID
         let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID()
         currentMicDeviceID = targetMicID ?? 0
-        diagLog("[ENGINE-3] starting mic capture, targetMicID=\(String(describing: targetMicID))")
-        let micStream = micCapture.bufferStream(deviceID: targetMicID)
+        currentMicBufferURL = recordingContext.flatMap { ctx in
+            try? SystemAudioCapture.sessionsDirectory().appendingPathComponent("\(ctx.sessionId).mic.wav")
+        }
+        diagLog("[ENGINE-3] starting mic capture, targetMicID=\(String(describing: targetMicID)), micBuffer=\(currentMicBufferURL?.lastPathComponent ?? "nil")")
+        let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
         // 3. Start system audio capture
         diagLog("[ENGINE-4] starting system audio capture...")
@@ -228,8 +236,10 @@ final class TranscriptionEngine {
 
         currentMicDeviceID = targetMicID
 
-        // Start new mic stream
-        let micStream = micCapture.bufferStream(deviceID: targetMicID)
+        // Start new mic stream. The retention writer reopens (overwriting) at the same
+        // path — a mid-session mic device change truncates the kept recording to the
+        // post-swap segment, so retained recordings assume a stable mic for the session.
+        let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
@@ -523,6 +533,14 @@ final class TranscriptionEngine {
     /// The WAV buffer URL for the currently-live (or most recently live) capture.
     /// Callers can snapshot this at stop time before starting a new session.
     var activeBufferURL: URL? { currentBufferURL }
+
+    /// Mic-track retention WAV URL for the current capture. Snapshot at stop time.
+    var activeMicBufferURL: URL? { currentMicBufferURL }
+
+    /// Wall-clock of the first mic / system sample for the current capture. Used by
+    /// the post-session mixer to align each track to the session start.
+    var micFirstSampleTime: Date? { micCapture.firstSampleTime }
+    var systemFirstSampleTime: Date? { systemCapture.firstSampleTime }
 
     /// Count of write failures on the system-audio WAV during the active capture.
     /// Snapshot at stop time, before `stop()` resets the capture's internal counter.

@@ -101,11 +101,26 @@ struct SessionHandle: Sendable {
     /// Path to the buffered system audio WAV. Nil when the session did not capture
     /// system audio (e.g. voice memos), which signals the job to skip diarization.
     let wavBufferPath: URL?
+    /// Path to the buffered mic-track WAV (always written during capture). Combined
+    /// with `wavBufferPath` by the mixer when retention is on; deleted afterward.
+    let micWavPath: URL?
+    /// Wall-clock of the first mic / system sample, used to align each track to the
+    /// session start (`transcript.sessionStartTime`) in the combined recording.
+    let micFirstSampleTime: Date?
+    let systemFirstSampleTime: Date?
     var transcript: TranscriptSessionSnapshot
     /// Number of times the system-audio WAV writer threw on `write(from:)`. Non-zero
     /// values are not fatal but indicate the diarization input may be incomplete —
     /// the post-processing job logs a warning before diarizing.
     var wavWriteErrorCount: Int = 0
+}
+
+// MARK: - Recording Retention
+
+/// Set on a `PostProcessingJob` when the user has retention enabled. Carries the
+/// destination folder for the exported combined `.m4a`.
+struct RecordingRetentionConfig: Sendable {
+    let folder: URL
 }
 
 // MARK: - Post-Processing Error

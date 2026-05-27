@@ -476,11 +476,21 @@ struct ContentView: View {
         currentSourceApp = nil
         apiServer.sessionDidStop(id: sessionId)
 
+        let retention = settings.retainRecordings
+            ? settings.recordingsFolderURL.map(RecordingRetentionConfig.init(folder:))
+            : nil
+
         Task {
-            // Snapshot the buffer URL BEFORE tearing down the engine, since the engine
-            // may begin a new session (which reuses `SystemAudioCapture`) immediately.
-            let bufferURL: URL? = wasCallCapture ? transcriptionEngine?.activeBufferURL : nil
-            let wavWriteErrors = wasCallCapture ? (transcriptionEngine?.systemAudioWriteErrorCount ?? 0) : 0
+            // Snapshot capture state BEFORE tearing down the engine, since the engine
+            // may begin a new session (which reuses the capture objects) immediately.
+            // The system WAV + mic WAV are snapshotted for all session types so the job
+            // can both retain (when enabled) and clean them up — gating diarization on
+            // `sessionType`, not on the presence of a buffer path.
+            let bufferURL = transcriptionEngine?.activeBufferURL
+            let micBufferURL = transcriptionEngine?.activeMicBufferURL
+            let micFirstSample = transcriptionEngine?.micFirstSampleTime
+            let systemFirstSample = transcriptionEngine?.systemFirstSampleTime
+            let wavWriteErrors = transcriptionEngine?.systemAudioWriteErrorCount ?? 0
 
             await transcriptionEngine?.stop()
             await services.sessionStore.endSession()
@@ -497,13 +507,17 @@ struct ContentView: View {
                 sessionType: sessionType,
                 sourceApp: sourceApp,
                 wavBufferPath: bufferURL,
+                micWavPath: micBufferURL,
+                micFirstSampleTime: micFirstSample,
+                systemFirstSampleTime: systemFirstSample,
                 transcript: transcriptSnapshot,
                 wavWriteErrorCount: wavWriteErrors
             )
             let job = PostProcessingJob(
                 handle: handle,
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
-                numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                retention: retention
             )
 
             services.postProcessingQueue.enqueue(job)

@@ -1,16 +1,31 @@
 @preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
+import os
 
 final class MicCapture: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
 
+    /// Optional crash-resilient WAV writer for retaining the mic track. Created in
+    /// `bufferStream` when a `recordOutputURL` is provided, written from the tap
+    /// callback, closed in `stop()`.
+    private let _recordWriter = OSAllocatedUnfairLock<WAVStreamWriter?>(uncheckedState: nil)
+
+    /// Wall-clock time of the first buffer delivered by the tap. Used by the
+    /// post-session mixer to align the mic track to the session start. Persisted
+    /// across `stop()` so the engine can snapshot it at teardown.
+    private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
+
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
-    func bufferStream(deviceID: AudioDeviceID? = nil) -> AsyncStream<AVAudioPCMBuffer> {
+    /// - Parameter recordOutputURL: when non-nil, the mic track is also written to a
+    ///   WAV at this path (float32 mono) for post-session retention. The first input
+    ///   channel only is captured for multi-channel devices.
+    func bufferStream(deviceID: AudioDeviceID? = nil, recordOutputURL: URL? = nil) -> AsyncStream<AVAudioPCMBuffer> {
         let level = _audioLevel
         let errorHolder = _error
 
@@ -72,6 +87,22 @@ final class MicCapture: @unchecked Sendable {
 
             diagLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
 
+            // Open the retention WAV writer (mono float32) before the tap fires.
+            self._firstSampleTime.withLock { $0 = nil }
+            self._recordWriter.withLock { writer in
+                writer?.close()
+                writer = nil
+                guard let url = recordOutputURL else { return }
+                do {
+                    writer = try WAVStreamWriter(url: url, sampleRate: tapFormat.sampleRate, channels: 1)
+                } catch {
+                    diagLog("[MIC-WAV-FAIL] could not open writer at \(url.path): \(error)")
+                }
+            }
+
+            let recordWriter = self._recordWriter
+            let firstSampleTime = self._firstSampleTime
+
             var tapCallCount = 0
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
                 tapCallCount += 1
@@ -81,6 +112,9 @@ final class MicCapture: @unchecked Sendable {
                 if tapCallCount <= 5 || tapCallCount % 100 == 0 {
                     diagLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
                 }
+
+                firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
+                recordWriter.withLock { try? $0?.write(buffer) }
 
                 continuation.yield(buffer)
             }
@@ -105,6 +139,12 @@ final class MicCapture: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         _audioLevel.value = 0
+        // Flush + finalize the retention WAV. firstSampleTime is intentionally
+        // preserved so the engine can snapshot it after stop.
+        _recordWriter.withLock { writer in
+            writer?.close()
+            writer = nil
+        }
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {

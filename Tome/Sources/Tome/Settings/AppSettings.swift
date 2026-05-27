@@ -37,6 +37,19 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(vaultVoicePath, forKey: "vaultVoicePath") }
     }
 
+    // MARK: - Recording Retention
+
+    /// When true, each session's combined audio (mic + system for calls, mic for
+    /// voice memos) is exported as an `.m4a` to `recordingsFolderPath` after
+    /// post-processing. Off by default.
+    var retainRecordings: Bool {
+        didSet { UserDefaults.standard.set(retainRecordings, forKey: "retainRecordings") }
+    }
+
+    var recordingsFolderPath: String {
+        didSet { UserDefaults.standard.set(recordingsFolderPath, forKey: "recordingsFolderPath") }
+    }
+
     // MARK: - Diarization (SpeakerKit / pyannote v4)
 
     var diarizationClusterThreshold: Double {
@@ -87,6 +100,8 @@ final class AppSettings {
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
+        self.retainRecordings = defaults.bool(forKey: "retainRecordings")
+        self.recordingsFolderPath = defaults.string(forKey: "recordingsFolderPath") ?? NSString("~/Documents/Tome/Recordings").expandingTildeInPath
         self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
         self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil
@@ -130,6 +145,11 @@ final class AppSettings {
     var vaultVoiceURL: URL? {
         guard !vaultVoicePath.isEmpty else { return nil }
         return URL(fileURLWithPath: vaultVoicePath)
+    }
+
+    var recordingsFolderURL: URL? {
+        guard !recordingsFolderPath.isEmpty else { return nil }
+        return URL(fileURLWithPath: recordingsFolderPath)
     }
 
     var locale: Locale {

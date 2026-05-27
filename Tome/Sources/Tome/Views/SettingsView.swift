@@ -154,6 +154,21 @@ private struct OutputTab: View {
                 ) { settings.vaultVoicePath = $0 }
             }
 
+            Section("Recordings") {
+                Toggle("Retain recordings", isOn: $settings.retainRecordings)
+                    .font(.system(size: 12))
+                if settings.retainRecordings {
+                    folderRow(
+                        title: "Recordings Folder",
+                        path: settings.recordingsFolderPath,
+                        chooseMessage: "Choose the folder for retained recordings"
+                    ) { settings.recordingsFolderPath = $0 }
+                }
+                Text(".m4a, ~25 MB/hour. Combines your mic and the other side into one file.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Filename Template") {
                 filenameRow(label: "Date Format", binding: $settings.filenameDateFormat, monospaced: true)
                 filenameRow(label: "Call Capture Label", binding: $settings.filenameCallLabel)

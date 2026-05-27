@@ -51,7 +51,12 @@ enum OrphanScanner {
             at: dir,
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
         )) ?? []
-        let wavURLs = urls.filter { $0.pathExtension.lowercased() == "wav" }
+        // `.mic.wav` files are mic-track companions of a `<sid>.wav`, not diarization
+        // primaries — skip them so a session is listed once and recovery never offers
+        // a mic-only WAV.
+        let wavURLs = urls.filter {
+            $0.pathExtension.lowercased() == "wav" && !$0.lastPathComponent.hasSuffix(".mic.wav")
+        }
         var orphans: [Orphan] = []
         for wavURL in wavURLs {
             // Skip empty / placeholder WAVs (header-only files with no data).
@@ -75,5 +80,6 @@ enum OrphanScanner {
     static func discard(_ orphan: Orphan) {
         try? FileManager.default.removeItem(at: orphan.wavURL)
         SessionSidecar.deleteIfExists(forWAV: orphan.wavURL)
+        try? FileManager.default.removeItem(at: SystemAudioCapture.micBufferURL(forSystemWAV: orphan.wavURL))
     }
 }

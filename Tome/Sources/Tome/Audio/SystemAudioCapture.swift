@@ -30,6 +30,12 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
 
+    /// Wall-clock time of the first sample buffer delivered by SCStream during the
+    /// current capture. Used by the post-session mixer to align the system track to
+    /// the session start. Reset to nil on `stop()`.
+    private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
+
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
         let bufferURL: URL
@@ -134,6 +140,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         }
         _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
         _lastSampleTime.withLock { $0 = nil }
+        _firstSampleTime.withLock { $0 = nil }
         _audioLevel.value = 0
     }
 
@@ -143,6 +150,13 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     static func cleanupBufferFile(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
         SessionSidecar.deleteIfExists(forWAV: url)
+    }
+
+    /// Companion mic-track WAV path for a given system-audio WAV. Both share the
+    /// session-id stem in the same directory: `<sid>.wav` ↔ `<sid>.mic.wav`.
+    static func micBufferURL(forSystemWAV systemWAV: URL) -> URL {
+        let sid = systemWAV.deletingPathExtension().lastPathComponent
+        return systemWAV.deletingLastPathComponent().appendingPathComponent("\(sid).mic.wav")
     }
 
     /// `~/Library/Application Support/Tome/sessions/` — the stable home for
@@ -187,6 +201,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         let rms = Self.normalizedRMS(from: pcmBuffer)
         _audioLevel.value = min(rms * 25, 1.0)
         _lastSampleTime.withLock { $0 = Date() }
+        _firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
 
         // Diagnostic: log raw system audio levels periodically
         let count = _sampleCount.withLock { val -> Int in val += 1; return val }
