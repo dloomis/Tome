@@ -240,13 +240,15 @@ struct ContentView: View {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm:ss"
+        // Offsets relative to the first utterance (no session-start handle on this
+        // ad-hoc save path); same decimal-seconds format as the vault transcripts.
+        let start = transcriptStore.utterances.first?.timestamp ?? Date()
 
         var md = "# Transcript\n\n"
         for u in transcriptStore.utterances {
             let speaker = u.speaker == .you ? "You" : "Them"
-            md += "**\(speaker)** (\(timeFmt.string(from: u.timestamp)))\n"
+            let offset = u.timestamp.timeIntervalSince(start)
+            md += "**\(speaker)** (\(formatTimeOffset(offset)))\n"
             md += "\(u.text)\n\n"
         }
 

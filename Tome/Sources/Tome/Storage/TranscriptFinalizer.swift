@@ -20,50 +20,41 @@ enum TranscriptFinalizer {
 
         let header = String(content[..<transcriptStart.upperBound])
         let body = String(content[transcriptStart.upperBound...])
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm:ss"
 
-        // Parse existing You utterances to preserve them
-        let youPattern = #"\*\*You\*\* \((\d{2}:\d{2}:\d{2})\)\n(.*?)(?=\n\n|\z)"#
+        // Parse existing You utterances to preserve them. The marker is the decimal-second
+        // offset from session start that the live logger wrote.
+        let youPattern = #"\*\*You\*\* \(([\d.]+)\)\n(.*?)(?=\n\n|\z)"#
         let youRegex = try? NSRegularExpression(pattern: youPattern, options: .dotMatchesLineSeparators)
-        var youUtterances: [(timestamp: Date, text: String)] = []
+        var youUtterances: [(offset: Double, text: String)] = []
         if let youRegex {
             let nsBody = body as NSString
             let youMatches = youRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
             for match in youMatches {
-                let timeStr = nsBody.substring(with: match.range(at: 1))
+                let offsetStr = nsBody.substring(with: match.range(at: 1))
                 let text = nsBody.substring(with: match.range(at: 2))
-                if let date = timeFmt.date(from: timeStr) {
-                    let calendar = Calendar.current
-                    let timeComps = calendar.dateComponents([.hour, .minute, .second], from: date)
-                    var fullDate = calendar.dateComponents([.year, .month, .day], from: snapshot.sessionStartTime)
-                    fullDate.hour = timeComps.hour
-                    fullDate.minute = timeComps.minute
-                    fullDate.second = timeComps.second
-                    if let reconstructed = calendar.date(from: fullDate) {
-                        youUtterances.append((timestamp: reconstructed, text: text))
-                    }
+                if let offset = Double(offsetStr) {
+                    youUtterances.append((offset: offset, text: text))
                 }
             }
         }
 
-        // Build combined timeline: diarized system segments + You utterances
+        // Build combined timeline (offsets in seconds from session start): diarized
+        // system segments + You utterances. Diarized `startTime` is already an offset.
         struct TimelineEntry: Comparable {
             let speaker: String
             let text: String
-            let timestamp: Date
+            let offset: Double
             static func < (lhs: TimelineEntry, rhs: TimelineEntry) -> Bool {
-                lhs.timestamp < rhs.timestamp
+                lhs.offset < rhs.offset
             }
         }
 
         var timeline: [TimelineEntry] = []
         for seg in diarizedSegments {
-            let segDate = snapshot.sessionStartTime.addingTimeInterval(TimeInterval(seg.startTime))
-            timeline.append(TimelineEntry(speaker: seg.speaker, text: seg.text, timestamp: segDate))
+            timeline.append(TimelineEntry(speaker: seg.speaker, text: seg.text, offset: Double(seg.startTime)))
         }
         for you in youUtterances {
-            timeline.append(TimelineEntry(speaker: "You", text: you.text, timestamp: you.timestamp))
+            timeline.append(TimelineEntry(speaker: "You", text: you.text, offset: you.offset))
         }
         timeline.sort()
 
@@ -73,7 +64,7 @@ enum TranscriptFinalizer {
         var newBody = ""
         let allSpeakers = Set(timeline.map(\.speaker))
         for entry in timeline {
-            newBody += "**\(entry.speaker)** (\(timeFmt.string(from: entry.timestamp)))\n"
+            newBody += "**\(entry.speaker)** (\(formatTimeOffset(entry.offset)))\n"
             newBody += "\(entry.text)\n\n"
         }
 
@@ -103,30 +94,17 @@ enum TranscriptFinalizer {
         // Build a map of unique diarization speaker IDs → friendly labels
         let diarSpeakerMap = speakerLabels(from: segments.map(\.speakerId))
 
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm:ss"
-
-        let pattern = #"\*\*Them\*\* \((\d{2}:\d{2}:\d{2})\)"#
+        // Each "Them" marker is already the decimal-second offset from session start.
+        let pattern = #"\*\*Them\*\* \(([\d.]+)\)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
 
         let nsContent = content as NSString
         let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
 
-        let calendar = Calendar.current
-        let startComponents = calendar.dateComponents([.hour, .minute, .second], from: snapshot.sessionStartTime)
-        let sessionStartSecs = (startComponents.hour ?? 0) * 3600 + (startComponents.minute ?? 0) * 60 + (startComponents.second ?? 0)
-
-        func offsetFor(_ timeStr: String) -> Float? {
-            guard let d = timeFmt.date(from: timeStr) else { return nil }
-            let c = calendar.dateComponents([.hour, .minute, .second], from: d)
-            let secs = (c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0)
-            return Float(secs - sessionStartSecs)
-        }
-
         var matchOffsets: [Float] = []
         for match in matches {
             let timeStr = nsContent.substring(with: match.range(at: 1))
-            matchOffsets.append(offsetFor(timeStr) ?? 0)
+            matchOffsets.append(Float(timeStr) ?? 0)
         }
 
         // Process in reverse so range offsets stay valid

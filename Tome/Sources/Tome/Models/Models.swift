@@ -19,6 +19,16 @@ struct Utterance: Identifiable, Codable, Sendable {
     }
 }
 
+// MARK: - Transcript Time Offsets
+
+/// Formats a transcript line's time offset (seconds elapsed since the session /
+/// recording start) for the per-line marker, e.g. `12.345`. Emitted in seconds
+/// with millisecond precision so it drops directly into the Obsidian Media
+/// Extended `#t=` fragment, which expects fractional seconds (not raw ms).
+func formatTimeOffset(_ seconds: TimeInterval) -> String {
+    String(format: "%.3f", max(0, seconds))
+}
+
 // MARK: - Speaker Labels
 
 /// Maps raw diarization speaker IDs to friendly labels ("Speaker 2", "Speaker 3", etc.).

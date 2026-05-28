@@ -39,7 +39,7 @@ I'm putting it out there because if you're running Obsidian with any kind of AI 
 
 - **Plain markdown out.** YAML frontmatter, tags, timestamps. Your vault already knows what to do with it. No proprietary export, no copy-paste, no middleman.
 - **Built for the agent pipeline.** Tome is just the capture layer. You talk, it transcribes, your agent picks up the `.md` and does whatever you've wired it to do.
-- **Runs on your machine.** Parakeet-TDT v2 on Apple Silicon. No API keys, no accounts, no subscriptions, no data leaving the building.
+- **Runs on your machine.** Parakeet-TDT v3 on Apple Silicon. No API keys, no accounts, no subscriptions, no data leaving the building.
 
 ```
 speak → capture → vault → agent → knowledge base
@@ -54,7 +54,9 @@ Tome does the first three. Your agent does the rest.
 - **Voice Memo** is mic only. For quick thoughts, verbal notes, stream of consciousness. Saves to a separate folder so it doesn't clutter your meeting transcripts.
 - **Speaker diarization** runs after the call ends. pyannote splits the remote audio into Speaker 2, Speaker 3, Speaker 4. Not perfect, but way better than one wall of unattributed text.
 - **Vault-native output** writes `.md` with frontmatter: `type`, `created`, `attendees`, `tags`, `source_app`. Lands in your vault ready to process.
-- **Privacy.** Hidden from screen sharing by default. No audio saved. Transcripts only.
+- **Privacy.** Hidden from screen sharing by default. Audio is discarded after transcription — opt in to recording retention if you want to keep the audio file.
+- **Timestamped lines.** Every transcript line is tagged with its start offset in seconds from the start of the recording (e.g. `(3.120)`). Drops straight into an [Obsidian Media Extended](https://github.com/aidenlx/media-extended) `#t=` link, so a line can replay the exact moment of audio it came from.
+- **Optional recording retention.** Off by default. When enabled (Settings > Output), each session's combined audio — your mic plus the other side — is exported as a single `.m4a` (~25 MB/hour) to a folder you choose. Leave it off and nothing but text is kept.
 - **Silence auto-stop.** Stops itself after a configurable stretch of dead air (default 120s, slider in Settings, 0 disables).
 - **Configurable filenames.** Settings > Output exposes the date format and per-session-type labels so files land as `2026-05-20 14-30-00 Call Recording.md` or whatever pattern you prefer.
 - **Crash-safe recordings.** WAVs are written with a self-healing header and stored under `~/Library/Application Support/Tome/sessions/` — a crash mid-meeting leaves a readable file. On next launch, Tome detects orphaned sessions and offers one-click recovery (diarization + transcript rebuild) or a manual `File > Recover from WAV…` (Cmd+Opt+R) for legacy WAVs.
@@ -112,15 +114,20 @@ tags:
 
 # Call Recording — 2026-03-23 10:00
 
-**You** (10:00:03)
+**You** (3.120)
 Morning. Quick sync on the product launch. Where are we at?
 
-**Speaker 2** (10:00:07)
+**Speaker 2** (7.480)
 We're in good shape. QA signed off yesterday, marketing assets
 are locked, landing page is live in staging.
 ```
 
 Voice memos use `type: fleeting` with a single speaker. Same structure, same frontmatter.
+
+Each line is tagged with its start offset in seconds (millisecond precision) from the
+beginning of the recording. The value drops straight into an [Obsidian Media Extended](https://github.com/aidenlx/media-extended)
+`#t=` fragment — e.g. `[[recording.m4a#t=3.120]]` — so a transcript line can jump the
+audio to the exact moment it was spoken.
 
 ## Build
 
@@ -193,7 +200,7 @@ Tome/Sources/Tome/
 
 - Transcription runs entirely on-device. No audio is ever sent anywhere.
 - No network calls. No analytics. No telemetry.
-- No audio is saved to disk. Only text transcripts.
+- Audio is not saved by default — only text transcripts. Optional recording retention (off by default, Settings > Output) keeps a combined `.m4a` in a folder you choose; otherwise the working audio is deleted once post-processing finishes.
 - The app window is hidden from screen sharing by default.
 - Transcripts are saved as plain `.md` files to a folder you choose.
 
@@ -243,6 +250,8 @@ This fork has diverged substantially from upstream Tome. Beyond what upstream sh
 - **Tabbed Settings window** — five panes (General · Audio · Transcription · Output · API) with SF Symbol icons replace the single scrolling Form. Per-tab state means device enumeration and the API port read only happen when you visit those tabs.
 - **Configurable silence auto-stop** — Settings > Audio slider (0–600s, 30s steps). 0 disables auto-stop entirely. Default 120s preserves prior behavior.
 - **Configurable filename template** — Settings > Output exposes the `DateFormatter` pattern plus per-session-type labels ("Call Recording", "Voice Memo" by default). Rename to "Scheduled Meetings", "Quick Notes", etc., or leave a label blank for date-only filenames. A shared sanitizer scrubs filesystem-hostile characters (`/ \ : ? * < > | "`, control chars, leading dots) so user-entered formats are always safe to commit to disk. The chosen format is snapshotted at session start so a mid-recording settings change doesn't shift the prefix on an in-flight session's post-processing rename.
+- **Optional recording retention** — `Settings > Output > Recordings` toggle (off by default) exports each session's combined audio as a single `.m4a`. `RecordingMixer` pads each track by `firstSample − sessionStart` so the mic and system streams align to the same timeline as the transcript, then `PostProcessingJob` writes the file to the chosen folder (default `~/Documents/Tome/Recordings`) after diarization. With retention off, the working WAVs are deleted once post-processing finishes.
+- **Per-line time offsets** — transcript lines are tagged with their start offset in seconds (millisecond precision) from the session start instead of wall-clock time. `StreamingTranscriber` derives the offset from a 16 kHz audio sample clock, so each line marks where its speech *begins* rather than when ASR finalized it. The decimal-seconds value (e.g. `(3.120)`) drops directly into an [Obsidian Media Extended](https://github.com/aidenlx/media-extended) `#t=` fragment — `[[recording.m4a#t=3.120]]` — for click-to-play against the retained recording.
 - **File > Save Transcript (Cmd+S)** — manually save the current transcript at any time during or after a session via `NSSavePanel`.
 - **View > Logs** — opens `/tmp/tome.log` for quick diagnostic inspection.
 - **Window scene (single instance)** — replaces `WindowGroup` so macOS 26 stops adding the "+" duplicate-instance pill to the toolbar.

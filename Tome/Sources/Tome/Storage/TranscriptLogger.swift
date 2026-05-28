@@ -158,12 +158,15 @@ tags:
     private func flushBuffer() {
         guard let fileHandle, !utteranceBuffer.isEmpty else { return }
 
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm:ss"
+        // Per-line marker is the offset (in seconds, ms precision) from the session
+        // start — the same t=0 the retained recording is anchored to — so it drops
+        // straight into an Obsidian Media Extended `#t=` fragment.
+        let start = sessionStartTime ?? utteranceBuffer.first?.timestamp ?? Date()
 
         var lines = ""
         for entry in utteranceBuffer {
-            lines += "**\(entry.speaker)** (\(timeFmt.string(from: entry.timestamp)))\n"
+            let offset = entry.timestamp.timeIntervalSince(start)
+            lines += "**\(entry.speaker)** (\(formatTimeOffset(offset)))\n"
             lines += "\(entry.text)\n\n"
         }
 

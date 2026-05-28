@@ -9,7 +9,11 @@ final class StreamingTranscriber: @unchecked Sendable {
     private let speaker: Speaker
     private let audioSource: AudioSource
     private let onPartial: @Sendable (String) -> Void
-    private let onFinal: @Sendable (String) -> Void
+    /// Emits a finalized segment with the wall-clock time at which its speech
+    /// *started* (not when ASR finished). The session's offset markers are derived
+    /// downstream as `startTime − sessionStart`, so this must reflect the audio
+    /// position, not the transcription latency.
+    private let onFinal: @Sendable (String, Date) -> Void
     private let log = Logger(subsystem: "io.gremble.tome", category: "StreamingTranscriber")
 
     /// Resampler from source format to 16kHz mono Float32.
@@ -27,7 +31,7 @@ final class StreamingTranscriber: @unchecked Sendable {
         speaker: Speaker,
         audioSource: AudioSource = .microphone,
         onPartial: @escaping @Sendable (String) -> Void,
-        onFinal: @escaping @Sendable (String) -> Void
+        onFinal: @escaping @Sendable (String, Date) -> Void
     ) {
         self.asrCoordinator = asrCoordinator
         self.vadManager = vadManager
@@ -54,7 +58,20 @@ final class StreamingTranscriber: @unchecked Sendable {
         var bufferCount = 0
         var consecutiveErrors = 0
 
+        // Audio clock for per-line offsets. `baseTime` is the wall-clock of the first
+        // received sample (≈ capture start, the same anchor the recording mixer pads
+        // each track to). `consumedSamples` counts 16kHz samples handed to the VAD, so
+        // `segmentStartSample / 16000` is the audio position where a segment begins.
+        var baseTime: Date?
+        var consumedSamples = 0
+        var segmentStartSample = 0
+
+        func startDate(forSample sample: Int) -> Date {
+            (baseTime ?? Date()).addingTimeInterval(Double(sample) / 16000.0)
+        }
+
         outerLoop: for await buffer in stream {
+            if baseTime == nil { baseTime = Date() }
             bufferCount += 1
             if bufferCount <= 3 {
                 let fmt = buffer.format
@@ -73,6 +90,7 @@ final class StreamingTranscriber: @unchecked Sendable {
             while vadBuffer.count >= Self.vadChunkSize {
                 let chunk = Array(vadBuffer.prefix(Self.vadChunkSize))
                 vadBuffer.removeFirst(Self.vadChunkSize)
+                consumedSamples += Self.vadChunkSize
 
                 do {
                     let result = try await vadManager.processStreamingChunk(
@@ -90,6 +108,8 @@ final class StreamingTranscriber: @unchecked Sendable {
                         case .speechStart:
                             isSpeaking = true
                             speechSamples.removeAll(keepingCapacity: true)
+                            // Speech began somewhere in the chunk just consumed.
+                            segmentStartSample = max(0, consumedSamples - Self.vadChunkSize)
                             diagLog("[\(self.speaker.rawValue)] speech start")
 
                         case .speechEnd:
@@ -97,8 +117,9 @@ final class StreamingTranscriber: @unchecked Sendable {
                             diagLog("[\(self.speaker.rawValue)] speech end, samples=\(speechSamples.count)")
                             if speechSamples.count > 8000 {
                                 let segment = speechSamples
+                                let segStart = segmentStartSample
                                 speechSamples.removeAll(keepingCapacity: true)
-                                if await !transcribeSegment(segment) {
+                                if await !transcribeSegment(segment, startTime: startDate(forSample: segStart)) {
                                     consecutiveErrors += 1
                                     if consecutiveErrors > 10 { break outerLoop }
                                 } else {
@@ -117,8 +138,11 @@ final class StreamingTranscriber: @unchecked Sendable {
                         // Flush every ~3s for near-real-time output during continuous speech
                         if speechSamples.count >= Self.flushInterval {
                             let segment = speechSamples
+                            let segStart = segmentStartSample
                             speechSamples.removeAll(keepingCapacity: true)
-                            if await !transcribeSegment(segment) {
+                            // Next segment of this continuous run starts where this one ended.
+                            segmentStartSample = consumedSamples
+                            if await !transcribeSegment(segment, startTime: startDate(forSample: segStart)) {
                                 consecutiveErrors += 1
                                 if consecutiveErrors > 10 { break outerLoop }
                             } else {
@@ -135,7 +159,7 @@ final class StreamingTranscriber: @unchecked Sendable {
         }
 
         if speechSamples.count > 8000 {
-            _ = await transcribeSegment(speechSamples)
+            _ = await transcribeSegment(speechSamples, startTime: startDate(forSample: segmentStartSample))
         } else if !speechSamples.isEmpty {
             diagLog("[\(self.speaker.rawValue)] dropping short end-of-stream remnant: samples=\(speechSamples.count) (<8000 ≈ 0.5s)")
         }
@@ -144,13 +168,13 @@ final class StreamingTranscriber: @unchecked Sendable {
     }
 
     /// Returns `true` on success, `false` on ASR error.
-    private func transcribeSegment(_ samples: [Float]) async -> Bool {
+    private func transcribeSegment(_ samples: [Float], startTime: Date) async -> Bool {
         do {
             let result = try await asrCoordinator.transcribe(samples: samples, source: audioSource)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return true }
             log.info("[\(self.speaker.rawValue)] transcribed: \(text.prefix(80))")
-            onFinal(text)
+            onFinal(text, startTime)
             return true
         } catch {
             log.error("ASR error: \(error.localizedDescription)")

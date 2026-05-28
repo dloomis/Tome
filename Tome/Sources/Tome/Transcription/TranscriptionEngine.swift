@@ -159,10 +159,10 @@ final class TranscriptionEngine {
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
-            onFinal: { text in
+            onFinal: { text, startTime in
                 Task { @MainActor in
                     store.volatileYouText = ""
-                    store.append(Utterance(text: text, speaker: .you))
+                    store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
             }
         )
@@ -186,10 +186,10 @@ final class TranscriptionEngine {
                 onPartial: { text in
                     Task { @MainActor in store.volatileThemText = text }
                 },
-                onFinal: { text in
+                onFinal: { text, startTime in
                     Task { @MainActor in
                         store.volatileThemText = ""
-                        store.append(Utterance(text: text, speaker: .them))
+                        store.append(Utterance(text: text, speaker: .them, timestamp: startTime))
                     }
                 }
             )
@@ -249,10 +249,10 @@ final class TranscriptionEngine {
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
-            onFinal: { text in
+            onFinal: { text, startTime in
                 Task { @MainActor in
                     store.volatileYouText = ""
-                    store.append(Utterance(text: text, speaker: .you))
+                    store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
             }
         )
