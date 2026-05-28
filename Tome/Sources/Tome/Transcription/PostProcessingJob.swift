@@ -127,9 +127,12 @@ final class PostProcessingJob: Identifiable {
         }
 
         // 3. Retain the combined recording before deleting the source WAVs. Failure
-        //    here is non-fatal — the transcript is already saved.
+        //    here is non-fatal — the transcript is already saved. On success, link the
+        //    transcript to its audio via an Obsidian wikilink in the frontmatter.
         if let retention {
-            await exportRetainedRecording(to: retention.folder, transcriptPath: savedPath)
+            if let audioURL = await exportRetainedRecording(to: retention.folder, transcriptPath: savedPath) {
+                TranscriptFinalizer.setRecordingLink(filePath: savedPath, audioFilename: audioURL.lastPathComponent)
+            }
         }
 
         cleanupCaptureFiles()
@@ -142,14 +145,16 @@ final class PostProcessingJob: Identifiable {
     /// Combine the session's mic + system WAVs into one `.m4a` in `folder`, named to
     /// match the transcript stem (with a numeric suffix on collision). Voice memos
     /// export the mic track only.
-    private func exportRetainedRecording(to folder: URL, transcriptPath: URL) async {
+    /// Returns the URL of the written `.m4a` on success, or nil if there was no source
+    /// audio, the folder couldn't be created, or the combine failed.
+    private func exportRetainedRecording(to folder: URL, transcriptPath: URL) async -> URL? {
         let micArg: (url: URL, firstSample: Date)? = pair(handle.micWavPath, handle.micFirstSampleTime)
         let systemArg: (url: URL, firstSample: Date)? = handle.sessionType == .callCapture
             ? pair(handle.wavBufferPath, handle.systemFirstSampleTime)
             : nil
         guard micArg != nil || systemArg != nil else {
             diagLog("[JOB \(id)] retention: no source audio to combine, skipping")
-            return
+            return nil
         }
 
         let sessionStart = handle.transcript.sessionStartTime
@@ -157,20 +162,24 @@ final class PostProcessingJob: Identifiable {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
             diagLog("[JOB \(id)] retention: could not create folder (non-fatal): \(error)")
-            return
+            return nil
         }
         let outputURL = uniqueURL(in: folder, stem: transcriptPath.deletingPathExtension().lastPathComponent, ext: "m4a")
 
         // Offline render is CPU-heavy and synchronous — run it off the main actor so
         // the UI stays responsive (mirrors how diarize / re-transcribe hop off-main).
-        await Task.detached(priority: .utility) {
+        let produced = await Task.detached(priority: .utility) { () -> Bool in
             do {
                 try RecordingMixer.produce(mic: micArg, system: systemArg, sessionStart: sessionStart, outputURL: outputURL)
                 diagLog("[JOB] retention: wrote \(outputURL.lastPathComponent)")
+                return true
             } catch {
                 diagLog("[JOB] retention: combine failed (non-fatal): \(error)")
+                return false
             }
         }.value
+
+        return produced ? outputURL : nil
     }
 
     /// Delete both transient capture WAVs (and the system sidecar) for this session,

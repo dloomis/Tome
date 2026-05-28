@@ -105,6 +105,7 @@ created: "2026-03-23"
 time: "10:00"
 duration: "18:42"
 source_app: "Zoom"
+recording: "[[2026-03-23 Call Recording.m4a]]"
 attendees: ["You", "Speaker 2"]
 tags:
   - log/meeting
@@ -128,6 +129,10 @@ Each line is tagged with its start offset in seconds (millisecond precision) fro
 beginning of the recording. The value drops straight into an [Obsidian Media Extended](https://github.com/aidenlx/media-extended)
 `#t=` fragment — e.g. `[[recording.m4a#t=3.120]]` — so a transcript line can jump the
 audio to the exact moment it was spoken.
+
+The `recording:` frontmatter property is written only when recording retention is on. It's
+an Obsidian wikilink (quoted so the `[[…]]` parses as a YAML scalar) to the session's
+`.m4a`, so Obsidian cleanly links the transcript and its audio.
 
 ## Build
 

@@ -185,6 +185,32 @@ enum TranscriptFinalizer {
         )
     }
 
+    /// Add (or update) a `recording:` frontmatter property linking the transcript to
+    /// its retained audio file, using Obsidian wikilink syntax. The value is quoted so
+    /// the `[[…]]` parses as a YAML scalar (Obsidian renders quoted wikilinks in a
+    /// property as a clickable link), and the `.m4a` extension is kept because Obsidian
+    /// wikilinks to non-markdown files require it. Best-effort — a failure here leaves
+    /// both the saved transcript and the exported audio intact.
+    static func setRecordingLink(filePath: URL, audioFilename: String) {
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        let line = "recording: \"[[\(audioFilename)]]\""
+
+        if let range = content.range(of: #"recording: ".*""#, options: .regularExpression) {
+            content.replaceSubrange(range, with: line)
+        } else if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+            // Land the link right under source_file, inside the existing frontmatter.
+            content.insert(contentsOf: "\n" + line, at: range.upperBound)
+        } else {
+            return
+        }
+
+        do {
+            try atomicWrite(content, to: filePath, tmpName: ".tome_rec_tmp.md", context: "setRecordingLink")
+        } catch {
+            diagLog("[FINALIZER] setRecordingLink write failed (non-fatal): \(error)")
+        }
+    }
+
     private static func rewriteFrontmatter(
         filePath: URL,
         startTime: Date,
