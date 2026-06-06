@@ -28,6 +28,10 @@ struct ContentView: View {
     @State private var activeSessionType: SessionType?
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
+    /// True while the silence stop-confirmation prompt (in-app + notification) is
+    /// up. Recording continues until the user answers; cleared when audio resumes
+    /// or the session ends. Replaces the old behavior of silently auto-stopping.
+    @State private var silencePromptActive = false
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
@@ -87,11 +91,13 @@ struct ContentView: View {
                 detectedApp: detectedAppName,
                 silenceSeconds: silenceSeconds,
                 silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
+                silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
                 onStartCallCapture: { startSession(type: .callCapture) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
-                onStop: stopSession
+                onStop: stopSession,
+                onKeepRecording: dismissSilencePrompt
             )
         }
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
@@ -164,6 +170,17 @@ struct ContentView: View {
             services.saveTranscriptAction = { saveTranscriptToFile() }
             services.recoverFromWAVAction = { recoverFromWAV() }
 
+            // Silence stop prompt — the notification's action buttons mirror the
+            // in-app prompt so it's answerable while the Tome window is hidden
+            // behind the meeting app. Guarded: a stale notification (already
+            // answered in-app, or from a session that ended) must be a no-op.
+            NotificationPresenter.shared.silenceStopAction = {
+                if silencePromptActive { stopSession() }
+            }
+            NotificationPresenter.shared.silenceKeepAction = {
+                if silencePromptActive { dismissSilencePrompt() }
+            }
+
             // Returning users: onboarding never shows, so we surface the orphan
             // prompt at the end of boot. First-launch users hit the onChange
             // handler when onboarding closes.
@@ -183,18 +200,25 @@ struct ContentView: View {
                     audioLevel = engine.audioLevel
                     if audioLevel > 0.01 {
                         silenceSeconds = 0
+                        // Audio resumed — the silence premise is gone, so the
+                        // pending stop confirmation withdraws itself.
+                        if silencePromptActive { dismissSilencePrompt() }
                     }
                 } else if audioLevel != 0 {
                     audioLevel = 0
                 }
             }
         }
-        // Silence auto-stop + elapsed timer
+        // Silence stop-confirmation + elapsed timer
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard isRunning else {
                     silenceSeconds = 0
+                    // Defensive: if the engine stopped through some path other
+                    // than stopSession() (e.g. a capture error), don't leave a
+                    // stale prompt up.
+                    if silencePromptActive { dismissSilencePrompt() }
                     continue
                 }
                 sessionElapsed += 1
@@ -202,8 +226,10 @@ struct ContentView: View {
                 if audioLevel < 0.01 {
                     silenceSeconds += 1
                     let limit = settings.silenceAutoStopSeconds
-                    if limit > 0 && silenceSeconds >= limit {
-                        stopSession()
+                    if limit > 0 && silenceSeconds >= limit && !silencePromptActive {
+                        // Silence limit reached — never stop silently. Keep
+                        // recording and ask the user to confirm.
+                        presentSilencePrompt()
                     }
                 }
             }
@@ -381,9 +407,29 @@ struct ContentView: View {
 
     // MARK: - Actions
 
+    /// Silence limit reached. The old behavior was a silent `stopSession()`;
+    /// now the session keeps recording and asks — an in-app prompt in the
+    /// control bar plus an actionable notification for when the window is
+    /// hidden behind the meeting app.
+    private func presentSilencePrompt() {
+        silencePromptActive = true
+        let elapsed = silenceSeconds
+        Task { await NotificationPresenter.shared.postSilencePrompt(silentForSeconds: elapsed) }
+    }
+
+    /// Withdraw the silence prompt and restart the silence window — fired by
+    /// the "Keep Recording" buttons (in-app and notification) and automatically
+    /// when audio resumes. The prompt re-arms after another full silence period.
+    private func dismissSilencePrompt() {
+        silencePromptActive = false
+        silenceSeconds = 0
+        NotificationPresenter.shared.clearSilencePrompt()
+    }
+
     private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil) {
         transcriptStore.clear()
         silenceSeconds = 0
+        silencePromptActive = false
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
@@ -479,6 +525,8 @@ struct ContentView: View {
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
+        silencePromptActive = false
+        NotificationPresenter.shared.clearSilencePrompt()
         currentSessionId = nil
         currentSourceApp = nil
         apiServer.sessionDidStop(id: sessionId)
@@ -792,6 +840,8 @@ struct ContentView: View {
     private func handleNewUtterance() {
         guard let last = transcriptStore.utterances.last else { return }
         silenceSeconds = 0
+        // Speech evidence cancels a pending silence stop prompt, same as raw audio.
+        if silencePromptActive { dismissSilencePrompt() }
         utteranceContinuation?.yield(UtteranceWrite(speaker: last.speaker, text: last.text, timestamp: last.timestamp))
     }
 }

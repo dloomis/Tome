@@ -61,7 +61,10 @@ final class AppSettings {
     }
 
     /// Seconds of continuous silence (mic + system audio both below threshold) before
-    /// the active session auto-stops. 0 disables auto-stop entirely.
+    /// the active session asks the user to confirm stopping. Recording continues
+    /// until the user confirms — silence never stops a session on its own. 0 disables
+    /// the prompt entirely. (Key name predates the confirm flow, when this drove a
+    /// silent auto-stop.)
     var silenceAutoStopSeconds: Int {
         didSet { UserDefaults.standard.set(silenceAutoStopSeconds, forKey: "silenceAutoStopSeconds") }
     }

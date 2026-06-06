@@ -11,9 +11,37 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     private var authorized = false
     private var authRequested = false
 
+    // MARK: - Silence stop confirmation
+
+    /// Category + action identifiers for the silence stop prompt. The category is
+    /// registered in `init` so the action buttons exist before the first post.
+    nonisolated static let silenceCategoryID = "TOME_SILENCE_PROMPT"
+    nonisolated static let silenceStopActionID = "TOME_SILENCE_STOP"
+    nonisolated static let silenceKeepActionID = "TOME_SILENCE_KEEP"
+    /// Fixed request identifier so a re-post replaces (not stacks) and the prompt
+    /// can be withdrawn by id when answered in-app or audio resumes.
+    private nonisolated static let silencePromptRequestID = "tome-silence-prompt"
+
+    /// Registered by `ContentView` during its boot task — same callback wiring
+    /// rationale as `AppServices.saveTranscriptAction`. Invoked on the main actor
+    /// when the user answers the silence prompt from the notification.
+    var silenceStopAction: (() -> Void)?
+    var silenceKeepAction: (() -> Void)?
+
     override private init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
+
+        let stop = UNNotificationAction(identifier: Self.silenceStopActionID, title: "Stop Recording", options: [])
+        let keep = UNNotificationAction(identifier: Self.silenceKeepActionID, title: "Keep Recording", options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(
+                identifier: Self.silenceCategoryID,
+                actions: [stop, keep],
+                intentIdentifiers: [],
+                options: []
+            )
+        ])
     }
 
     /// Ask for permission lazily — only when we actually have a notification to post.
@@ -51,6 +79,40 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         try? await UNUserNotificationCenter.current().add(request)
     }
 
+    /// Ask the user to confirm stopping after prolonged silence. Mirrors the
+    /// in-app prompt in `ControlBar` for when the Tome window is hidden behind
+    /// the meeting app. Recording continues until an action is chosen — this
+    /// notification never stops anything by itself.
+    func postSilencePrompt(silentForSeconds: Int) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Still there? Tome is recording silence"
+        content.body = "No audio for \(Self.silenceDescription(silentForSeconds)). Recording continues until you stop it."
+        content.sound = .default
+        content.categoryIdentifier = Self.silenceCategoryID
+
+        let request = UNNotificationRequest(
+            identifier: Self.silencePromptRequestID,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw the silence prompt — answered in-app, audio resumed, or the
+    /// session ended some other way. Safe to call when nothing is posted.
+    func clearSilencePrompt() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.silencePromptRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.silencePromptRequestID])
+    }
+
+    private static func silenceDescription(_ seconds: Int) -> String {
+        seconds < 120 ? "\(seconds) seconds" : "\(seconds / 60) minutes"
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(
@@ -58,8 +120,27 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let userInfo = response.notification.request.content.userInfo
-        if let filePath = userInfo["filePath"] as? String {
+        let content = response.notification.request.content
+
+        if content.categoryIdentifier == Self.silenceCategoryID {
+            let action = response.actionIdentifier
+            Task { @MainActor in
+                switch action {
+                case Self.silenceStopActionID:
+                    self.silenceStopAction?()
+                case Self.silenceKeepActionID:
+                    self.silenceKeepAction?()
+                default:
+                    // Banner body clicked — bring Tome forward so the user can
+                    // answer via the in-app prompt instead.
+                    NSApp.activate()
+                }
+            }
+            completionHandler()
+            return
+        }
+
+        if let filePath = content.userInfo["filePath"] as? String {
             let url = URL(fileURLWithPath: filePath)
             Task { @MainActor in
                 NSWorkspace.shared.activateFileViewerSelecting([url])

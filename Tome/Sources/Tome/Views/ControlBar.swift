@@ -20,11 +20,13 @@ struct ControlBar: View {
     let detectedApp: String?
     let silenceSeconds: Int
     let silenceAutoStopSeconds: Int
+    let silencePromptActive: Bool
     let statusMessage: String?
     let errorMessage: String?
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
     let onStop: () -> Void
+    let onKeepRecording: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -79,9 +81,11 @@ struct ControlBar: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
 
-                if silenceAutoStopSeconds > 0,
-                   silenceSeconds >= max(silenceAutoStopSeconds - 30, 1) {
-                    Text("Silence — auto-stop in \(silenceAutoStopSeconds - silenceSeconds)s")
+                if silencePromptActive {
+                    silenceStopPrompt
+                } else if silenceAutoStopSeconds > 0,
+                          silenceSeconds >= max(silenceAutoStopSeconds - 30, 1) {
+                    Text("Silence — will ask to stop in \(max(silenceAutoStopSeconds - silenceSeconds, 0))s")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -142,6 +146,54 @@ struct ControlBar: View {
         }
         .background(Color.bg1.opacity(0.45))
         .overlay(Divider(), alignment: .top)
+    }
+
+    /// Shown when the silence limit elapsed. Recording continues — nothing stops
+    /// until the user explicitly picks one of these. `silenceSeconds` keeps
+    /// ticking while the prompt is up, so the duration label is live.
+    private var silenceStopPrompt: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "waveform.slash")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.orange)
+                Text("Silent for \(formatSilence(silenceSeconds)) — stop recording?")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.orange)
+            }
+
+            HStack(spacing: 8) {
+                Button(action: onStop) {
+                    Text("Stop & Save")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.fg1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.recordRed.opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.recordRed.opacity(0.3)))
+                }
+                .buttonStyle(.plain)
+
+                Button(action: onKeepRecording) {
+                    Text("Keep Recording")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.fg1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.bg1.opacity(0.7))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+    }
+
+    private func formatSilence(_ s: Int) -> String {
+        s < 60 ? "\(s)s" : "\(s / 60):\(String(format: "%02d", s % 60))"
     }
 
     private var activeSessionLabel: String {

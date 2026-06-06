@@ -69,7 +69,7 @@ private struct AudioTab: View {
                 .font(.system(size: 12))
             }
 
-            Section("Auto-Stop") {
+            Section("Silence") {
                 HStack {
                     Text("Silence Timeout")
                         .font(.system(size: 12, weight: .medium))
@@ -83,7 +83,7 @@ private struct AudioTab: View {
                     get: { Double(settings.silenceAutoStopSeconds) },
                     set: { settings.silenceAutoStopSeconds = Int($0) }
                 ), in: 0...600, step: 30)
-                Text("Stop recording after this many seconds of silence (mic + system audio). 0 disables. Default: 120s")
+                Text("Ask to stop recording after this many seconds of silence (mic + system audio). Recording never stops without your confirmation. 0 disables the prompt. Default: 120s")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
