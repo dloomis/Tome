@@ -13,7 +13,7 @@
 
 ---
 
-> **Fork note:** Tome was created at [Gremble-io/Tome](https://github.com/Gremble-io/Tome) — the original idea and first release belong to the upstream author. Upstream has since evolved into a different product ([Detto](https://github.com/Gremble-io/Tome), a dictation-first app under a BSL license) and isn't accepting pull requests, so **this fork is where Tome continues**. It has diverged substantially from the last upstream release: post-session speaker diarization, a local HTTP API for agent integration, crash-safe capture with one-click recovery, opt-in audio retention with click-to-play timestamps, and more — see [Fork Additions](#fork-additions). It stays MIT-licensed, and new work lands against a public [roadmap](ROADMAP.md). If you're deciding which version to install or build on, this is the actively maintained one.
+> **Fork note:** Tome was created at [Gremble-io/Tome](https://github.com/Gremble-io/Tome) — the original idea and first release belong to the upstream author. Upstream has since evolved into a different product ([Detto](https://github.com/Gremble-io/Tome), a dictation-first app under a BSL license), so **this fork is where Tome continues**. It has diverged substantially from the last upstream release: post-session speaker diarization, a local HTTP API for agent integration, crash-safe capture with one-click recovery, opt-in audio retention with click-to-play timestamps, and more — see [Fork Additions](#fork-additions). It stays MIT-licensed, and new work lands against a public [roadmap](ROADMAP.md). If you're deciding which version to install or build on, this is the actively maintained one.
 
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
@@ -24,17 +24,9 @@ Tome is a macOS app that captures meetings and voice memos, transcribes them loc
 
 ## Background
 
-Tome's origin story, from the original author:
+Tome exists for one workflow: capture → vault → agent. If you're on calls all day and don't take notes, you want something that listens, transcribes, and drops structured markdown into your Obsidian vault where an agent layer can do the rest — pull action items, update client files, connect the dots. Otter, Granola, and Fireflies all lock your data in their cloud, none of them output plain markdown, and none of them are built to feed an agent pipeline.
 
-> I'm not a developer. I'm a consultant who fell down the Obsidian rabbit hole. I built out a vault as a second brain: structured notes with YAML frontmatter, backlinks, tags, and a Claude agent layer that processes everything for me. Client files, meeting notes, action items, daily briefs, all flowing through the vault automatically.
->
-> The problem was capture. I'm on calls all day and I just don't take notes. I needed something that would listen, transcribe, and drop structured markdown into the vault where my agent could pick it up and do the rest. Pull out action items, update client files, connect the dots.
->
-> I looked at Otter, Granola, Fireflies. They all lock your data in their cloud, their format, their walled garden. None of them output plain markdown. None of them are built to feed into an agent workflow. I just wanted something built for my exact use case.
->
-> With frontier models you can actually do that now. I started from [OpenGranola](https://github.com/yazinsai/OpenGranola), learned Swift along the way, and with Claude's help rewrote most of it: different audio pipeline, local ASR, speaker diarization, vault-native output. First thing I've ever built. Took about two weeks.
-
-If you're running Obsidian with any kind of AI agent setup, you probably have the same capture gap. That's the itch Tome scratches — and this fork exists to keep scratching it now that the upstream project has moved in a different direction. The [Fork Additions](#fork-additions) below show how far it's come; the [roadmap](ROADMAP.md) shows where it's headed.
+The original Tome nailed that idea, and full credit goes to its author. I forked it to push the workflow further — speaker diarization, crash-safe capture, a local API so other tools can drive it — and since upstream has evolved into [Detto](https://github.com/Gremble-io/Tome), a dictation-first app, this fork is where Tome development continues. The [Fork Additions](#fork-additions) below show how far it's come; the [roadmap](ROADMAP.md) shows where it's headed.
 
 ## Why Tome?
 
