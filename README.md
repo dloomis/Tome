@@ -13,27 +13,28 @@
 
 ---
 
-> **Fork note:** This is a fork of [Gremble-io/Tome](https://github.com/Gremble-io/Tome). The upstream project is the original work — this fork adds a local API server and a few quality-of-life fixes. See [Fork Additions](#fork-additions) below.
+> **Fork note:** Tome was created at [Gremble-io/Tome](https://github.com/Gremble-io/Tome) — the original idea and first release belong to the upstream author. Upstream has since evolved into a different product ([Detto](https://github.com/Gremble-io/Tome), a dictation-first app under a BSL license) and isn't accepting pull requests, so **this fork is where Tome continues**. It has diverged substantially from the last upstream release: post-session speaker diarization, a local HTTP API for agent integration, crash-safe capture with one-click recovery, opt-in audio retention with click-to-play timestamps, and more — see [Fork Additions](#fork-additions). It stays MIT-licensed, and new work lands against a public [roadmap](ROADMAP.md). If you're deciding which version to install or build on, this is the actively maintained one.
 
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-idle.png" width="350" alt="Tome — idle state" />
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-recording.png" width="350" alt="Tome — recording with spectrum visualizer" />
-</p>
+  <img src="assets/screenshot-idle.png" width="350" alt="Tome — idle state" />
+  <img src="assets/screenshot-recording.png" width="350" alt="Tome — recording with spectrum visualizer" />
 </p>
 
 ## Background
 
-I'm not a developer. I'm a consultant who fell down the Obsidian rabbit hole. I built out a vault as a second brain: structured notes with YAML frontmatter, backlinks, tags, and a Claude agent layer that processes everything for me. Client files, meeting notes, action items, daily briefs, all flowing through the vault automatically.
+Tome's origin story, from the original author:
 
-The problem was capture. I'm on calls all day and I just don't take notes. I needed something that would listen, transcribe, and drop structured markdown into the vault where my agent could pick it up and do the rest. Pull out action items, update client files, connect the dots.
+> I'm not a developer. I'm a consultant who fell down the Obsidian rabbit hole. I built out a vault as a second brain: structured notes with YAML frontmatter, backlinks, tags, and a Claude agent layer that processes everything for me. Client files, meeting notes, action items, daily briefs, all flowing through the vault automatically.
+>
+> The problem was capture. I'm on calls all day and I just don't take notes. I needed something that would listen, transcribe, and drop structured markdown into the vault where my agent could pick it up and do the rest. Pull out action items, update client files, connect the dots.
+>
+> I looked at Otter, Granola, Fireflies. They all lock your data in their cloud, their format, their walled garden. None of them output plain markdown. None of them are built to feed into an agent workflow. I just wanted something built for my exact use case.
+>
+> With frontier models you can actually do that now. I started from [OpenGranola](https://github.com/yazinsai/OpenGranola), learned Swift along the way, and with Claude's help rewrote most of it: different audio pipeline, local ASR, speaker diarization, vault-native output. First thing I've ever built. Took about two weeks.
 
-I looked at Otter, Granola, Fireflies. They all lock your data in their cloud, their format, their walled garden. None of them output plain markdown. None of them are built to feed into an agent workflow. I just wanted something built for my exact use case.
-
-With frontier models you can actually do that now. I started from [OpenGranola](https://github.com/yazinsai/OpenGranola), learned Swift along the way, and with Claude's help rewrote most of it: different audio pipeline, local ASR, speaker diarization, vault-native output. First thing I've ever built. Took about two weeks.
-
-I'm putting it out there because if you're running Obsidian with any kind of AI agent setup, you probably have the same gap. No promises on updates or a roadmap. I built this for myself and it works. If it's useful to you, cool.
+If you're running Obsidian with any kind of AI agent setup, you probably have the same capture gap. That's the itch Tome scratches — and this fork exists to keep scratching it now that the upstream project has moved in a different direction. The [Fork Additions](#fork-additions) below show how far it's come; the [roadmap](ROADMAP.md) shows where it's headed.
 
 ## Why Tome?
 
@@ -92,11 +93,11 @@ Tome does the first three. Your agent does the rest.
 ## Output
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-frontmatter.png?v=2" width="600" alt="Vault note with YAML frontmatter" />
+  <img src="assets/screenshot-vault-frontmatter.png" width="600" alt="Vault note with YAML frontmatter" />
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gremble-io/Tome/main/assets/screenshot-vault-transcript.png?v=2" width="600" alt="Vault note transcript view" />
+  <img src="assets/screenshot-vault-transcript.png" width="600" alt="Vault note transcript view" />
 </p>
 
 ```markdown
@@ -220,7 +221,7 @@ Tome/Sources/Tome/
 
 ## Fork Additions
 
-This fork has diverged substantially from upstream Tome. Beyond what upstream ships, this fork adds:
+This fork has diverged substantially from the original project — and since upstream's pivot to Detto, it's where Tome development happens. Relative to the last upstream release of Tome, this fork adds:
 
 ### Diarization & transcription
 
@@ -272,7 +273,7 @@ This fork has diverged substantially from upstream Tome. Beyond what upstream sh
 
 ## Credits
 
-Started from [OpenGranola](https://github.com/yazinsai/OpenGranola). Substantially rewritten from there.
+Tome was created by the [upstream author](https://github.com/Gremble-io/Tome), who started from [OpenGranola](https://github.com/yazinsai/OpenGranola) and substantially rewrote it. This fork builds on that foundation and continues it.
 
 ## License
 
