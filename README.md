@@ -222,6 +222,7 @@ This fork has diverged substantially from the original project — and since ups
 - **Keep transcribing while the display sleeps** — capture and ASR are no longer interrupted by display sleep.
 - **Dynamic ASR language hint** — `AppSettings.transcriptionLanguage` flows through to the ASR coordinator at session start and on the fly; UI exposure ships in the next release.
 - **Fresh TDT decoder state per transcribe call** — eliminates cross-utterance state bleed that produced empty/duplicated outputs on FluidAudio 0.14.
+- **Tracks current FluidAudio** — pinned to 0.15.1+, picking up ~8% faster Parakeet v3 transcription (GPU encoder placement, WER-neutral), the French accent-drift token blocklist, and Greek script support.
 
 ### Reliability & durability
 
