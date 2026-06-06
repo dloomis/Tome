@@ -64,6 +64,11 @@ struct TomeApp: App {
         MenuBarExtra {
             Text("Tome")
                 .font(.headline)
+            if services.isRecording {
+                Text("Recording…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
             if services.postProcessingQueue.isAnyJobRunning {
                 let count = services.postProcessingQueue.inFlightCount
                 Text(count == 1 ? "Finalizing 1 transcript…" : "Finalizing \(count) transcripts…")
@@ -76,11 +81,18 @@ struct TomeApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            // Filled icon while any background finalization is in flight — gives a
-            // peripheral-vision cue without taking over the menu bar.
-            Image(systemName: services.postProcessingQueue.isAnyJobRunning ? "book.closed.fill" : "book.closed")
+            // Three visual states, in priority order:
+            //   • Recording  → red filled book + pulse (most prominent live cue)
+            //   • Finalizing → monochrome filled book + pulse (background job)
+            //   • Idle       → outline book
+            // Recording wins when it overlaps a background finalization (a new
+            // session can start while the previous one is still being labeled).
+            let recording = services.isRecording
+            let busy = recording || services.postProcessingQueue.isAnyJobRunning
+            Image(systemName: busy ? "book.closed.fill" : "book.closed")
                 .symbolRenderingMode(.monochrome)
-                .symbolEffect(.pulse, options: .repeating, isActive: services.postProcessingQueue.isAnyJobRunning)
+                .foregroundStyle(recording ? Color.red : Color.primary)
+                .symbolEffect(.pulse, options: .repeating, isActive: busy)
         }
     }
 }

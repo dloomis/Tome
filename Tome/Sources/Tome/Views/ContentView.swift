@@ -111,6 +111,11 @@ struct ContentView: View {
                 Task { await checkForOrphanedSessionsOnce() }
             }
         }
+        .onChange(of: transcriptionEngine?.isRunning ?? false) { _, running in
+            // Mirror live recording state into AppServices so the MenuBarExtra
+            // scene (which can't see the engine) can show a recording indicator.
+            services.isRecording = running
+        }
         .onChange(of: settings.transcriptionLanguage) {
             // Push setting changes to the ASR actor so subsequent transcribe calls
             // use the new language hint. No UI for this setting yet — the hook is

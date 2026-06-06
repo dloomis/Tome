@@ -22,6 +22,13 @@ final class AppServices {
     /// Crash-recovery JSONL store. Same ownership rationale as `transcriptLogger`.
     let sessionStore: SessionStore
 
+    /// True while a live recording/transcription session is in progress.
+    /// `ContentView` mirrors `TranscriptionEngine.isRunning` into this so
+    /// out-of-hierarchy scenes — notably the `MenuBarExtra` — can show a
+    /// recording indicator. The engine itself lives in `ContentView`'s view
+    /// state, where the menu bar scene can't reach it.
+    var isRecording = false
+
     /// Action invoked by the `Save Transcript…` menu item. `ContentView` registers
     /// this in its boot task so the menu can fire it without going through
     /// `@FocusedValue` — that path triggers a main-menu rebuild on every focus
