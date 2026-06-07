@@ -80,7 +80,7 @@ Tome does the first three. Your agent does the rest.
 2. **Transcribe** runs VAD to detect speech segments, then Parakeet transcribes locally.
 3. **Diarize** splits the system audio into individual speakers after the session ends.
 4. **Write** drops structured `.md` with YAML frontmatter into your vault folder.
-5. **Agent picks up** whatever you've got downstream processes the transcript.
+5. **Agent picks up** whatever you've got downstream processes the transcript — [WhisperCal](https://github.com/dloomis/WhisperCal) is the purpose-built option (see [The Obsidian Side](#the-obsidian-side-whispercal)).
 
 ## Output
 
@@ -127,6 +127,22 @@ audio to the exact moment it was spoken.
 The `recording:` frontmatter property is written only when recording retention is on. It's
 an Obsidian wikilink (quoted so the `[[…]]` parses as a YAML scalar) to the session's
 `.m4a`, so Obsidian cleanly links the transcript and its audio.
+
+## The Obsidian Side: WhisperCal
+
+Tome writes plain `.md` files — any downstream tool can pick them up. But if Obsidian is
+your workspace, [WhisperCal](https://github.com/dloomis/WhisperCal) (same author) is the
+other half of the workflow: an Obsidian plugin built around Tome's local Recording API
+that closes the loop from calendar event to finished meeting note.
+
+1. **Calendar in the sidebar** — browse your Microsoft 365 or Google Calendar day by day inside Obsidian.
+2. **One-click meeting note** — templated, frontmatter pre-filled, attendees wiki-linked against your People folder.
+3. **Record from the note** — WhisperCal calls Tome's localhost API with the meeting subject and attendees, so the transcript lands with the right filename and a seeded `## Context` block, then polls status until transcription completes.
+4. **Transcript linked back** — the transcript and meeting note cross-link via frontmatter. Recordings that never got linked to a note surface in a collapsible "Unlinked recordings" section for cleanup, and back-to-back calls can be merged into one note (speaker labels renumbered, durations summed, originals archived).
+5. **LLM pipeline** — speaker tagging turns `Speaker 2` into real names using per-speaker excerpts, summarization extracts decisions and action items, and a research stage pulls context from your own vault. Bring your own model: it works with any CLI that reads a prompt on stdin (Claude CLI is the tested path).
+
+Tome stays fully useful standalone — WhisperCal is what turns the vault drop into an
+end-to-end meeting workflow.
 
 ## Build
 
