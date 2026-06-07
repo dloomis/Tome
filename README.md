@@ -15,7 +15,7 @@
 
 > **Fork note:** Tome was created at [Gremble-io/Tome](https://github.com/Gremble-io/Tome) — the original idea and first release belong to the upstream author. Upstream has since evolved into a different product ([Detto](https://github.com/Gremble-io/Tome), a dictation-first app under a BSL license), so **this fork is where Tome continues**. It has diverged substantially from the last upstream release: post-session speaker diarization, a local HTTP API for agent integration, crash-safe capture with one-click recovery, opt-in audio retention with click-to-play timestamps, and more — see [Fork Additions](#fork-additions). It stays MIT-licensed, and new work lands against a public [roadmap](ROADMAP.md). If you're deciding which version to install or build on, this is the actively maintained one.
 
-Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home.
+Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home. Pair it with [WhisperCal](https://github.com/dloomis/WhisperCal), an Obsidian plugin that drives Tome straight from your calendar — one-click meeting notes, recording via Tome's local API, and an LLM pipeline for speaker tagging and summaries ([details below](#the-obsidian-side-whispercal)).
 
 <p align="center">
   <img src="assets/screenshot-idle.png" width="350" alt="Tome — idle state" />
@@ -38,7 +38,7 @@ The original Tome nailed that idea, and full credit goes to its author. I forked
 speak → capture → vault → agent → knowledge base
 ```
 
-Tome does the first three. Your agent does the rest.
+Tome does the first three. Your agent does the rest — or install [WhisperCal](https://github.com/dloomis/WhisperCal) and get the whole chain inside Obsidian.
 
 ## Features
 
