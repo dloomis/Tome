@@ -37,7 +37,15 @@ final class MicCapture: @unchecked Sendable {
             // Set input device before accessing inputNode format
             if let id = deviceID {
                 let inputNode = self.engine.inputNode
-                let audioUnit = inputNode.audioUnit!
+                guard let audioUnit = inputNode.audioUnit else {
+                    // The input node exposes no audio unit (no HAL input, device in
+                    // a bad state). Surface it instead of force-unwrap-crashing.
+                    let msg = "Microphone input is unavailable — can't select device \(id)."
+                    diagLog("[MIC-2-FAIL] \(msg)")
+                    errorHolder.value = msg
+                    continuation.finish()
+                    return
+                }
                 var devID = id
                 let status = AudioUnitSetProperty(
                     audioUnit,

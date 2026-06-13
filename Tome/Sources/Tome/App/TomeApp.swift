@@ -2,6 +2,48 @@ import SwiftUI
 import AppKit
 import Sparkle
 
+/// Collect Tome's unified-logging output into a temp file and open it. Replaces
+/// the old "open /tmp/tome.log" path now that diagnostics route through os.Logger.
+/// `log show` scans the on-disk log archive and can take a beat, so it runs off
+/// the main thread; the result is then revealed. Best-effort — on failure or no
+/// matches the opened file says so rather than silently doing nothing.
+private func openDiagnosticLogs() {
+    let outURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("tome-diagnostics.log")
+    Task.detached {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        proc.arguments = [
+            "show",
+            "--predicate", "subsystem == \"\(tomeLogSubsystem)\"",
+            "--info", "--debug",
+            "--last", "2h",
+            "--style", "syslog",
+        ]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        var output: Data
+        do {
+            try proc.run()
+            // Drain before waitUntilExit so a full pipe buffer can't deadlock the child.
+            output = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+        } catch {
+            output = Data("Couldn't collect logs: \(error.localizedDescription)\n".utf8)
+        }
+        if output.isEmpty {
+            output = Data("No Tome log entries in the last 2 hours.\n".utf8)
+        }
+        try? output.write(to: outURL)
+
+        await MainActor.run {
+            _ = NSWorkspace.shared.open(outURL)
+        }
+    }
+}
+
 @main
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -50,11 +92,7 @@ struct TomeApp: App {
             }
             CommandGroup(after: .toolbar) {
                 Button("Logs") {
-                    let path = "/tmp/tome.log"
-                    if !FileManager.default.fileExists(atPath: path) {
-                        FileManager.default.createFile(atPath: path, contents: nil)
-                    }
-                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    openDiagnosticLogs()
                 }
             }
         }

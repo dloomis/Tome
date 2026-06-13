@@ -88,6 +88,12 @@ struct SessionRecord: Codable {
 struct TranscriptSessionSnapshot: Sendable {
     let filePath: URL
     let sessionStartTime: Date
+    /// Wall-clock moment the session stopped, captured in `TranscriptLogger.endSession()`.
+    /// Duration is `sessionEndTime − sessionStartTime`; pinning it at stop time keeps
+    /// background post-processing latency (diarization + re-transcription, which can run
+    /// for minutes) out of the reported duration. Previously finalization called `Date()`
+    /// directly, inflating every duration by however long the queue took to reach the job.
+    let sessionEndTime: Date
     var speakersDetected: Set<String>
     let sourceApp: String
     let sessionContext: String

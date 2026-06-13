@@ -178,6 +178,7 @@ enum TranscriptFinalizer {
         try rewriteFrontmatter(
             filePath: snapshot.filePath,
             startTime: snapshot.sessionStartTime,
+            endTime: snapshot.sessionEndTime,
             speakers: snapshot.speakersDetected,
             context: snapshot.sessionContext,
             suggestedFilename: snapshot.suggestedFilename,
@@ -214,6 +215,7 @@ enum TranscriptFinalizer {
     private static func rewriteFrontmatter(
         filePath: URL,
         startTime: Date,
+        endTime: Date,
         speakers: Set<String>,
         context: String,
         suggestedFilename: String? = nil,
@@ -221,7 +223,9 @@ enum TranscriptFinalizer {
     ) throws(PostProcessingError) -> URL {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return filePath }
 
-        let elapsed = Date().timeIntervalSince(startTime)
+        // Measured at stop time (see `TranscriptSessionSnapshot.sessionEndTime`), not
+        // `Date()` here — finalization runs in the background long after the user stopped.
+        let elapsed = endTime.timeIntervalSince(startTime)
         let minutes = Int(elapsed) / 60
         let seconds = Int(elapsed) % 60
         let durationStr = String(format: "%02d:%02d", minutes, seconds)

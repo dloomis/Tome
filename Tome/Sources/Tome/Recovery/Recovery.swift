@@ -88,6 +88,7 @@ enum Recovery {
         var snapshot = TranscriptSessionSnapshot(
             filePath: transcriptURL,
             sessionStartTime: sessionStartTime,
+            sessionEndTime: wav.modifiedAt,  // recording end ≈ WAV's last write
             speakersDetected: ["You", "Them"],
             sourceApp: "Recovered",
             sessionContext: "",            // suppresses context-based rename

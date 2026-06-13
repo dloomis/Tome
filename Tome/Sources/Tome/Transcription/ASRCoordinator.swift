@@ -36,9 +36,6 @@ actor ASRCoordinator {
         self.asrManager = asr
     }
 
-    /// No-op retained for API compatibility — decoder state is created fresh per call.
-    func resetDecoderState() {}
-
     func transcribe(samples: [Float], source: AudioSource) async throws -> ASRResult {
         guard let asrManager else { throw ASRCoordinatorError.notInitialized }
         var state = TdtDecoderState.make()

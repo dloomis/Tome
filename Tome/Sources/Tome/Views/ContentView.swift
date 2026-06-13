@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import Combine
 
 private let conferencingBundleIDs: [String: String] = [
     "com.microsoft.teams2": "Teams",
@@ -50,6 +49,14 @@ struct ContentView: View {
     /// individual Task closures can run.
     @State private var utteranceContinuation: AsyncStream<UtteranceWrite>.Continuation?
     @State private var utteranceWriterTask: Task<Void, Never>?
+
+    /// How many of `transcriptStore.utterances` have already been handed to the
+    /// writer channel. `handleNewUtterance` drains everything past this cursor so a
+    /// single `.onChange(of: utterances.count)` callback that covers *multiple*
+    /// appended utterances (SwiftUI's `@Observable` coalesces same-tick mutations)
+    /// persists all of them — the old `.last`-only yield silently dropped the
+    /// earlier line(s). Reset to 0 whenever the store is cleared for a new session.
+    @State private var persistedUtteranceCount = 0
 
     private struct UtteranceWrite: Sendable {
         let speaker: Speaker
@@ -428,6 +435,7 @@ struct ContentView: View {
 
     private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil) {
         transcriptStore.clear()
+        persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
         silencePromptActive = false
         sessionElapsed = 0
@@ -476,7 +484,14 @@ struct ContentView: View {
                         : settings.filenameCallLabel
                 )
             } catch {
+                // Transcript note couldn't be created (vault unwritable, etc.). The
+                // JSONL session and the API `.recording` state were already opened
+                // above — unwind both so we don't strand a phantom recording. No UI
+                // state was set yet (that happens after this point), and no note
+                // exists to delete since startSession threw.
                 await services.sessionStore.endSession()
+                apiServer.sessionDidStop(id: sid)
+                apiServer.sessionDidComplete(id: sid)
                 transcriptionEngine?.lastError = error.localizedDescription
                 return
             }
@@ -513,7 +528,50 @@ struct ContentView: View {
                     recordingContext: recordingContext
                 )
             }
+
+            // `engine.start()` returns without throwing even when capture never came
+            // up (mic permission denied, model-load failure — both leave isRunning
+            // false). Everything above provisioned session bookkeeping ahead of the
+            // start; unwind it so a failed start doesn't strand an open JSONL session,
+            // an empty vault note, and a recording-state API/UI with nothing behind them.
+            if transcriptionEngine?.isRunning != true {
+                await rollbackFailedStart(sessionId: sid)
+            }
         }
+    }
+
+    /// Undo the bookkeeping `startSession` created before a `transcriptionEngine.start()`
+    /// that failed to bring capture up. Mirrors the relevant parts of `stopSession`
+    /// minus post-processing — there's nothing to finalize, just an empty note to
+    /// discard and state to return to idle.
+    @MainActor
+    private func rollbackFailedStart(sessionId: String) async {
+        // The engine sets `lastError` on its hard-fail paths; keep a fallback in case
+        // a future path forgets, so the control bar always explains the no-op.
+        if transcriptionEngine?.lastError == nil {
+            transcriptionEngine?.lastError = "Couldn't start recording."
+        }
+
+        // Close the half-open transcript session and delete the empty note created
+        // before the failed start — no utterances landed, so there's nothing to keep.
+        if let snapshot = await services.transcriptLogger.endSession() {
+            try? FileManager.default.removeItem(at: snapshot.filePath)
+        }
+        await services.sessionStore.endSession()
+
+        // Walk the API out of `.recording` back to idle (a bare sessionDidComplete
+        // would stall, since it refuses to advance while state is `.recording`).
+        apiServer.sessionDidStop(id: sessionId)
+        apiServer.sessionDidComplete(id: sessionId)
+
+        // Return the UI to idle: the control bar shows Start, not Stop.
+        activeSessionType = nil
+        detectedAppName = nil
+        currentSessionId = nil
+        currentSourceApp = nil
+        silenceSeconds = 0
+        silencePromptActive = false
+        sessionElapsed = 0
     }
 
     private func stopSession() {
@@ -838,10 +896,24 @@ struct ContentView: View {
     }
 
     private func handleNewUtterance() {
-        guard let last = transcriptStore.utterances.last else { return }
+        let count = transcriptStore.utterances.count
+        // Defensive: the store shrank out from under us (cleared without going
+        // through startSession). Rewind so we never index past the end.
+        if count < persistedUtteranceCount { persistedUtteranceCount = 0 }
+        guard count > persistedUtteranceCount else { return }
+
         silenceSeconds = 0
         // Speech evidence cancels a pending silence stop prompt, same as raw audio.
         if silencePromptActive { dismissSilencePrompt() }
-        utteranceContinuation?.yield(UtteranceWrite(speaker: last.speaker, text: last.text, timestamp: last.timestamp))
+
+        // Drain every utterance since the cursor, not just the last one. Two
+        // utterances can land in a single update tick (mic + system finalizing
+        // back-to-back); `.onChange(of: count)` then fires once, and yielding only
+        // `.last` lost the earlier line from both the markdown and JSONL files.
+        for index in persistedUtteranceCount..<count {
+            let u = transcriptStore.utterances[index]
+            utteranceContinuation?.yield(UtteranceWrite(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
+        }
+        persistedUtteranceCount = count
     }
 }

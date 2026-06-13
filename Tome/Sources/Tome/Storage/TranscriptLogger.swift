@@ -249,6 +249,10 @@ tags:
     /// The logger is now free to begin a new session — the snapshot carries everything
     /// `TranscriptFinalizer` needs to finalize this session in the background.
     func endSession() -> TranscriptSessionSnapshot? {
+        // Capture the stop moment first — duration is measured to here, not to whenever
+        // the background queue eventually finalizes this session (which can be minutes
+        // later behind diarization of an earlier session).
+        let endTime = Date()
         flushBuffer()
         try? fileHandle?.synchronize()
         try? fileHandle?.close()
@@ -262,6 +266,7 @@ tags:
         let snapshot = TranscriptSessionSnapshot(
             filePath: filePath,
             sessionStartTime: startTime,
+            sessionEndTime: endTime,
             speakersDetected: speakersDetected,
             sourceApp: sourceApp,
             sessionContext: sessionContext,

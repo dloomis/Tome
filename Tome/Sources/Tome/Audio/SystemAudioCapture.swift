@@ -19,6 +19,13 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _audioFileWriter = OSAllocatedUnfairLock<WAVStreamWriter?>(uncheckedState: nil)
     private let _writeErrors = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
 
+    /// Latched true by `stop()` and reset by `bufferStream`. SCStream can still
+    /// deliver in-flight sample buffers after `stopCapture()` returns; without this
+    /// guard a late callback would re-enter the writer-creation path and call
+    /// `WAVStreamWriter(url:)`, which `createFile`s — truncating the WAV that
+    /// `stop()` just finalized for the post-processing job.
+    private let _stopped = OSAllocatedUnfairLock<Bool>(uncheckedState: false)
+
     /// Count of `AVAudioFile.write(from:)` failures during the current capture.
     /// Read by the engine at stop time to seed `SessionHandle.wavWriteErrorCount`.
     var writeErrorCount: Int { _writeErrors.withLock { $0 } }
@@ -100,6 +107,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _bufferFilePath.withLock { $0 = bufferURL }
         _audioFileWriter.withLock { $0 = nil } // will be created on first audio callback
         _writeErrors.withLock { $0 = 0 }
+        _stopped.withLock { $0 = false }
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
@@ -132,13 +140,18 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         try? await _stream.withLock { $0 }?.stopCapture()
         _stream.withLock { $0 = nil }
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
+        // Latch stopped and drop the path BEFORE closing the writer. A late
+        // SCStream callback (buffers stay in-flight past stopCapture) would
+        // otherwise re-enter writer creation and truncate the file we just
+        // finalized — the `_stopped` guard in didOutputSampleBuffer blocks that.
+        _stopped.withLock { $0 = true }
+        _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
         // Explicit close: flushes the final header refresh + synchronize so the
         // WAV is durably finalized before the post-processing job starts reading it.
         _audioFileWriter.withLock { writer in
             writer?.close()
             writer = nil
         }
-        _bufferFilePath.withLock { $0 = nil }  // capture no longer owns this URL
         _lastSampleTime.withLock { $0 = nil }
         _firstSampleTime.withLock { $0 = nil }
         _audioLevel.value = 0
@@ -214,6 +227,9 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         // valid WAV — see WAVStreamWriter.swift for the rationale.
         let sampleRate = asbd.mSampleRate
         _audioFileWriter.withLock { writer in
+            // stop() may have finalized the WAV already; a straggler buffer must not
+            // resurrect the writer (that would truncate the finalized file).
+            guard !self._stopped.withLock({ $0 }) else { return }
             if writer == nil, let bufferPath = self._bufferFilePath.withLock({ $0 }) {
                 do {
                     writer = try WAVStreamWriter(url: bufferPath, sampleRate: sampleRate)

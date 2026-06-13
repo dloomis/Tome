@@ -6,17 +6,23 @@ import os
 import SpeakerKit
 import WhisperKit
 
-// Writes to /tmp/tome.log
+/// Subsystem all of Tome's logging shares. Matches the per-type `Logger`s (e.g.
+/// `StreamingTranscriber`) so `log show --predicate 'subsystem == "io.gremble.tome"'`
+/// returns everything in one stream.
+let tomeLogSubsystem = "io.gremble.tome"
+
+private let diagLogger = Logger(subsystem: tomeLogSubsystem, category: "diag")
+
+/// Diagnostic logging, routed through the unified logging system. Replaces the
+/// former `/tmp/tome.log` file writer — which was world-readable, opened and
+/// closed the file on *every* call, and raced on concurrent writes from the audio
+/// threads. Emitted at `.notice` so it's persisted to the log store and reliably
+/// retrievable after the fact (the File ▸ Logs menu shells out to `log show`);
+/// `.debug`/`.info` are memory-only and would be gone by the time the user looks.
+/// Messages are marked public because they carry only diagnostic metadata —
+/// counts, audio formats, filenames, error text — never transcript content.
 func diagLog(_ msg: String) {
-    let line = "\(Date()): \(msg)\n"
-    let path = "/tmp/tome.log"
-    if let fh = FileHandle(forWritingAtPath: path) {
-        fh.seekToEndOfFile()
-        fh.write(line.data(using: .utf8)!)
-        fh.closeFile()
-    } else {
-        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
-    }
+    diagLogger.notice("\(msg, privacy: .public)")
 }
 
 /// Dual-stream mic + system audio transcription.
@@ -36,8 +42,6 @@ final class TranscriptionEngine {
 
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
-    /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
-    private var micKeepAliveTask: Task<Void, Never>?
 
     /// Polls `SystemAudioCapture.lastSampleTime` and surfaces a warning if SCStream
     /// silently stops delivering samples (display sleep without our activity assertion,
@@ -101,7 +105,6 @@ final class TranscriptionEngine {
         do {
             try await asrCoordinator.initialize()
             assetStatus = "Initializing ASR..."
-            await asrCoordinator.resetDecoderState()
 
             assetStatus = "Loading VAD model..."
             diagLog("[ENGINE-1b] loading VAD model...")
@@ -343,10 +346,8 @@ final class TranscriptionEngine {
         sysWatchdogTask = nil
         micTask?.cancel()
         sysTask?.cancel()
-        micKeepAliveTask?.cancel()
         micTask = nil
         sysTask = nil
-        micKeepAliveTask = nil
         await systemCapture.stop()
         micCapture.stop()
         currentMicDeviceID = 0
@@ -413,21 +414,6 @@ final class TranscriptionEngine {
         }
     }
 
-    /// Run offline diarization on the buffered system audio using SpeakerKit (pyannote v4).
-    /// Uses the buffer URL captured when this session started. Returns speaker segments,
-    /// or nil if no audio was buffered / it was too short.
-    func runPostSessionDiarization(clusterThreshold: Float, numberOfSpeakers: Int) async -> [DiarizedSegment]? {
-        guard let bufferURL = currentBufferURL else {
-            diagLog("[DIARIZE] No buffer URL tracked for this session")
-            return nil
-        }
-        return await Self.runDiarization(
-            bufferURL: bufferURL,
-            clusterThreshold: clusterThreshold,
-            numberOfSpeakers: numberOfSpeakers
-        )
-    }
-
     /// Stateless diarization: reads a WAV at `bufferURL` and returns speaker segments.
     /// Intended for use by `PostProcessingJob` without reaching into engine state.
     nonisolated static func runDiarization(
@@ -483,17 +469,6 @@ final class TranscriptionEngine {
             diagLog("[DIARIZE] Failed: \(error.localizedDescription)")
             return nil
         }
-    }
-
-    /// Re-transcribe the session's buffered WAV using diarization segment boundaries.
-    func reTranscribeWithDiarization(
-        segments: [DiarizedSegment]
-    ) async -> [ReTranscribedSegment]? {
-        guard let bufferURL = currentBufferURL else {
-            diagLog("[RETRANSCRIBE] FAILED: No buffer URL tracked")
-            return nil
-        }
-        return await Self.reTranscribe(asrCoordinator: asrCoordinator, bufferURL: bufferURL, segments: segments)
     }
 
     /// Stateless re-transcription: runs `SegmentReTranscriber` against `bufferURL`,
