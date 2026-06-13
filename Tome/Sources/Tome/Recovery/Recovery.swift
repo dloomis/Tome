@@ -102,13 +102,14 @@ enum Recovery {
         try await asr.initialize()
 
         diagLog("[RECOVERY] diarizing \(wavURL.lastPathComponent), duration=\(Int(wav.durationSeconds))s, sessionStart=\(sessionStartTime)")
-        guard let segments = await TranscriptionEngine.runDiarization(
+        guard let diar = await TranscriptionEngine.runDiarization(
             bufferURL: wavURL,
             clusterThreshold: clusterThreshold,
             numberOfSpeakers: numberOfSpeakers
-        ), !segments.isEmpty else {
+        ), !diar.segments.isEmpty else {
             throw RecoveryError.diarizationProducedNothing
         }
+        let segments = diar.segments
 
         diagLog("[RECOVERY] re-transcribing \(segments.count) segments")
         let results = await TranscriptionEngine.reTranscribe(

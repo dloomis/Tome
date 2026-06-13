@@ -178,6 +178,14 @@ private struct OutputTab: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Speaker Voiceprints") {
+                Toggle("Export speaker voiceprints", isOn: $settings.exportVoiceprints)
+                    .font(.system(size: 12))
+                Text("Writes a per-speaker voice embedding (.voiceprints.json) next to each call transcript so other tools can recognize returning speakers. Biometric data; stays on your machine. Off by default.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Filename Template") {
                 filenameRow(label: "Date Format", binding: $settings.filenameDateFormat, monospaced: true)
                 filenameRow(label: "Call Capture Label", binding: $settings.filenameCallLabel)

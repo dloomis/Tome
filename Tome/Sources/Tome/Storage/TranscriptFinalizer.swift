@@ -212,6 +212,29 @@ enum TranscriptFinalizer {
         }
     }
 
+    /// Add (or update) a `voiceprints:` frontmatter property pointing at the speaker
+    /// voiceprint sidecar (a plain JSON filename, not a wikilink — it's not an Obsidian
+    /// note), so the association survives a later transcript rename. Best-effort: a
+    /// failure just leaves the sibling `.voiceprints.json` as the fallback resolution.
+    static func setVoiceprintsLink(filePath: URL, sidecarFilename: String) {
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        let line = "voiceprints: \"\(sidecarFilename)\""
+
+        if let range = content.range(of: #"voiceprints: ".*""#, options: .regularExpression) {
+            content.replaceSubrange(range, with: line)
+        } else if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+            content.insert(contentsOf: "\n" + line, at: range.upperBound)
+        } else {
+            return
+        }
+
+        do {
+            try atomicWrite(content, to: filePath, tmpName: ".tome_vp_tmp.md", context: "setVoiceprintsLink")
+        } catch {
+            diagLog("[FINALIZER] setVoiceprintsLink write failed (non-fatal): \(error)")
+        }
+    }
+
     private static func rewriteFrontmatter(
         filePath: URL,
         startTime: Date,

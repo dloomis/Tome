@@ -630,7 +630,8 @@ struct ContentView: View {
                 handle: handle,
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
-                retention: retention
+                retention: retention,
+                exportVoiceprints: settings.exportVoiceprints
             )
 
             services.postProcessingQueue.enqueue(job)

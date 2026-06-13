@@ -420,7 +420,7 @@ final class TranscriptionEngine {
         bufferURL: URL,
         clusterThreshold: Float,
         numberOfSpeakers: Int
-    ) async -> [DiarizedSegment]? {
+    ) async -> DiarizationOutput? {
         guard FileManager.default.fileExists(atPath: bufferURL.path) else {
             diagLog("[DIARIZE] No buffered system audio file at \(bufferURL.path)")
             return nil
@@ -459,12 +459,22 @@ final class TranscriptionEngine {
                     id = "SPEAKER_\(ids.first ?? 0)"
                 case .noMatch:
                     id = "SPEAKER_UNKNOWN"
+                @unknown default:
+                    // SpeakerInfo is non-frozen in argmax-oss-swift 1.0+; map any
+                    // future case to an unmatched speaker.
+                    id = "SPEAKER_UNKNOWN"
                 }
                 return DiarizedSegment(speakerId: id, startTime: seg.startTime, endTime: seg.endTime)
             }
 
-            diagLog("[DIARIZE] Found \(segments.count) segments, \(Set(segments.map(\.speakerId)).count) speakers")
-            return segments
+            // Map per-cluster centroids (keyed by Int clusterId) onto the same
+            // "SPEAKER_n" ids used for the segments, so callers can join them.
+            let centroids: [String: [Float]] = result.speakerCentroidEmbeddings.reduce(into: [:]) { acc, pair in
+                acc["SPEAKER_\(pair.key)"] = pair.value
+            }
+
+            diagLog("[DIARIZE] Found \(segments.count) segments, \(Set(segments.map(\.speakerId)).count) speakers, \(centroids.count) centroids")
+            return DiarizationOutput(segments: segments, centroids: centroids)
         } catch {
             diagLog("[DIARIZE] Failed: \(error.localizedDescription)")
             return nil

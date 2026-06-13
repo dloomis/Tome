@@ -91,6 +91,15 @@ struct DiarizedSegment: Sendable {
     let endTime: Float
 }
 
+/// Full diarization output: per-speaker segments plus an optional acoustic centroid
+/// per raw speaker id ("SPEAKER_n"). Each centroid is the L2-normalized mean of that
+/// speaker's window embeddings, surfaced for downstream voiceprint enrollment. The
+/// `centroids` map is empty when the diarizer produced no embeddings.
+struct DiarizationOutput: Sendable {
+    let segments: [DiarizedSegment]
+    let centroids: [String: [Float]]
+}
+
 /// A segment after re-transcription with a speaker label.
 struct ReTranscribedSegment: Sendable {
     let speaker: String

@@ -34,12 +34,17 @@ final class PostProcessingJob: Identifiable {
     /// after the transcript is finalized. Nil = retention off.
     let retention: RecordingRetentionConfig?
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil) {
+    /// When true, write a per-speaker voiceprint sidecar (`*.voiceprints.json`) next to
+    /// the finalized transcript. Call captures only — needs a diarized system stream.
+    let exportVoiceprints: Bool
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
         self.retention = retention
+        self.exportVoiceprints = exportVoiceprints
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -57,17 +62,19 @@ final class PostProcessingJob: Identifiable {
         if handle.wavWriteErrorCount > 0 {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
         }
+        var diarOutput: DiarizationOutput?
         if handle.sessionType == .callCapture, let bufferURL = handle.wavBufferPath {
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
             diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
             phase = .diarizing
             diagLog("[JOB \(id)] diarizing \(bufferURL.lastPathComponent)")
-            let segments = await TranscriptionEngine.runDiarization(
+            let diar = await TranscriptionEngine.runDiarization(
                 bufferURL: bufferURL,
                 clusterThreshold: clusterThreshold,
                 numberOfSpeakers: numberOfSpeakers
             )
-            diagLog("[JOB \(id)] diarization returned: \(segments == nil ? "nil" : "\(segments!.count) segments")")
+            diarOutput = diar
+            diagLog("[JOB \(id)] diarization returned: \(diar == nil ? "nil" : "\(diar!.segments.count) segments")")
 
             if Task.isCancelled {
                 cleanupCaptureFiles()
@@ -75,7 +82,7 @@ final class PostProcessingJob: Identifiable {
                 throw .cancelled
             }
 
-            if let segments, !segments.isEmpty {
+            if let segments = diar?.segments, !segments.isEmpty {
                 phase = .reTranscribing
                 diagLog("[JOB \(id)] re-transcribing \(segments.count) diarized segments")
                 let results = await TranscriptionEngine.reTranscribe(
@@ -124,6 +131,21 @@ final class PostProcessingJob: Identifiable {
             }
             phase = .failed(error)
             throw error
+        }
+
+        // 2b. Emit per-speaker voiceprints next to the finalized transcript (opt-in).
+        //     Keyed by the same "Speaker N" labels as the body so a downstream consumer
+        //     can bind a centroid to the name the user confirms during speaker tagging.
+        if exportVoiceprints, let diar = diarOutput,
+           let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
+            let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath)
+            do {
+                try VoiceprintSidecar.write(sidecar, to: sidecarURL)
+                TranscriptFinalizer.setVoiceprintsLink(filePath: savedPath, sidecarFilename: sidecarURL.lastPathComponent)
+                diagLog("[JOB \(id)] wrote \(sidecar.speakers.count) voiceprints → \(sidecarURL.lastPathComponent)")
+            } catch {
+                diagLog("[JOB \(id)] voiceprint sidecar write failed (non-fatal): \(error)")
+            }
         }
 
         // 3. Retain the combined recording before deleting the source WAVs. Failure
