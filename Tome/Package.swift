@@ -26,5 +26,14 @@ let package = Package(
             path: "Sources/Tome",
             exclude: ["Info.plist", "Tome.entitlements", "Assets"]
         ),
+        // Diagnostic/backfill CLI (not part of the app). See Sources/VoiceprintAudit/main.swift.
+        .executableTarget(
+            name: "VoiceprintAudit",
+            dependencies: [
+                .product(name: "SpeakerKit", package: "argmax-oss-swift"),
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
+            ],
+            path: "Sources/VoiceprintAudit"
+        ),
     ]
 )
