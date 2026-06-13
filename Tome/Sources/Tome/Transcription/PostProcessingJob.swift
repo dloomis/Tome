@@ -34,17 +34,21 @@ final class PostProcessingJob: Identifiable {
     /// after the transcript is finalized. Nil = retention off.
     let retention: RecordingRetentionConfig?
 
-    /// When true, write a per-speaker voiceprint sidecar (`*.voiceprints.json`) next to
-    /// the finalized transcript. Call captures only — needs a diarized system stream.
+    /// When true, write a per-speaker voiceprint sidecar (`*.voiceprints.json`). Call
+    /// captures only — needs a diarized system stream.
     let exportVoiceprints: Bool
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false) {
+    /// Folder to write the voiceprint sidecar into. Nil = next to the transcript.
+    let voiceprintsFolder: URL?
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, voiceprintsFolder: URL? = nil) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
+        self.voiceprintsFolder = voiceprintsFolder
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -138,7 +142,10 @@ final class PostProcessingJob: Identifiable {
         //     can bind a centroid to the name the user confirms during speaker tagging.
         if exportVoiceprints, let diar = diarOutput,
            let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
-            let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath)
+            if let folder = voiceprintsFolder {
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            }
+            let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath, in: voiceprintsFolder)
             do {
                 try VoiceprintSidecar.write(sidecar, to: sidecarURL)
                 TranscriptFinalizer.setVoiceprintsLink(filePath: savedPath, sidecarFilename: sidecarURL.lastPathComponent)

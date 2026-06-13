@@ -57,6 +57,12 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(exportVoiceprints, forKey: "exportVoiceprints") }
     }
 
+    /// Folder where voiceprint sidecars (`.voiceprints.json`) are saved. Empty = next to
+    /// the transcript. Best kept inside the Obsidian vault so downstream tools can resolve it.
+    var voiceprintsFolderPath: String {
+        didSet { UserDefaults.standard.set(voiceprintsFolderPath, forKey: "voiceprintsFolderPath") }
+    }
+
     // MARK: - Diarization (SpeakerKit / pyannote v4)
 
     var diarizationClusterThreshold: Double {
@@ -113,6 +119,7 @@ final class AppSettings {
         self.retainRecordings = defaults.bool(forKey: "retainRecordings")
         self.recordingsFolderPath = defaults.string(forKey: "recordingsFolderPath") ?? NSString("~/Documents/Tome/Recordings").expandingTildeInPath
         self.exportVoiceprints = defaults.bool(forKey: "exportVoiceprints")
+        self.voiceprintsFolderPath = defaults.string(forKey: "voiceprintsFolderPath") ?? ""
         self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
         self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil

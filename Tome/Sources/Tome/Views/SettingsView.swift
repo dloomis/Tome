@@ -181,7 +181,14 @@ private struct OutputTab: View {
             Section("Speaker Voiceprints") {
                 Toggle("Export speaker voiceprints", isOn: $settings.exportVoiceprints)
                     .font(.system(size: 12))
-                Text("Writes a per-speaker voice embedding (.voiceprints.json) next to each call transcript so other tools can recognize returning speakers. Biometric data; stays on your machine. Off by default.")
+                if settings.exportVoiceprints {
+                    folderRow(
+                        title: "Voiceprints Folder",
+                        path: settings.voiceprintsFolderPath,
+                        chooseMessage: "Choose the folder for voiceprint files"
+                    ) { settings.voiceprintsFolderPath = $0 }
+                }
+                Text("Writes a per-speaker voice embedding (.voiceprints.json) for each call so other tools can recognize returning speakers. Saved next to the transcript by default, or in a folder you choose (keep it inside your vault). Biometric data; stays on your machine. Off by default.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }

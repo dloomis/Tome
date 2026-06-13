@@ -631,7 +631,8 @@ struct ContentView: View {
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                 retention: retention,
-                exportVoiceprints: settings.exportVoiceprints
+                exportVoiceprints: settings.exportVoiceprints,
+                voiceprintsFolder: settings.voiceprintsFolderPath.isEmpty ? nil : URL(fileURLWithPath: (settings.voiceprintsFolderPath as NSString).expandingTildeInPath)
             )
 
             services.postProcessingQueue.enqueue(job)

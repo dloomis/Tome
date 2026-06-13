@@ -40,9 +40,14 @@ struct VoiceprintSidecar: Codable, Sendable {
     /// the label it confirmed during speaker tagging.
     let speakers: [String: Speaker]
 
-    /// Sibling path convention: `<transcript-stem>.voiceprints.json`.
-    static func sidecarURL(forTranscript transcriptURL: URL) -> URL {
-        transcriptURL.deletingPathExtension().appendingPathExtension("voiceprints.json")
+    /// Path for the sidecar: `<folder>/<transcript-stem>.voiceprints.json` when a folder is
+    /// given, else the sibling `<transcript-stem>.voiceprints.json` next to the transcript.
+    static func sidecarURL(forTranscript transcriptURL: URL, in folder: URL? = nil) -> URL {
+        if let folder {
+            let name = transcriptURL.deletingPathExtension().lastPathComponent + ".voiceprints.json"
+            return folder.appendingPathComponent(name)
+        }
+        return transcriptURL.deletingPathExtension().appendingPathExtension("voiceprints.json")
     }
 
     /// Build a sidecar from a diarization output. Centroids are re-keyed from raw
