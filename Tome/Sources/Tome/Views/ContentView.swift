@@ -631,8 +631,7 @@ struct ContentView: View {
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                 retention: retention,
-                exportVoiceprints: settings.exportVoiceprints,
-                voiceprintsFolder: settings.voiceprintsFolderPath.isEmpty ? nil : URL(fileURLWithPath: (settings.voiceprintsFolderPath as NSString).expandingTildeInPath)
+                exportVoiceprints: settings.exportVoiceprints
             )
 
             services.postProcessingQueue.enqueue(job)
@@ -733,7 +732,8 @@ struct ContentView: View {
                     transcriptURL: transcriptURL,
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
-                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                    numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                    exportVoiceprints: settings.exportVoiceprints
                 )
                 OrphanScanner.discard(orphan)
                 recovered += 1
@@ -851,7 +851,8 @@ struct ContentView: View {
                     transcriptURL: mdURL,
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
-                    numberOfSpeakers: settings.diarizationNumberOfSpeakers
+                    numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                    exportVoiceprints: settings.exportVoiceprints
                 )
                 result = .success(saved)
             } catch {

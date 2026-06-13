@@ -34,21 +34,17 @@ final class PostProcessingJob: Identifiable {
     /// after the transcript is finalized. Nil = retention off.
     let retention: RecordingRetentionConfig?
 
-    /// When true, write a per-speaker voiceprint sidecar (`*.voiceprints.json`). Call
-    /// captures only — needs a diarized system stream.
+    /// When true, write a per-speaker voiceprint sidecar (`*.voiceprints.json`) next to
+    /// the finalized transcript. Call captures only — needs a diarized system stream.
     let exportVoiceprints: Bool
 
-    /// Folder to write the voiceprint sidecar into. Nil = next to the transcript.
-    let voiceprintsFolder: URL?
-
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, voiceprintsFolder: URL? = nil) {
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
-        self.voiceprintsFolder = voiceprintsFolder
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -140,18 +136,21 @@ final class PostProcessingJob: Identifiable {
         // 2b. Emit per-speaker voiceprints next to the finalized transcript (opt-in).
         //     Keyed by the same "Speaker N" labels as the body so a downstream consumer
         //     can bind a centroid to the name the user confirms during speaker tagging.
-        if exportVoiceprints, let diar = diarOutput,
-           let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
-            if let folder = voiceprintsFolder {
-                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            }
-            let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath, in: voiceprintsFolder)
-            do {
-                try VoiceprintSidecar.write(sidecar, to: sidecarURL)
-                TranscriptFinalizer.setVoiceprintsLink(filePath: savedPath, sidecarFilename: sidecarURL.lastPathComponent)
-                diagLog("[JOB \(id)] wrote \(sidecar.speakers.count) voiceprints → \(sidecarURL.lastPathComponent)")
-            } catch {
-                diagLog("[JOB \(id)] voiceprint sidecar write failed (non-fatal): \(error)")
+        if exportVoiceprints {
+            if let diar = diarOutput,
+               let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
+                let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath)
+                do {
+                    try VoiceprintSidecar.write(sidecar, to: sidecarURL)
+                    TranscriptFinalizer.setVoiceprintsLink(filePath: savedPath, sidecarFilename: sidecarURL.lastPathComponent)
+                    diagLog("[JOB \(id)] wrote \(sidecar.speakers.count) voiceprints → \(sidecarURL.lastPathComponent)")
+                } catch {
+                    diagLog("[JOB \(id)] voiceprint sidecar write failed (non-fatal): \(error)")
+                }
+            } else {
+                // Opt-in was on but diarization yielded no centroids (no system speech, too
+                // short, or a backend that doesn't expose them) — say so rather than going silent.
+                diagLog("[JOB \(id)] voiceprints enabled but none emitted (no diarization centroids for this session)")
             }
         }
 

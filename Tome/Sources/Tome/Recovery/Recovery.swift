@@ -74,7 +74,8 @@ enum Recovery {
         transcriptURL: URL,
         asr: ASRCoordinator,
         clusterThreshold: Float,
-        numberOfSpeakers: Int
+        numberOfSpeakers: Int,
+        exportVoiceprints: Bool = false
     ) async throws -> URL {
         let wav = try inspectWAV(wavURL)
 
@@ -141,6 +142,25 @@ enum Recovery {
         // because users frequently maintain it via external tooling that
         // restructures it into a richer form Tome doesn't recognize.
         updateDurationFields(at: transcriptURL, durationSeconds: Int(wav.durationSeconds.rounded()))
+
+        // Emit per-speaker voiceprints next to the recovered transcript (opt-in), mirroring
+        // the normal stop path — the recovered WAV is the diarized system stream, and the
+        // sidecar's "Speaker N" keys come from the same `speakerLabels` map the body rewrite
+        // used. Best-effort: the transcript is already saved, so a failure here is non-fatal.
+        if exportVoiceprints {
+            if let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
+                let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: transcriptURL)
+                do {
+                    try VoiceprintSidecar.write(sidecar, to: sidecarURL)
+                    TranscriptFinalizer.setVoiceprintsLink(filePath: transcriptURL, sidecarFilename: sidecarURL.lastPathComponent)
+                    diagLog("[RECOVERY] wrote \(sidecar.speakers.count) voiceprints → \(sidecarURL.lastPathComponent)")
+                } catch {
+                    diagLog("[RECOVERY] voiceprint sidecar write failed (non-fatal): \(error)")
+                }
+            } else {
+                diagLog("[RECOVERY] voiceprints enabled but none emitted (no diarization centroids)")
+            }
+        }
 
         diagLog("[RECOVERY] complete: \(transcriptURL.lastPathComponent)")
         return transcriptURL

@@ -18,9 +18,11 @@ the join key between Tome's artifact and WhisperCal's confirmation.
 ## The embedding API
 
 Per-speaker centroids come from `DiarizationResult.speakerCentroidEmbeddings` — the
-official API added in **argmax-oss-swift** (formerly WhisperKit) by upstream PR #463: an
-L2-normalized mean embedding per speaker cluster. `Tome/Package.swift` is pinned to that
-commit (unreleased as of pinning); re-pin to a tagged release once it ships in one. The
+official API added in **argmax-oss-swift** (formerly WhisperKit) by upstream PR #463: a
+mean embedding per speaker cluster, returned in the raw embedder space (un-normalized).
+Tome L2-normalizes each centroid in `VoiceprintSidecar.build` before writing, so the stored
+print is unit-length and matches the backfill CLI's output. `Tome/Package.swift` is pinned to
+that commit (unreleased as of pinning); re-pin to a tagged release once it ships in one. The
 embedding space is identified by the sidecar's `model` field (`speakerkit-1.0`); consumers
 refuse to compare vectors across differing models.
 
@@ -28,9 +30,10 @@ refuse to compare vectors across differing models.
 
 When `AppSettings.exportVoiceprints` is on (Settings ▸ Output, off by default),
 `PostProcessingJob` writes a sidecar next to the finalized transcript after diarization.
-Keys are the **same `Speaker N` labels used in the transcript body** (`speakerLabels`,
-encounter order from 2) so they line up with what WhisperCal's speaker-tag modal shows as
-`original_name`.
+The orphaned-WAV recovery path (`Recovery.run`, used when a crash skipped post-processing)
+emits the same sidecar after it re-diarizes and rebuilds the transcript. Keys are the
+**same `Speaker N` labels used in the transcript body** (`speakerLabels`, encounter order
+from 2) so they line up with what WhisperCal's speaker-tag modal shows as `original_name`.
 
 Sidecar — `<transcript-stem>.voiceprints.json`, also referenced by a `voiceprints:`
 frontmatter key so the link survives a later rename:

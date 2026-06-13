@@ -1,8 +1,10 @@
 import Foundation
 
 /// Per-speaker acoustic voiceprints written next to a finalized transcript as
-/// `<stem>.voiceprints.json`. Each speaker's `embedding` is an L2-normalized centroid
-/// produced by diarization (SpeakerKit `DiarizationResult.speakerCentroidEmbeddings`).
+/// `<stem>.voiceprints.json`. Each speaker's `embedding` is the per-speaker centroid from
+/// diarization (SpeakerKit `DiarizationResult.speakerCentroidEmbeddings`), which SpeakerKit
+/// returns in its raw embedder space; Tome L2-normalizes it here at emit time so the stored
+/// print is unit-length and a consumer can compare two prints with a plain dot product.
 ///
 /// This is a deliberately neutral artifact. Tome emits anonymous centroids keyed by the
 /// same `Speaker N` labels as the transcript body; a downstream tool (e.g. WhisperCal)
@@ -40,14 +42,12 @@ struct VoiceprintSidecar: Codable, Sendable {
     /// the label it confirmed during speaker tagging.
     let speakers: [String: Speaker]
 
-    /// Path for the sidecar: `<folder>/<transcript-stem>.voiceprints.json` when a folder is
-    /// given, else the sibling `<transcript-stem>.voiceprints.json` next to the transcript.
-    static func sidecarURL(forTranscript transcriptURL: URL, in folder: URL? = nil) -> URL {
-        if let folder {
-            let name = transcriptURL.deletingPathExtension().lastPathComponent + ".voiceprints.json"
-            return folder.appendingPathComponent(name)
-        }
-        return transcriptURL.deletingPathExtension().appendingPathExtension("voiceprints.json")
+    /// Path for the sidecar: the sibling `<transcript-stem>.voiceprints.json` next to the
+    /// transcript. Keeping it beside the transcript means the bare filename recorded in the
+    /// `voiceprints:` frontmatter always resolves, and the sidecar is exactly as unique as
+    /// the transcript it joins to.
+    static func sidecarURL(forTranscript transcriptURL: URL) -> URL {
+        transcriptURL.deletingPathExtension().appendingPathExtension("voiceprints.json")
     }
 
     /// Build a sidecar from a diarization output. Centroids are re-keyed from raw
@@ -71,9 +71,13 @@ struct VoiceprintSidecar: Codable, Sendable {
         var dimension = 0
         for (rawId, vector) in diar.centroids {
             guard let label = labelMap[rawId], !vector.isEmpty else { continue }
-            dimension = vector.count
+            // SpeakerKit returns centroids in the raw embedder space (un-normalized mean
+            // of window embeddings). Normalize to unit length here so the stored print
+            // matches the contract this sidecar advertises and the backfill CLI's output.
+            let unit = l2Normalized(vector)
+            dimension = unit.count
             speakers[label] = Speaker(
-                embedding: vector,
+                embedding: unit,
                 activeSeconds: activeSeconds[label] ?? 0,
                 segmentCount: segmentCounts[label] ?? 0
             )
@@ -95,5 +99,13 @@ struct VoiceprintSidecar: Codable, Sendable {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(sidecar)
         try data.write(to: url, options: .atomic)
+    }
+
+    /// L2-normalize a centroid to unit length so two prints compare with a plain dot
+    /// product. Returns the input unchanged when it has zero magnitude (unreachable in a
+    /// real diarization run, but keeps the function total).
+    private static func l2Normalized(_ v: [Float]) -> [Float] {
+        let norm = v.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+        return norm > 0 ? v.map { $0 / norm } : v
     }
 }
