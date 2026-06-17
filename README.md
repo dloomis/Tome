@@ -24,6 +24,22 @@ Tome is a macOS app that captures meetings and voice memos, transcribes them loc
   <img src="assets/screenshot-recording.png" width="350" alt="Tome — recording with spectrum visualizer" />
 </p>
 
+## Install (macOS)
+
+> ### [⬇️ Download the latest Tome.dmg](https://github.com/dloomis/Tome/releases/latest/download/Tome.dmg)
+> Apple Silicon Mac · macOS 26+ · [all releases](https://github.com/dloomis/Tome/releases/latest)
+
+1. Open the downloaded **`Tome.dmg`** and drag **Tome** into your **Applications** folder.
+2. Open **Applications** and double-click **Tome**. **The first launch shows a warning — this is expected.** Tome is free and open-source (not paid-Apple-Developer signed), so macOS says:
+   > *“Tome” can’t be opened because Apple cannot check it for malicious software.*
+   >
+   > Click **Done** — do **not** click “Move to Trash.”
+3. Open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the message about Tome. Confirm with Touch ID or your password.
+
+That's a **one-time** approval. Tome launches normally every time afterward and keeps itself up to date automatically (Check for Updates is built in).
+
+<sub>Prefer Terminal? `xattr -dr com.apple.quarantine /Applications/Tome.app` clears the flag and skips the prompt. Want to build from source instead? See [Build](#build).</sub>
+
 ## Background
 
 Tome exists for one workflow: capture → vault → agent. If you're on calls all day and don't take notes, you want something that listens, transcribes, and drops structured markdown into your Obsidian vault where an agent layer can do the rest — pull action items, update client files, connect the dots. Otter, Granola, and Fireflies all lock your data in their cloud, none of them output plain markdown, and none of them are built to feed an agent pipeline.
@@ -146,22 +162,6 @@ that closes the loop from calendar event to finished meeting note.
 
 Tome stays fully useful standalone — WhisperCal is what turns the vault drop into an
 end-to-end meeting workflow.
-
-## Install
-
-Download the latest **Tome.dmg** from the [Releases page](https://github.com/dloomis/Tome/releases/latest), open it, and drag **Tome** into your Applications folder.
-
-**First launch.** Tome is free and open-source, distributed without a paid Apple Developer signature, so macOS Gatekeeper will stop the first launch with *"Tome can't be opened because Apple cannot check it for malicious software."* This is expected. To approve it (once):
-
-1. Double-click **Tome** — you'll see the warning. Click **Done**.
-2. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the message about Tome.
-3. Confirm with Touch ID / your password. Tome opens normally from then on.
-
-Prefer the terminal? `xattr -dr com.apple.quarantine /Applications/Tome.app` clears the quarantine flag in one step, after which Tome opens with no prompt.
-
-After the first launch, Tome keeps itself up to date automatically.
-
-**Requirements:** Apple Silicon Mac, macOS 26+.
 
 ## Build
 
