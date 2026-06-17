@@ -17,7 +17,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Build the tagged commit: a release event supplies the tag; a manual
           # dispatch supplies it via the `tag` input (forks don't fire release events).
@@ -99,7 +99,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Tome-dmg
           path: dist/Tome.dmg
