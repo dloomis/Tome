@@ -15,9 +15,9 @@
 
 ---
 
-> **Fork note:** Tome was created at [Gremble-io/Tome](https://github.com/Gremble-io/Tome) — the original idea and first release belong to the upstream author. Upstream has since evolved into a different product ([Detto](https://github.com/Gremble-io/Tome), a dictation-first app under a BSL license), so **this fork is where Tome continues**. It has diverged substantially from the last upstream release: post-session speaker diarization, a local HTTP API for agent integration, crash-safe capture with one-click recovery, opt-in audio retention with click-to-play timestamps, and more — see [Fork Additions](#fork-additions). It stays MIT-licensed, and new work lands against a public [roadmap](https://github.com/dloomis/Tome/blob/main/ROADMAP.md). If you're deciding which version to install or build on, this is the actively maintained one.
-
 Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home. Pair it with [WhisperCal](https://github.com/dloomis/WhisperCal), an Obsidian plugin that drives Tome straight from your calendar — one-click meeting notes, recording via Tome's local API, and an LLM pipeline for speaker tagging and summaries ([details below](#the-obsidian-side-whispercal)).
+
+> **Origins:** Tome began as a fork of an open-source app by [Jason Craik](https://github.com/Gremble-io) (itself built on [OpenGranola](https://github.com/yazinsai/OpenGranola)). That project has since moved in a different direction under a new name ([Detto](https://github.com/Gremble-io/Tome)), so Tome is now an independent project — designed, built, and maintained here — and stays MIT-licensed. Full [credits](#credits) below.
 
 <p align="center">
   <img src="assets/screenshot-idle.png" width="350" alt="Tome — idle state" />
@@ -44,7 +44,7 @@ That's a **one-time** approval. Tome launches normally every time afterward and 
 
 Tome exists for one workflow: capture → vault → agent. If you're on calls all day and don't take notes, you want something that listens, transcribes, and drops structured markdown into your Obsidian vault where an agent layer can do the rest — pull action items, update client files, connect the dots. Otter, Granola, and Fireflies all lock your data in their cloud, none of them output plain markdown, and none of them are built to feed an agent pipeline.
 
-The original Tome nailed that idea, and full credit goes to its author. I forked it to push the workflow further — speaker diarization, crash-safe capture, a local API so other tools can drive it — and since upstream has evolved into [Detto](https://github.com/Gremble-io/Tome), a dictation-first app, this fork is where Tome development continues. The [Fork Additions](#fork-additions) below show how far it's come; the [roadmap](https://github.com/dloomis/Tome/blob/main/ROADMAP.md) shows where it's headed.
+That's the workflow Tome is built for. It started from an open-source foundation (see [credits](#credits)) and I've taken it well beyond — speaker diarization, crash-safe capture, a local API so other tools can drive it, opt-in audio retention, and more. The [capabilities](#capabilities) below show how far it's come; the [roadmap](https://github.com/dloomis/Tome/blob/main/ROADMAP.md) shows where it's headed.
 
 ## Why Tome?
 
@@ -249,9 +249,9 @@ Tome/Sources/Tome/
 - **No live speaker labels.** Diarization runs after the session ends. During capture, remote audio (calls) or the mic (in-person memos) shows as a single stream.
 - **In-person separation depends on the room.** One laptop mic for a whole table works, but far/overlapping voices diarize worse than a per-person or headset setup.
 
-## Fork Additions
+## Capabilities
 
-This fork has diverged substantially from the original project — and since upstream's pivot to Detto, it's where Tome development happens. Relative to the last upstream release of Tome, this fork adds:
+Tome has grown well beyond its open-source starting point. Here's what's built in:
 
 ### Diarization & transcription
 
@@ -304,7 +304,7 @@ This fork has diverged substantially from the original project — and since ups
 
 ## Credits
 
-Tome was created by the [upstream author](https://github.com/Gremble-io/Tome), who started from [OpenGranola](https://github.com/yazinsai/OpenGranola) and substantially rewrote it. This fork builds on that foundation and continues it.
+Tome began as a fork of an open-source project by [Jason Craik](https://github.com/Gremble-io), which itself built on [OpenGranola](https://github.com/yazinsai/OpenGranola) — sincere thanks to both for the foundation. That project has since become a separate product, [Detto](https://github.com/Gremble-io/Tome); Tome has grown into its own standalone app, maintained here by [@dloomis](https://github.com/dloomis). Released under the [MIT license](LICENSE), which preserves the original copyright notices.
 
 ## License
 
