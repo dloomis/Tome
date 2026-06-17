@@ -109,6 +109,14 @@ jobs:
           SPARKLE_EDDSA_KEY: ${{ secrets.SPARKLE_EDDSA_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Sparkle is optional. Without the EdDSA key there's nothing to sign
+          # the appcast with, so skip — the DMG is already attached to the release
+          # above; only in-app auto-update advertising is unavailable.
+          if [[ -z "${SPARKLE_EDDSA_KEY}" ]]; then
+            echo "SPARKLE_EDDSA_KEY not set — skipping appcast update (in-app auto-update won't advertise this release)."
+            exit 0
+          fi
+
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
           DMG_PATH="dist/Tome.dmg"
@@ -135,11 +143,11 @@ jobs:
           echo "EdDSA signature: $ED_SIGNATURE"
           echo "DMG length: $DMG_LENGTH"
 
-          DMG_URL="https://github.com/Gremble-io/Tome/releases/download/${TAG}/Tome.dmg"
+          DMG_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Tome.dmg"
           PUB_DATE=$(date -u +"%a, %d %b %Y %H:%M:%S %z")
 
           # Clone gh-pages branch
-          git clone --branch gh-pages --single-branch "https://x-access-token:${GH_TOKEN}@github.com/Gremble-io/Tome.git" /tmp/gh-pages
+          git clone --branch gh-pages --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" /tmp/gh-pages
 
           # Generate appcast.xml
           cat > /tmp/gh-pages/appcast.xml <<APPCAST_EOF
@@ -147,7 +155,7 @@ jobs:
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
             <channel>
               <title>Tome Updates</title>
-              <link>https://raw.githubusercontent.com/Gremble-io/Tome/gh-pages/appcast.xml</link>
+              <link>https://raw.githubusercontent.com/${{ github.repository }}/gh-pages/appcast.xml</link>
               <description>Most recent updates to Tome</description>
               <language>en</language>
               <item>

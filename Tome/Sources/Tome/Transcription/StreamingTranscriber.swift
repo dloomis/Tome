@@ -14,7 +14,7 @@ final class StreamingTranscriber: @unchecked Sendable {
     /// downstream as `startTime − sessionStart`, so this must reflect the audio
     /// position, not the transcription latency.
     private let onFinal: @Sendable (String, Date) -> Void
-    private let log = Logger(subsystem: "io.gremble.tome", category: "StreamingTranscriber")
+    private let log = Logger(subsystem: tomeLogSubsystem, category: "StreamingTranscriber")
 
     /// Resampler from source format to 16kHz mono Float32.
     private var converter: AVAudioConverter?

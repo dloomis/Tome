@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
 SWIFT_DIR="$ROOT_DIR/Tome"
 APP_NAME="Tome"
-BUNDLE_ID="io.gremble.tome"
+BUNDLE_ID="com.dloomis.tome"
 
 echo "=== Building $APP_NAME (Swift) ==="
 
@@ -86,52 +86,70 @@ if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
   fi
 fi
 
-# Sign the app
+ENTITLEMENTS="$SWIFT_DIR/Sources/Tome/Tome.entitlements"
+
+# Decide how to sign. A real "Developer ID Application" identity gives a
+# notarizable, Gatekeeper-clean build. With no identity we fall back to an
+# ad-hoc signature (`-`): free, requires no Apple Developer account, and — unlike
+# leaving the bundle unsigned — keeps it launchable on Apple Silicon. (The
+# install_name_tool call above invalidates the linker's automatic signature, and
+# an invalid signature makes macOS report the app as "damaged" rather than merely
+# "from an unidentified developer". Re-signing ad-hoc avoids that.)
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  ENTITLEMENTS="$SWIFT_DIR/Sources/Tome/Tome.entitlements"
-  echo "Signing with: $CODESIGN_IDENTITY"
+  ADHOC=0
+  echo "Signing with Developer ID: $CODESIGN_IDENTITY"
+else
+  ADHOC=1
+  echo "No Developer ID identity found — applying an ad-hoc signature (free, unsigned distribution)."
+  echo "Users will see an 'unidentified developer' prompt on first launch; see README ▸ Install."
+fi
 
-  # Sign Sparkle components inside-out (innermost first)
-  SPARKLE_FW_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
-  if [[ -d "$SPARKLE_FW_BUNDLE" ]]; then
-    # Sign XPC service executables, then their bundles
-    for xpc in "$SPARKLE_FW_BUNDLE"/Versions/B/XPCServices/*.xpc; do
-      if [[ -d "$xpc" ]]; then
-        codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$xpc/Contents/MacOS/$(basename "${xpc%.xpc}")"
-        codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$xpc"
-      fi
-    done
+# Sign one path. Hardened runtime + secure timestamp are notarization
+# prerequisites and only apply to a real Developer ID signature; ad-hoc uses
+# neither. Extra args (e.g. --entitlements) are passed through before the path.
+sign_path() {
+  local path="$1"; shift
+  if [[ "$ADHOC" -eq 1 ]]; then
+    codesign --force "$@" --sign - "$path"
+  else
+    codesign --force --options runtime --timestamp "$@" --sign "$CODESIGN_IDENTITY" "$path"
+  fi
+}
 
-    # Sign Autoupdate helper
-    AUTOUPDATE="$SPARKLE_FW_BUNDLE/Versions/B/Autoupdate"
-    if [[ -f "$AUTOUPDATE" ]]; then
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$AUTOUPDATE"
+# Sign Sparkle components inside-out (innermost first)
+SPARKLE_FW_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
+if [[ -d "$SPARKLE_FW_BUNDLE" ]]; then
+  # Sign XPC service executables, then their bundles
+  for xpc in "$SPARKLE_FW_BUNDLE"/Versions/B/XPCServices/*.xpc; do
+    if [[ -d "$xpc" ]]; then
+      sign_path "$xpc/Contents/MacOS/$(basename "${xpc%.xpc}")"
+      sign_path "$xpc"
     fi
+  done
 
-    # Sign Updater.app
-    UPDATER_APP="$SPARKLE_FW_BUNDLE/Versions/B/Updater.app"
-    if [[ -d "$UPDATER_APP" ]]; then
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$UPDATER_APP/Contents/MacOS/Updater"
-      codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$UPDATER_APP"
-    fi
-
-    # Sign the framework dylib, then the framework bundle
-    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$SPARKLE_FW_BUNDLE/Versions/B/Sparkle"
-    codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$SPARKLE_FW_BUNDLE"
+  # Sign Autoupdate helper
+  AUTOUPDATE="$SPARKLE_FW_BUNDLE/Versions/B/Autoupdate"
+  if [[ -f "$AUTOUPDATE" ]]; then
+    sign_path "$AUTOUPDATE"
   fi
 
-  # Sign the main app bundle
-  codesign --force --options runtime \
-    --sign "$CODESIGN_IDENTITY" \
-    --entitlements "$ENTITLEMENTS" \
-    --timestamp \
-    "$APP_DIR"
+  # Sign Updater.app
+  UPDATER_APP="$SPARKLE_FW_BUNDLE/Versions/B/Updater.app"
+  if [[ -d "$UPDATER_APP" ]]; then
+    sign_path "$UPDATER_APP/Contents/MacOS/Updater"
+    sign_path "$UPDATER_APP"
+  fi
 
-  echo "Code signing complete"
-  codesign -vvv "$APP_DIR"
-else
-  echo "Warning: No signing identity found. App will be unsigned."
+  # Sign the framework dylib, then the framework bundle
+  sign_path "$SPARKLE_FW_BUNDLE/Versions/B/Sparkle"
+  sign_path "$SPARKLE_FW_BUNDLE"
 fi
+
+# Sign the main app bundle (entitlements apply in both modes)
+sign_path "$APP_DIR" --entitlements "$ENTITLEMENTS"
+
+echo "Code signing complete (ad-hoc: $ADHOC)"
+codesign -vvv "$APP_DIR" 2>&1 || true
 
 # Install to /Applications
 cp -R "$APP_DIR" /Applications/

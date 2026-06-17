@@ -31,12 +31,15 @@ func formatTimeOffset(_ seconds: TimeInterval) -> String {
 
 // MARK: - Speaker Labels
 
-/// Maps raw diarization speaker IDs to friendly labels ("Speaker 2", "Speaker 3", etc.).
-/// Numbering starts at 2 because "You" is always the implicit first speaker.
+/// Maps raw diarization speaker IDs to friendly labels ("Speaker 1", "Speaker 2", etc.).
+/// `startingAt` is the first speaker number: 2 for call capture, where "You" is the
+/// implicit Speaker 1 on the mic track and only the system ("them") stream is diarized;
+/// 1 for mic-only in-person sessions, where every speaker — including the recording user —
+/// comes from the diarizer, so there's no implicit "You" slot to reserve.
 /// Labels are assigned in encounter order.
-func speakerLabels(from orderedIds: some Sequence<String>) -> [String: String] {
+func speakerLabels(from orderedIds: some Sequence<String>, startingAt: Int = 2) -> [String: String] {
     var map: [String: String] = [:]
-    var next = 2
+    var next = startingAt
     for id in orderedIds where map[id] == nil {
         map[id] = "Speaker \(next)"
         next += 1

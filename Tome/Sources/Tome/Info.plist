@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Tome</string>
     <key>CFBundleIdentifier</key>
-    <string>io.gremble.tome</string>
+    <string>com.dloomis.tome</string>
     <key>CFBundleVersion</key>
     <string>1.0.1</string>
     <key>CFBundleShortVersionString</key>
@@ -33,10 +33,10 @@
         <string>MacOSX</string>
     </array>
     <key>SUFeedURL</key>
-    <string>https://raw.githubusercontent.com/Gremble-io/Tome/gh-pages/appcast.xml</string>
+    <string>https://raw.githubusercontent.com/dloomis/Tome/gh-pages/appcast.xml</string>
     <key>SUEnableAutomaticChecks</key>
     <true/>
     <key>SUPublicEDKey</key>
-    <string>LT2/oCSuJPmnri+6b62DV1WhHxSmWrJ1nZzbAK2ipV4=</string>
+    <string>M5M3I4vmP+82GHKucC3XmWuciDeoqms+zggl1OOxBIs=</string>
 </dict>
 </plist>

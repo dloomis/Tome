@@ -8,6 +8,10 @@ struct SegmentReTranscriber: Sendable {
     let asrCoordinator: ASRCoordinator
     let fileURL: URL
     let segments: [DiarizedSegment]
+    /// First speaker number for labels: 2 for call capture (system stream; "You" is the
+    /// implicit Speaker 1), 1 for mic-only in-person diarization (every speaker, including
+    /// the recording user, comes from the diarizer).
+    let speakerNumberBase: Int
 
     func run() async -> [ReTranscribedSegment]? {
         do {
@@ -15,7 +19,7 @@ struct SegmentReTranscriber: Sendable {
             let sampleRate = audioFile.processingFormat.sampleRate
             let totalFrames = AVAudioFrameCount(audioFile.length)
 
-            let speakerMap = speakerLabels(from: segments.map(\.speakerId))
+            let speakerMap = speakerLabels(from: segments.map(\.speakerId), startingAt: speakerNumberBase)
 
             // Merge consecutive segments from the same speaker (< 0.5s gap)
             var merged: [DiarizedSegment] = []
@@ -62,14 +66,14 @@ struct SegmentReTranscriber: Sendable {
                     let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { continue }
 
-                    let label = speakerMap[seg.speakerId] ?? "Speaker 2"
+                    let label = speakerMap[seg.speakerId] ?? "Speaker \(speakerNumberBase)"
                     output.append(ReTranscribedSegment(speaker: label, text: text, startTime: seg.startTime))
                 } catch {
                     // Visible holes in the final transcript beat silent drops — the user can see
                     // which segment failed and re-record. "[transcription failed]" is the agreed
                     // placeholder convention; downstream rebuilders treat it as opaque text.
                     diagLog("[RETRANSCRIBE] Segment \(seg.startTime)-\(seg.endTime) failed: \(error.localizedDescription)")
-                    let label = speakerMap[seg.speakerId] ?? "Speaker 2"
+                    let label = speakerMap[seg.speakerId] ?? "Speaker \(speakerNumberBase)"
                     output.append(ReTranscribedSegment(speaker: label, text: "[transcription failed]", startTime: seg.startTime))
                     continue
                 }

@@ -5,6 +5,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/dloomis/Tome/releases/latest"><img src="https://img.shields.io/badge/Download-Tome.dmg-007AFF?logo=apple&logoColor=white" alt="Download Tome.dmg" /></a>
+  <a href="https://github.com/dloomis/Tome/releases/latest"><img src="https://img.shields.io/github/v/release/dloomis/Tome?label=latest&logo=github" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white" alt="Swift 6.2" />
   <img src="https://img.shields.io/badge/macOS-26%2B-000000?logo=apple&logoColor=white" alt="macOS 26+" />
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License" />
@@ -44,9 +46,9 @@ Tome does the first three. Your agent does the rest — or install [WhisperCal](
 
 - **Local transcription** via Parakeet-TDT v3 ([FluidAudio](https://github.com/FluidInference/FluidAudio)) on Apple Silicon. Nothing hits the network.
 - **Call Capture** grabs mic + system audio. Detects which conferencing app you're in (Teams, Zoom, Slack, etc.) and filters audio to just that app. Your Spotify and notification sounds stay out of the transcript.
-- **Voice Memo** is mic only. For quick thoughts, verbal notes, stream of consciousness. Saves to a separate folder so it doesn't clutter your meeting transcripts.
-- **Speaker diarization** runs after the call ends. pyannote splits the remote audio into Speaker 2, Speaker 3, Speaker 4. Not perfect, but way better than one wall of unattributed text.
-- **Speaker voiceprints (opt-in).** Settings > Output can export a per-speaker voice embedding (`.voiceprints.json`) next to each call transcript, so downstream tools ([WhisperCal](https://github.com/dloomis/WhisperCal)) recognize returning speakers acoustically and tag your regulars automatically — no cloud. Biometric data; off by default, stays on your machine. See [`docs/voiceprints.md`](docs/voiceprints.md).
+- **Voice Memo** is mic only — for quick thoughts and verbal notes, but also **in-person meetings**: when more than one person is talking, post-session diarization splits the single mic stream into Speaker 1, Speaker 2, … just like a call. A solo memo stays one "You" block. Saves to a separate folder so it doesn't clutter your meeting transcripts.
+- **Speaker diarization** runs after the session ends. For a call, pyannote splits the remote audio into Speaker 2, Speaker 3, …; for an in-person voice memo it splits the mic itself into Speaker 1, Speaker 2, …. Not perfect, but way better than one wall of unattributed text.
+- **Speaker voiceprints (opt-in).** Settings > Output can export a per-speaker voice embedding (`.voiceprints.json`) next to each diarized transcript — call or in-person — so downstream tools ([WhisperCal](https://github.com/dloomis/WhisperCal)) recognize returning speakers acoustically and tag your regulars automatically — no cloud. Biometric data; off by default, stays on your machine. See [`docs/voiceprints.md`](docs/voiceprints.md).
 - **Vault-native output** writes `.md` with frontmatter: `type`, `created`, `attendees`, `tags`, `source_app`. Lands in your vault ready to process.
 - **Privacy.** Hidden from screen sharing by default. Audio is discarded after transcription — opt in to recording retention if you want to keep the audio file.
 - **Timestamped lines.** Every transcript line is tagged with its start offset in seconds from the start of the recording (e.g. `(3.120)`). Drops straight into an [Obsidian Media Extended](https://github.com/aidenlx/media-extended) `#t=` link, so a line can replay the exact moment of audio it came from.
@@ -145,7 +147,25 @@ that closes the loop from calendar event to finished meeting note.
 Tome stays fully useful standalone — WhisperCal is what turns the vault drop into an
 end-to-end meeting workflow.
 
+## Install
+
+Download the latest **Tome.dmg** from the [Releases page](https://github.com/dloomis/Tome/releases/latest), open it, and drag **Tome** into your Applications folder.
+
+**First launch.** Tome is free and open-source, distributed without a paid Apple Developer signature, so macOS Gatekeeper will stop the first launch with *"Tome can't be opened because Apple cannot check it for malicious software."* This is expected. To approve it (once):
+
+1. Double-click **Tome** — you'll see the warning. Click **Done**.
+2. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the message about Tome.
+3. Confirm with Touch ID / your password. Tome opens normally from then on.
+
+Prefer the terminal? `xattr -dr com.apple.quarantine /Applications/Tome.app` clears the quarantine flag in one step, after which Tome opens with no prompt.
+
+After the first launch, Tome keeps itself up to date automatically.
+
+**Requirements:** Apple Silicon Mac, macOS 26+.
+
 ## Build
+
+If you'd rather compile it yourself:
 
 **Requirements:** Apple Silicon Mac, macOS 26+, Xcode 26.3+
 
@@ -226,7 +246,8 @@ Tome/Sources/Tome/
 - **macOS 26+ only.**
 - **Screen Recording re-prompts monthly.** OS limitation.
 - **Diarization is imperfect.** Works well with headset mics. Laptop speakers with crosstalk will give you worse speaker separation.
-- **No live speaker labels.** Diarization runs after the session ends. During the call, remote audio shows as a single stream.
+- **No live speaker labels.** Diarization runs after the session ends. During capture, remote audio (calls) or the mic (in-person memos) shows as a single stream.
+- **In-person separation depends on the room.** One laptop mic for a whole table works, but far/overlapping voices diarize worse than a per-person or headset setup.
 
 ## Fork Additions
 
@@ -234,7 +255,7 @@ This fork has diverged substantially from the original project — and since ups
 
 ### Diarization & transcription
 
-- **SpeakerKit diarization (pyannote v4)** — replaces upstream's FluidAudio offline diarizer with [SpeakerKit](https://github.com/argmaxinc/WhisperKit). After a session ends, system audio is re-processed for speaker segmentation and each segment is re-transcribed with per-speaker labels.
+- **SpeakerKit diarization (pyannote v4)** — replaces upstream's FluidAudio offline diarizer with [SpeakerKit](https://github.com/argmaxinc/WhisperKit). After a session ends, the diarized stream — system audio for calls, or the mic itself for mic-only in-person sessions — is re-processed for speaker segmentation and each segment is re-transcribed with per-speaker labels.
 - **Background post-session processing** — diarization + frontmatter finalization run on a serial background queue (`PostProcessingQueue`) so a new recording can start immediately after Stop. The menu bar icon pulses while finalization is in flight.
 - **Keep transcribing while the display sleeps** — capture and ASR are no longer interrupted by display sleep.
 - **Dynamic ASR language hint** — `AppSettings.transcriptionLanguage` flows through to the ASR coordinator at session start and on the fly; UI exposure ships in the next release.

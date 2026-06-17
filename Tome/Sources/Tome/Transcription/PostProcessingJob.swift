@@ -57,13 +57,40 @@ final class PostProcessingJob: Identifiable {
             throw .cancelled
         }
 
-        // 1. Diarize + re-transcribe when we have a system-audio buffer (call captures).
-        diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
+        // 1. Diarize + re-transcribe. Call captures diarize the system ("them") WAV and
+        //    keep the live mic track as "You". Mic-only sessions (voice memos / in-person
+        //    meetings) diarize the mic WAV itself — every speaker, including the recording
+        //    user, comes from the diarizer, so labels start at 1 and the live "You" lines
+        //    are replaced wholesale.
+        diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), micWavPath=\(handle.micWavPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
         if handle.wavWriteErrorCount > 0 {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
         }
+
+        // Per-session-type diarization plan.
+        let diarBufferURL: URL?
+        let speakerBase: Int
+        let preserveYou: Bool
+        let voiceprintSource: String
+        let voiceprintIncludesYou: Bool
+        switch handle.sessionType {
+        case .callCapture:
+            diarBufferURL = handle.wavBufferPath
+            speakerBase = 2
+            preserveYou = true
+            voiceprintSource = "system"
+            voiceprintIncludesYou = false
+        case .voiceMemo:
+            diarBufferURL = handle.micWavPath
+            speakerBase = 1
+            preserveYou = false
+            voiceprintSource = "mic"
+            voiceprintIncludesYou = true
+        }
+
         var diarOutput: DiarizationOutput?
-        if handle.sessionType == .callCapture, let bufferURL = handle.wavBufferPath {
+        var didRebuildSpeakers = false
+        if let bufferURL = diarBufferURL {
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: bufferURL.path)[.size] as? Int) ?? -1
             diagLog("[JOB \(id)] buffer file size=\(fileSize) bytes, exists=\(FileManager.default.fileExists(atPath: bufferURL.path))")
             phase = .diarizing
@@ -82,17 +109,31 @@ final class PostProcessingJob: Identifiable {
                 throw .cancelled
             }
 
-            if let segments = diar?.segments, !segments.isEmpty {
+            // Mic-only collapse: a solo memo (≤1 detected speaker) keeps its live "You"
+            // transcript untouched — no re-transcription, no relabel, no voiceprint. Only a
+            // multi-speaker in-person session is rebuilt into Speaker 1..N. Call captures
+            // always rebuild when diarization produced segments (existing behavior).
+            let segments = diar?.segments ?? []
+            let distinctSpeakers = Set(segments.map(\.speakerId)).count
+            let shouldRebuild = handle.sessionType == .callCapture
+                ? !segments.isEmpty
+                : distinctSpeakers >= 2
+            if handle.sessionType == .voiceMemo && !shouldRebuild {
+                diagLog("[JOB \(id)] mic diarization found \(distinctSpeakers) speaker(s) — keeping live 'You' transcript")
+            }
+
+            if shouldRebuild, !segments.isEmpty {
                 phase = .reTranscribing
-                diagLog("[JOB \(id)] re-transcribing \(segments.count) diarized segments")
+                diagLog("[JOB \(id)] re-transcribing \(segments.count) diarized segments (speakerBase=\(speakerBase))")
                 let results = await TranscriptionEngine.reTranscribe(
                     asrCoordinator: asr,
                     bufferURL: bufferURL,
-                    segments: segments
+                    segments: segments,
+                    speakerNumberBase: speakerBase
                 )
 
                 if Task.isCancelled {
-                    SystemAudioCapture.cleanupBufferFile(bufferURL)
+                    cleanupCaptureFiles()
                     phase = .cancelled
                     throw .cancelled
                 }
@@ -101,14 +142,22 @@ final class PostProcessingJob: Identifiable {
                     if let results, !results.isEmpty {
                         try TranscriptFinalizer.rebuildFromDiarizedSegments(
                             snapshot: &handle.transcript,
-                            diarizedSegments: results
+                            diarizedSegments: results,
+                            preserveYou: preserveYou
                         )
-                    } else {
+                        didRebuildSpeakers = true
+                    } else if handle.sessionType == .callCapture {
+                        // Call-capture fallback: relabel "Them" by overlap when re-transcription
+                        // produced nothing. Mic-only sessions have no "Them" lines to relabel,
+                        // so they keep the live "You" transcript instead.
                         diagLog("[JOB \(id)] re-transcription empty, falling back to relabel")
                         try TranscriptFinalizer.rewriteWithDiarization(
                             snapshot: &handle.transcript,
                             segments: segments
                         )
+                        didRebuildSpeakers = true
+                    } else {
+                        diagLog("[JOB \(id)] mic re-transcription empty — keeping live 'You' transcript")
                     }
                 } catch {
                     handleDurableWriteFailure(bufferURL: bufferURL, error: error)
@@ -137,20 +186,24 @@ final class PostProcessingJob: Identifiable {
         //     Keyed by the same "Speaker N" labels as the body so a downstream consumer
         //     can bind a centroid to the name the user confirms during speaker tagging.
         if exportVoiceprints {
-            if let diar = diarOutput,
-               let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
+            // Skip when the body wasn't rebuilt into Speaker labels (e.g. a solo voice memo
+            // kept as "You"): the sidecar keys must match the transcript's speaker labels,
+            // and `startingAt` must equal the base the body rewrite used.
+            if didRebuildSpeakers,
+               let diar = diarOutput,
+               let sidecar = VoiceprintSidecar.build(from: diar, source: voiceprintSource, includesYou: voiceprintIncludesYou, startingAt: speakerBase) {
                 let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath)
                 do {
                     try VoiceprintSidecar.write(sidecar, to: sidecarURL)
                     TranscriptFinalizer.setVoiceprintsLink(filePath: savedPath, sidecarFilename: sidecarURL.lastPathComponent)
-                    diagLog("[JOB \(id)] wrote \(sidecar.speakers.count) voiceprints → \(sidecarURL.lastPathComponent)")
+                    diagLog("[JOB \(id)] wrote \(sidecar.speakers.count) voiceprints (source=\(voiceprintSource)) → \(sidecarURL.lastPathComponent)")
                 } catch {
                     diagLog("[JOB \(id)] voiceprint sidecar write failed (non-fatal): \(error)")
                 }
             } else {
-                // Opt-in was on but diarization yielded no centroids (no system speech, too
-                // short, or a backend that doesn't expose them) — say so rather than going silent.
-                diagLog("[JOB \(id)] voiceprints enabled but none emitted (no diarization centroids for this session)")
+                // Opt-in was on but there's nothing to emit (no rebuilt speakers, no system
+                // speech, too short, or a backend without centroids) — say so, don't go silent.
+                diagLog("[JOB \(id)] voiceprints enabled but none emitted (no rebuilt speakers / centroids for this session)")
             }
         }
 

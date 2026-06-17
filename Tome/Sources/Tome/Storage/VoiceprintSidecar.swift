@@ -54,10 +54,10 @@ struct VoiceprintSidecar: Codable, Sendable {
     /// "SPEAKER_n" ids to the friendly labels the transcript body uses, via the shared
     /// `speakerLabels` map, so the keys line up with what the speaker-tag step sees.
     /// Returns nil when there is nothing worth writing.
-    static func build(from diar: DiarizationOutput, source: String, includesYou: Bool) -> VoiceprintSidecar? {
+    static func build(from diar: DiarizationOutput, source: String, includesYou: Bool, startingAt: Int = 2) -> VoiceprintSidecar? {
         guard !diar.centroids.isEmpty else { return nil }
 
-        let labelMap = speakerLabels(from: diar.segments.map(\.speakerId))
+        let labelMap = speakerLabels(from: diar.segments.map(\.speakerId), startingAt: startingAt)
 
         var activeSeconds: [String: Double] = [:]
         var segmentCounts: [String: Int] = [:]

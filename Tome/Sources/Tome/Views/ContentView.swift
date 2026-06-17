@@ -522,10 +522,14 @@ struct ContentView: View {
                     recordingContext: recordingContext
                 )
             } else {
+                // Voice memos / in-person meetings are mic-only: skip system-audio
+                // capture so the mic is the sole source and post-session diarization
+                // runs on the mic track (see PostProcessingJob).
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    recordingContext: recordingContext
+                    recordingContext: recordingContext,
+                    captureSystemAudio: false
                 )
             }
 

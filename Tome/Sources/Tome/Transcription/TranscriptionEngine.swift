@@ -7,9 +7,9 @@ import SpeakerKit
 import WhisperKit
 
 /// Subsystem all of Tome's logging shares. Matches the per-type `Logger`s (e.g.
-/// `StreamingTranscriber`) so `log show --predicate 'subsystem == "io.gremble.tome"'`
+/// `StreamingTranscriber`) so `log show --predicate 'subsystem == "com.dloomis.tome"'`
 /// returns everything in one stream.
-let tomeLogSubsystem = "io.gremble.tome"
+let tomeLogSubsystem = "com.dloomis.tome"
 
 private let diagLogger = Logger(subsystem: tomeLogSubsystem, category: "diag")
 
@@ -88,7 +88,8 @@ final class TranscriptionEngine {
         locale: Locale,
         inputDeviceID: AudioDeviceID = 0,
         appBundleID: String? = nil,
-        recordingContext: SessionRecordingContext? = nil
+        recordingContext: SessionRecordingContext? = nil,
+        captureSystemAudio: Bool = true
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
@@ -135,21 +136,30 @@ final class TranscriptionEngine {
         diagLog("[ENGINE-3] starting mic capture, targetMicID=\(String(describing: targetMicID)), micBuffer=\(currentMicBufferURL?.lastPathComponent ?? "nil")")
         let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
-        // 3. Start system audio capture
-        diagLog("[ENGINE-4] starting system audio capture...")
+        // 3. Start system audio capture. Skipped for mic-only sessions (voice memos /
+        //    in-person meetings) — there the mic is the sole source and diarization runs
+        //    on the mic track, so capturing system audio would only add a stray "Them"
+        //    stream and a needless ScreenCaptureKit permission prompt.
         let sysStreams: SystemAudioCapture.CaptureStreams?
-        do {
-            sysStreams = try await systemCapture.bufferStream(
-                appBundleID: appBundleID,
-                recordingContext: recordingContext
-            )
-            currentBufferURL = sysStreams?.bufferURL
-            diagLog("[ENGINE-5] system audio capture started OK")
-        } catch {
-            let msg = "Failed to start system audio: \(error.localizedDescription)"
-            diagLog("[ENGINE-5-FAIL] \(msg)")
-            lastError = msg
+        if captureSystemAudio {
+            diagLog("[ENGINE-4] starting system audio capture...")
+            do {
+                sysStreams = try await systemCapture.bufferStream(
+                    appBundleID: appBundleID,
+                    recordingContext: recordingContext
+                )
+                currentBufferURL = sysStreams?.bufferURL
+                diagLog("[ENGINE-5] system audio capture started OK")
+            } catch {
+                let msg = "Failed to start system audio: \(error.localizedDescription)"
+                diagLog("[ENGINE-5-FAIL] \(msg)")
+                lastError = msg
+                sysStreams = nil
+            }
+        } else {
+            diagLog("[ENGINE-4] system audio capture skipped (mic-only session)")
             sysStreams = nil
+            currentBufferURL = nil
         }
 
         // 4. Start mic transcription
@@ -487,7 +497,8 @@ final class TranscriptionEngine {
     nonisolated static func reTranscribe(
         asrCoordinator: ASRCoordinator,
         bufferURL: URL,
-        segments: [DiarizedSegment]
+        segments: [DiarizedSegment],
+        speakerNumberBase: Int = 2
     ) async -> [ReTranscribedSegment]? {
         guard FileManager.default.fileExists(atPath: bufferURL.path) else {
             diagLog("[RETRANSCRIBE] FAILED: Buffer file missing at \(bufferURL.path)")
@@ -499,7 +510,8 @@ final class TranscriptionEngine {
         let transcriber = SegmentReTranscriber(
             asrCoordinator: asrCoordinator,
             fileURL: bufferURL,
-            segments: segments
+            segments: segments,
+            speakerNumberBase: speakerNumberBase
         )
         let results = await transcriber.run()
 

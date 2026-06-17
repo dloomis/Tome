@@ -9,9 +9,9 @@ people are tagged by voice, locally, with nothing leaving the machine.
 The signal is acoustic; the binding is human-once-then-automatic; the `Speaker N` label is
 the join key between Tome's artifact and WhisperCal's confirmation.
 
-**Status: shipped (phases 1–3 + backfill), across two repos:**
-- **Tome** — emits the sidecar (`VoiceprintSidecar`) + a diagnostic/backfill CLI
-  (`Sources/VoiceprintAudit/`).
+**Status: shipped (phases 1–3 + backfill + mic/in-person diarization), across two repos:**
+- **Tome** — emits the sidecar (`VoiceprintSidecar`) for both call-capture (system stream)
+  and mic-only in-person sessions, plus a diagnostic/backfill CLI (`Sources/VoiceprintAudit/`).
 - **WhisperCal** — enrollment, matching, and self-heal (`VoiceprintEnroller`,
   `VoiceprintMatcher`).
 
@@ -30,10 +30,22 @@ refuse to compare vectors across differing models.
 
 When `AppSettings.exportVoiceprints` is on (Settings ▸ Output, off by default),
 `PostProcessingJob` writes a sidecar next to the finalized transcript after diarization.
-The orphaned-WAV recovery path (`Recovery.run`, used when a crash skipped post-processing)
-emits the same sidecar after it re-diarizes and rebuilds the transcript. Keys are the
-**same `Speaker N` labels used in the transcript body** (`speakerLabels`, encounter order
-from 2) so they line up with what WhisperCal's speaker-tag modal shows as `original_name`.
+Which stream is diarized depends on the session:
+
+- **Call capture** diarizes the **system ("them")** WAV; the live mic track stays "You",
+  the implicit Speaker 1 excluded from diarization. → `source: "system"`,
+  `includesYou: false`, labels numbered from **2**.
+- **Voice memo / in-person meeting** is mic-only (no system capture), so it diarizes the
+  **mic** WAV itself — every speaker, including the recording user, comes from the diarizer.
+  → `source: "mic"`, `includesYou: true`, labels numbered from **1**. A solo memo (≤1
+  detected speaker) keeps its "You" transcript and writes no sidecar.
+
+Keys are the **same `Speaker N` labels used in the transcript body** (`speakerLabels`, in
+encounter order from the per-session base) so they line up with what WhisperCal's
+speaker-tag modal shows as `original_name`. The orphaned-WAV recovery path (`Recovery.run`,
+used when a crash skipped post-processing) emits the same sidecar for the
+call-capture/system stream; mic-only crash recovery is not yet wired (the orphan scanner
+skips `.mic.wav` companions).
 
 Sidecar — `<transcript-stem>.voiceprints.json`, also referenced by a `voiceprints:`
 frontmatter key so the link survives a later rename:
@@ -54,15 +66,18 @@ frontmatter key so the link survives a later rename:
 
 - `model` — embedding-space identity; matches are refused across mismatches. Bump when the
   diarization model changes.
-- `source` — `system` (the diarized stream is system audio). `mic` / `mixed` reserved for
-  the voice-memo and backfill paths.
-- `includesYou` — false (you are the un-diarized mic channel). Reserved for voice-memo
-  diarization, where you *are* a diarized speaker.
+- `source` — which stream was diarized: `system` (call capture), `mic` (voice memo /
+  in-person meeting), or `mixed` (the backfill CLI re-diarizing a retained mono mix).
+- `includesYou` — `false` when the recording user is the un-diarized mic channel (call
+  capture); `true` for a mic-only session, where you *are* one of the diarized speakers
+  (Tome doesn't label which — WhisperCal binds it on confirmation, learning your own print).
 - `activeSeconds` / `segmentCount` — per-speaker quality signal so the consumer can refuse
   a flimsy drive-by centroid.
 
-`You` is never written here; voice memos (no system stream) write no sidecar. These are
-biometric vectors, hence the opt-in toggle.
+For call capture, `You` is never written here (it's the un-diarized mic channel); for a
+mic-only session the user *is* one of the `Speaker N` prints, just not labeled as such. A
+solo voice memo (≤1 speaker) writes no sidecar. These are biometric vectors, hence the
+opt-in toggle.
 
 ## Phase 2 — WhisperCal enrollment (on Apply)
 
@@ -105,6 +120,9 @@ swift run VoiceprintAudit [--enroll <Caches/Voiceprints folder>] "<m4a>" ["<m4a>
 
 ## What's left
 
-- **Enroll You** — capture your own print from the clean call-capture mic channel.
-- **Voice-memo diarization** — diarize the mic stream and relabel the single `You` block
-  into N speakers, powered by the enrolled prints.
+- **Enroll You** — capture your own print from the clean call-capture mic channel. (Mic-only
+  in-person sessions already include your print among the `Speaker N` prints — just not
+  labeled as yours.)
+- **Mic-only crash recovery** — `OrphanScanner` skips `.mic.wav` files and `Recovery`
+  assumes a system stream, so an in-person session that crashed before post-processing
+  isn't offered for recovery.

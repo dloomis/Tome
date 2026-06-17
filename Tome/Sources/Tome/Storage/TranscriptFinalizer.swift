@@ -6,13 +6,17 @@ import Foundation
 /// that `finalizeFrontmatter` then uses.
 enum TranscriptFinalizer {
 
-    /// Rebuild the transcript by replacing all "Them" utterances with re-transcribed,
-    /// per-speaker segments from the diarization pipeline. Preserves "You" utterances
-    /// and interleaves them with diarized segments on the timeline. Updates
-    /// `snapshot.speakersDetected` to the post-diarization speaker set.
+    /// Rebuild the transcript from re-transcribed, per-speaker diarization segments.
+    /// When `preserveYou` is true (call capture), the live "You" mic utterances are parsed
+    /// out and interleaved with the diarized "them" segments on the timeline — only "Them"
+    /// is replaced. When false (mic-only in-person sessions, where the mic *is* the diarized
+    /// stream), the body is replaced wholesale by the diarized segments; preserving "You"
+    /// would duplicate every word. Updates `snapshot.speakersDetected` to the
+    /// post-diarization speaker set.
     static func rebuildFromDiarizedSegments(
         snapshot: inout TranscriptSessionSnapshot,
-        diarizedSegments: [ReTranscribedSegment]
+        diarizedSegments: [ReTranscribedSegment],
+        preserveYou: Bool = true
     ) throws(PostProcessingError) {
         let filePath = snapshot.filePath
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
@@ -26,7 +30,7 @@ enum TranscriptFinalizer {
         let youPattern = #"\*\*You\*\* \(([\d.]+)\)\n(.*?)(?=\n\n|\z)"#
         let youRegex = try? NSRegularExpression(pattern: youPattern, options: .dotMatchesLineSeparators)
         var youUtterances: [(offset: Double, text: String)] = []
-        if let youRegex {
+        if preserveYou, let youRegex {
             let nsBody = body as NSString
             let youMatches = youRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
             for match in youMatches {
