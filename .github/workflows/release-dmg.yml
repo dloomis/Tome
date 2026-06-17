@@ -2,6 +2,11 @@ name: Build macOS DMG
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v1.3.0)"
+        required: true
+        type: string
   release:
     types: [published]
 
@@ -13,6 +18,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Build the tagged commit: a release event supplies the tag; a manual
+          # dispatch supplies it via the `tag` input (forks don't fire release events).
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Select Xcode 26
         run: |
@@ -20,9 +29,8 @@ jobs:
           swift --version
 
       - name: Set version from tag
-        if: github.event_name == 'release'
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
           VERSION="${TAG#v}"
           PLIST="Tome/Sources/Tome/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST"
@@ -97,14 +105,16 @@ jobs:
           path: dist/Tome.dmg
 
       - name: Attach DMG to Release
-        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} dist/Tome.dmg --clobber
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          # Ensure a release exists for this tag (always true for a release event;
+          # a dispatch may target a tag whose release was deleted or never created).
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Tome ${TAG#v}" --generate-notes
+          gh release upload "$TAG" dist/Tome.dmg --clobber
 
       - name: Sign DMG and update appcast
-        if: github.event_name == 'release'
         env:
           SPARKLE_EDDSA_KEY: ${{ secrets.SPARKLE_EDDSA_KEY }}
           GH_TOKEN: ${{ github.token }}
@@ -117,7 +127,7 @@ jobs:
             exit 0
           fi
 
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
           VERSION="${TAG#v}"
           DMG_PATH="dist/Tome.dmg"
 
