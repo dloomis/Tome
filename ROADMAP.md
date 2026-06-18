@@ -16,3 +16,6 @@ Automatically detect when a meeting starts in Google Meet, Microsoft Teams, or Z
 
 **Multi-language support**
 Transcription currently defaults to English. Add a language picker so sessions can be transcribed in other languages.
+
+**Stealth mode**
+Hide the Tome app from screen capture so it doesn't appear when sharing your desktop during a meeting.
