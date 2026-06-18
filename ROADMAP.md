@@ -10,3 +10,6 @@ Upstream fixes to the ASR pipeline: source-specific decoder state reset and a th
 
 **JSONL crash recovery**
 Rebuild transcripts from session data if the app exits mid-session.
+
+**Meeting autodetection**
+Automatically detect when a meeting starts in Google Meet, Microsoft Teams, or Zoom and prompt to start recording — no manual capture toggling.
