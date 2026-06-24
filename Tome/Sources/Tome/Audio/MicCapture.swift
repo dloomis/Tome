@@ -265,12 +265,23 @@ final class MicCapture: @unchecked Sendable {
             status = AudioObjectGetPropertyDataSize(deviceID, &inputAddress, 0, nil, &bufferListSize)
             guard status == noErr, bufferListSize > 0 else { continue }
 
-            let bufferListPtr = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+            // AudioBufferList is a variable-length struct: its C definition carries a
+            // single AudioBuffer inline, but a device with multiple input streams reports
+            // a `bufferListSize` covering mNumberBuffers buffers. Allocating one
+            // `AudioBufferList` (room for a single buffer) and then letting CoreAudio
+            // write the full `bufferListSize` overflows the heap. Allocate the exact
+            // reported byte count instead.
+            let bufferListPtr = UnsafeMutableRawPointer.allocate(
+                byteCount: Int(bufferListSize),
+                alignment: MemoryLayout<AudioBufferList>.alignment
+            )
             defer { bufferListPtr.deallocate() }
             status = AudioObjectGetPropertyData(deviceID, &inputAddress, 0, nil, &bufferListSize, bufferListPtr)
             guard status == noErr else { continue }
 
-            let bufferList = UnsafeMutableAudioBufferListPointer(bufferListPtr)
+            let bufferList = UnsafeMutableAudioBufferListPointer(
+                bufferListPtr.assumingMemoryBound(to: AudioBufferList.self)
+            )
             let inputChannels = bufferList.reduce(0) { $0 + Int($1.mNumberChannels) }
             guard inputChannels > 0 else { continue }
 
