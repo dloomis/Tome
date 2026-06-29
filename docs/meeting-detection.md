@@ -61,13 +61,20 @@ API suggestedFilename  >  API meetingContext.subject  >  autodetected title  >  
 ```
 
 ```swift
-let effectiveContext = meetingContext   // API caller — authoritative
-    ?? detectedMeeting.map { MeetingContext(subject: $0.title, …) }   // fallback
+let apiNamePresent = meetingContext != nil || suggestedFilename != nil
+let effectiveContext = meetingContext               // API caller — authoritative
+    ?? (apiNamePresent ? nil                        // API named it (even filename-only) → no autodetect
+        : detectedMeeting.map { MeetingContext(subject: $0.title, …) })   // else fall back
 ```
 
 API-initiated sessions pass their own `meetingContext`/`suggestedFilename` and never
-pass `detectedMeeting`, so **API meeting info always overrides autodetection**.
-`suggestedFilename` (API only) additionally outranks all context in the finalizer.
+pass `detectedMeeting`, so **API meeting info always overrides autodetection**. The two
+name sources are therefore mutually exclusive per `startSession` call; the `apiNamePresent`
+guard makes the rule hold defensively even if a future caller passed both — and keeps the
+**displayed** title (`effectiveContext.subject`, shown in the Stop subtitle) in lockstep
+with the saved filename, so a `suggestedFilename`-only call never shows an autodetected
+name the transcript won't actually use. `suggestedFilename` (API only) additionally
+outranks all context in the finalizer.
 
 ## UX
 
