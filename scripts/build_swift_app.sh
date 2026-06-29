@@ -84,36 +84,55 @@ if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
   if [[ -z "$CODESIGN_IDENTITY" ]]; then
     CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
   fi
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    # Stable self-signed code-signing cert (free, no Apple account). Matched by name
+    # (default "Tome Self-Signed", override with SELF_SIGNED_IDENTITY) so a local build
+    # picks it up automatically once imported — letting macOS keep Screen Recording /
+    # Microphone grants across updates instead of re-prompting every release.
+    CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "${SELF_SIGNED_IDENTITY:-Tome Self-Signed}" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
+  fi
 fi
 
 ENTITLEMENTS="$SWIFT_DIR/Sources/Tome/Tome.entitlements"
 
-# Decide how to sign. A real "Developer ID Application" identity gives a
-# notarizable, Gatekeeper-clean build. With no identity we fall back to an
-# ad-hoc signature (`-`): free, requires no Apple Developer account, and — unlike
-# leaving the bundle unsigned — keeps it launchable on Apple Silicon. (The
-# install_name_tool call above invalidates the linker's automatic signature, and
-# an invalid signature makes macOS report the app as "damaged" rather than merely
-# "from an unidentified developer". Re-signing ad-hoc avoids that.)
-if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  ADHOC=0
-  echo "Signing with Developer ID: $CODESIGN_IDENTITY"
-else
-  ADHOC=1
-  echo "No Developer ID identity found — applying an ad-hoc signature (free, unsigned distribution)."
+# Decide how to sign:
+#   developerid — a real "Developer ID Application" cert → hardened runtime + secure
+#                 timestamp: the notarizable, Gatekeeper-clean path.
+#   stable      — any other real identity (a self-signed code-signing cert, or an
+#                 "Apple Development" cert). A *stable* signing identity is all macOS
+#                 TCC needs to keep Screen Recording / Microphone grants across updates,
+#                 so this is the "free, no $99 account, but stop re-prompting" path. We
+#                 sign plainly (entitlements only) — hardened runtime + secure timestamp
+#                 are notarization-only and would add library-validation / network risk
+#                 for a cert that can't be notarized anyway.
+#   adhoc       — no identity → ad-hoc (`-`): free and launchable, but its code hash
+#                 changes every build, so macOS re-prompts for permissions each update.
+#                 (Re-signing ad-hoc is still required: the install_name_tool call above
+#                 invalidates the linker's automatic signature, and an invalid signature
+#                 makes macOS report the app as "damaged" rather than merely
+#                 "from an unidentified developer".)
+if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
+  SIGN_MODE="adhoc"
+  echo "No signing identity found — applying an ad-hoc signature (free, unsigned distribution)."
   echo "Users will see an 'unidentified developer' prompt on first launch; see README ▸ Install."
+elif [[ "$CODESIGN_IDENTITY" == *"Developer ID Application"* ]]; then
+  SIGN_MODE="developerid"
+  echo "Signing with Developer ID (notarizable): $CODESIGN_IDENTITY"
+else
+  SIGN_MODE="stable"
+  echo "Signing with a stable identity (no hardened runtime, not notarized): $CODESIGN_IDENTITY"
 fi
 
-# Sign one path. Hardened runtime + secure timestamp are notarization
-# prerequisites and only apply to a real Developer ID signature; ad-hoc uses
-# neither. Extra args (e.g. --entitlements) are passed through before the path.
+# Sign one path. Hardened runtime + secure timestamp are notarization prerequisites
+# and apply only to a real Developer ID signature. Extra args (e.g. --entitlements)
+# are passed through before the path.
 sign_path() {
   local path="$1"; shift
-  if [[ "$ADHOC" -eq 1 ]]; then
-    codesign --force "$@" --sign - "$path"
-  else
-    codesign --force --options runtime --timestamp "$@" --sign "$CODESIGN_IDENTITY" "$path"
-  fi
+  case "$SIGN_MODE" in
+    adhoc)       codesign --force "$@" --sign - "$path" ;;
+    stable)      codesign --force "$@" --sign "$CODESIGN_IDENTITY" "$path" ;;
+    developerid) codesign --force --options runtime --timestamp "$@" --sign "$CODESIGN_IDENTITY" "$path" ;;
+  esac
 }
 
 # Sign Sparkle components inside-out (innermost first)
@@ -148,7 +167,7 @@ fi
 # Sign the main app bundle (entitlements apply in both modes)
 sign_path "$APP_DIR" --entitlements "$ENTITLEMENTS"
 
-echo "Code signing complete (ad-hoc: $ADHOC)"
+echo "Code signing complete (mode: $SIGN_MODE)"
 codesign -vvv "$APP_DIR" 2>&1 || true
 
 # Install to /Applications

@@ -57,20 +57,33 @@ jobs:
 
           echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_FILE"
 
-          curl -sL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o /tmp/DeveloperIDG2CA.cer
-
           security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_FILE"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_FILE"
           security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_FILE"
 
-          security import /tmp/DeveloperIDG2CA.cer -k "$KEYCHAIN_FILE" -T /usr/bin/codesign
+          # The Apple intermediate CA only matters for a Developer ID chain; a
+          # self-signed code-signing cert is its own chain, so this is best-effort.
+          if curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o /tmp/DeveloperIDG2CA.cer; then
+            security import /tmp/DeveloperIDG2CA.cer -k "$KEYCHAIN_FILE" -T /usr/bin/codesign || true
+          fi
+
           security import "$CERT_FILE" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_FILE"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_FILE"
           security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
 
           rm -f "$CERT_FILE" /tmp/DeveloperIDG2CA.cer
 
-          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_FILE" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+          # First code-signing identity in this ephemeral keychain — it holds only the
+          # cert we just imported, so this resolves a self-signed cert (named anything)
+          # or a Developer ID cert alike. build_swift_app.sh picks the signing mode from
+          # the identity name (Developer ID → hardened+timestamp; otherwise stable).
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_FILE" | grep '"' | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::MACOS_CERTIFICATE imported but no code-signing identity was found — check the .p12 (cert + private key, Code Signing usage) and MACOS_CERTIFICATE_PWD."
+            security find-identity -v -p codesigning "$KEYCHAIN_FILE" || true
+            exit 1
+          fi
+          echo "Resolved signing identity: $IDENTITY"
           echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           echo "KEYCHAIN_FILE=$KEYCHAIN_FILE" >> "$GITHUB_ENV"
 
