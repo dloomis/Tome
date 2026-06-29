@@ -1,19 +1,8 @@
 import SwiftUI
 import AppKit
 
-private let conferencingBundleIDs: [String: String] = [
-    "com.microsoft.teams2": "Teams",
-    "com.microsoft.teams": "Teams",
-    "us.zoom.xos": "Zoom",
-    "com.apple.FaceTime": "FaceTime",
-    "com.tinyspeck.slackmacgap": "Slack",
-    "com.cisco.webexmeetingsapp": "Webex",
-    "Cisco-Systems.Spark": "Webex",
-    "com.google.Chrome": "Chrome",
-    "company.thebrowser.Browser": "Arc",
-    "com.apple.Safari": "Safari",
-    "com.microsoft.edgemac": "Edge",
-]
+// The conferencing-app table lives in `MeetingDetector.swift` (`conferencingApps` /
+// `conferencingAppName`) so detection and source-app labeling share one source of truth.
 
 struct ContentView: View {
     @Bindable var settings: AppSettings
@@ -26,6 +15,15 @@ struct ContentView: View {
     @State private var audioLevel: Float = 0
     @State private var activeSessionType: SessionType?
     @State private var detectedAppName: String?
+    /// Latest passively-detected active meeting (Teams / Google Meet). Drives the
+    /// pre-start naming chip. Nil when nothing is detected, screen-recording permission
+    /// isn't granted, or a session is running.
+    @State private var detectedMeeting: DetectedMeeting?
+    /// Title the user explicitly dismissed (✕). Suppresses the chip for that exact
+    /// meeting; a different title re-arms it. Cleared when a session ends.
+    @State private var dismissedMeetingTitle: String?
+    /// Meeting title applied to the in-flight session, shown in the Stop subtitle.
+    @State private var activeMeetingTitle: String?
     @State private var silenceSeconds: Int = 0
     /// True while the silence stop-confirmation prompt (in-app + notification) is
     /// up. Recording continues until the user answers; cleared when audio resumes
@@ -96,15 +94,18 @@ struct ContentView: View {
                 activeSessionType: activeSessionType,
                 audioLevel: audioLevel,
                 detectedApp: detectedAppName,
+                detectedMeetingName: suggestedMeeting?.title,
+                activeMeetingTitle: activeMeetingTitle,
                 silenceSeconds: silenceSeconds,
                 silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
                 silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
-                onStartCallCapture: { startSession(type: .callCapture) },
+                onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession,
-                onKeepRecording: dismissSilencePrompt
+                onKeepRecording: dismissSilencePrompt,
+                onDismissMeeting: { dismissedMeetingTitle = detectedMeeting?.title }
             )
         }
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
@@ -249,6 +250,23 @@ struct ContentView: View {
                 if let err = await services.transcriptLogger.lastError {
                     transcriptionEngine?.lastError = err
                 }
+            }
+        }
+        // Active-meeting detection (pre-start naming). Passive window-title scan via
+        // SCShareableContent — uses the screen-recording permission Tome already holds
+        // and never prompts (see MeetingDetector.scan). Idle-only; the chip is gated
+        // on `suggestedMeeting`, which requires `!isRunning`.
+        .task {
+            while !Task.isCancelled {
+                if !isRunning {
+                    let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                    let result = await MeetingDetector.scan(frontmostBundleID: front)
+                    if result != detectedMeeting {
+                        detectedMeeting = result
+                        if let result { diagLog("[DETECT] \(result.appName) meeting detected") }
+                    }
+                }
+                try? await Task.sleep(for: .seconds(3))
             }
         }
         .onChange(of: settings.inputDeviceID) {
@@ -408,6 +426,14 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// The detected meeting to actually offer, after the global toggle, the per-meeting
+    /// dismissal, and the not-recording gate. Nil → Call Capture uses the default label.
+    private var suggestedMeeting: DetectedMeeting? {
+        guard !isRunning, settings.useDetectedMeetingNames,
+              let m = detectedMeeting, m.title != dismissedMeetingTitle else { return nil }
+        return m
+    }
+
     private func formatTime(_ s: Int) -> String {
         "\(s / 60):\(String(format: "%02d", s % 60))"
     }
@@ -433,7 +459,7 @@ struct ContentView: View {
         NotificationPresenter.shared.clearSilencePrompt()
     }
 
-    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil) {
+    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
         transcriptStore.clear()
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
@@ -455,7 +481,7 @@ struct ContentView: View {
             outputPath = settings.vaultMeetingsPath
             if let frontApp = NSWorkspace.shared.frontmostApplication,
                let bundleID = frontApp.bundleIdentifier,
-               let appName = conferencingBundleIDs[bundleID] {
+               let appName = conferencingAppName(bundleID) {
                 sourceApp = appName
                 appBundleID = bundleID
                 resolvedAppName = appName
@@ -467,10 +493,27 @@ struct ContentView: View {
             sourceApp = "Voice Memo"
         }
 
+        // Resolve the meeting name to apply. An API-supplied name always overrules what
+        // Tome autodetected — and that must hold for the *displayed* title (driven by
+        // effectiveContext.subject below), not just the resulting filename. The finalizer
+        // names the file `suggestedFilename` → context(subject) → timestamp; so once the
+        // API has supplied *any* name (a subject or a suggestedFilename), autodetection is
+        // suppressed here too, keeping the on-screen title and the saved name in lockstep.
+        // Autodetection only drives the title when the API named nothing at all.
+        let apiNamePresent = meetingContext != nil || suggestedFilename != nil
+        let effectiveContext: MeetingContext? = meetingContext
+            ?? (apiNamePresent
+                ? nil
+                : detectedMeeting.map { MeetingContext(subject: $0.title, attendees: nil, calendarEventId: nil, startTime: nil) })
+
         Task {
             transcriptionEngine?.lastError = nil
             await services.sessionStore.startSession(sessionId: sid)
-            apiServer.sessionDidStart(id: sid)
+            apiServer.sessionDidStart(
+                id: sid,
+                subject: effectiveContext?.subject,
+                suggestedFilename: suggestedFilename
+            )
             let transcriptURL: URL
             do {
                 transcriptURL = try await services.transcriptLogger.startSession(
@@ -496,13 +539,14 @@ struct ContentView: View {
                 return
             }
 
-            // Forward meeting context from API callers to the transcript
-            if let ctx = meetingContext, let subject = ctx.subject {
+            // Apply the meeting context (API caller, else autodetected) to the transcript.
+            if let subject = effectiveContext?.subject {
                 await services.transcriptLogger.updateContext(subject)
             }
 
             activeSessionType = type
             detectedAppName = resolvedAppName
+            activeMeetingTitle = effectiveContext?.subject
             currentSessionId = sid
             currentSourceApp = sourceApp
 
@@ -571,6 +615,9 @@ struct ContentView: View {
         // Return the UI to idle: the control bar shows Start, not Stop.
         activeSessionType = nil
         detectedAppName = nil
+        detectedMeeting = nil
+        dismissedMeetingTitle = nil
+        activeMeetingTitle = nil
         currentSessionId = nil
         currentSourceApp = nil
         silenceSeconds = 0
@@ -586,6 +633,9 @@ struct ContentView: View {
 
         activeSessionType = nil
         detectedAppName = nil
+        detectedMeeting = nil
+        dismissedMeetingTitle = nil
+        activeMeetingTitle = nil
         silenceSeconds = 0
         silencePromptActive = false
         NotificationPresenter.shared.clearSilencePrompt()

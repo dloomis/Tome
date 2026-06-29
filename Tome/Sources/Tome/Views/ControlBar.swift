@@ -18,6 +18,11 @@ struct ControlBar: View {
     let activeSessionType: SessionType?
     let audioLevel: Float
     let detectedApp: String?
+    /// Name of an auto-detected active meeting to offer for the Call Capture filename,
+    /// already filtered by dismissal + the global toggle. Nil → no chip.
+    let detectedMeetingName: String?
+    /// Meeting title applied to the in-flight session (shown in the Stop subtitle).
+    let activeMeetingTitle: String?
     let silenceSeconds: Int
     let silenceAutoStopSeconds: Int
     let silencePromptActive: Bool
@@ -27,6 +32,7 @@ struct ControlBar: View {
     let onStartVoiceMemo: () -> Void
     let onStop: () -> Void
     let onKeepRecording: () -> Void
+    let onDismissMeeting: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -93,6 +99,9 @@ struct ControlBar: View {
                         .padding(.bottom, 4)
                 }
             } else {
+                if let meetingName = detectedMeetingName {
+                    detectedMeetingChip(meetingName)
+                }
                 HStack(spacing: 10) {
                     Button(action: onStartCallCapture) {
                         HStack(spacing: 6) {
@@ -192,6 +201,32 @@ struct ControlBar: View {
         .padding(.bottom, 10)
     }
 
+    /// Pre-start chip naming the detected meeting. Tapping ✕ ignores this detection so
+    /// Call Capture falls back to the default label (`onDismissMeeting`).
+    private func detectedMeetingChip(_ name: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "video.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.accent1)
+            Text("Meeting: \(name)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.fg1)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 6)
+            Button(action: onDismissMeeting) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.fg3)
+            }
+            .buttonStyle(.plain)
+            .help("Ignore — use the default Call Capture label")
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
     private func formatSilence(_ s: Int) -> String {
         s < 60 ? "\(s)s" : "\(s / 60):\(String(format: "%02d", s % 60))"
     }
@@ -199,6 +234,9 @@ struct ControlBar: View {
     private var activeSessionLabel: String {
         switch activeSessionType {
         case .callCapture:
+            if let title = activeMeetingTitle, !title.isEmpty {
+                return "Call Capture · \(title)"
+            }
             if let app = detectedApp {
                 return "Call Capture · \(app)"
             }

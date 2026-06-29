@@ -12,7 +12,7 @@ Upstream fixes to the ASR pipeline: source-specific decoder state reset and a th
 Rebuild transcripts from session data if the app exits mid-session.
 
 **Meeting autodetection**
-Automatically detect when a meeting starts in Google Meet, Microsoft Teams, or Zoom and prompt to start recording — no manual capture toggling.
+Detect the active meeting in Google Meet, Microsoft Teams, or Zoom. Shipped: the detected meeting name auto-fills the Call Capture filename, shown as a dismissible chip (see `docs/meeting-detection.md`). Still planned: automatically prompt to start recording when a meeting begins — no manual capture toggling.
 
 **Multi-language support**
 Transcription currently defaults to English. Add a language picker so sessions can be transcribed in other languages.

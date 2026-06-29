@@ -95,6 +95,13 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(filenameVoiceLabel, forKey: "filenameVoiceLabel") }
     }
 
+    /// When true (default), a Call Capture started from the menu adopts the name of an
+    /// auto-detected active meeting (Teams / Google Meet) in place of `filenameCallLabel`.
+    /// Per-meeting dismissal and any API-supplied name always take priority.
+    var useDetectedMeetingNames: Bool {
+        didSet { UserDefaults.standard.set(useDetectedMeetingNames, forKey: "useDetectedMeetingNames") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -121,6 +128,9 @@ final class AppSettings {
         self.filenameDateFormat = defaults.string(forKey: "filenameDateFormat") ?? "yyyy-MM-dd HH-mm-ss"
         self.filenameCallLabel = defaults.string(forKey: "filenameCallLabel") ?? "Call Recording"
         self.filenameVoiceLabel = defaults.string(forKey: "filenameVoiceLabel") ?? "Voice Memo"
+        self.useDetectedMeetingNames = defaults.object(forKey: "useDetectedMeetingNames") == nil
+            ? true
+            : defaults.bool(forKey: "useDetectedMeetingNames")
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")

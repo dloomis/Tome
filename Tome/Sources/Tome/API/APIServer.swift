@@ -41,6 +41,12 @@ final class APIServer {
     private(set) var sessionStates: [String: SessionLifecycleState] = [:]
     private(set) var lifecycleState: SessionLifecycleState = .idle
 
+    /// The active recording's subject/title and suggested filename, set at start
+    /// and echoed from GET /status while recording or transcribing. Reset on each
+    /// start (a no-context UI start clears them) and when the session goes idle.
+    private(set) var recordingSubject: String?
+    private(set) var recordingFilename: String?
+
     init() {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
@@ -66,11 +72,16 @@ final class APIServer {
     }
 
     /// Mark a session as started (called by ContentView after startSession succeeds).
-    func sessionDidStart(id: String) {
+    /// `subject`/`suggestedFilename` are the resolved recording identity (API context,
+    /// else autodetected, else nil) echoed by GET /status; passing them here also
+    /// clears any stale values from a prior session on a no-context UI start.
+    func sessionDidStart(id: String, subject: String? = nil, suggestedFilename: String? = nil) {
         currentSessionId = id
         sessionStates[id] = .recording
         lifecycleState = .recording
         hasDiarizationCompleted = false
+        recordingSubject = subject
+        recordingFilename = suggestedFilename
     }
 
     /// Mark that recording has stopped for a specific session — its post-processing
@@ -106,6 +117,8 @@ final class APIServer {
             if lifecycleState == .complete && currentSessionId == id {
                 lifecycleState = .idle
                 currentSessionId = nil
+                recordingSubject = nil
+                recordingFilename = nil
             } else if lifecycleState == .complete {
                 // This was an older session's completion; don't touch currentSessionId.
                 lifecycleState = .idle
@@ -304,7 +317,11 @@ final class APIServer {
         currentSessionId = sessionId
         sessionElapsed = 0
         hasDiarizationCompleted = false
-        lifecycleState = .recording  // Set synchronously to prevent race with rapid duplicate requests
+        // Set synchronously to prevent races with rapid duplicate requests and with
+        // a /status poll landing before the async sessionDidStart fires.
+        lifecycleState = .recording
+        recordingSubject = req?.meetingContext?.subject
+        recordingFilename = req?.suggestedFilename
 
         onStartSession?(.callCapture, sessionId, req?.meetingContext, req?.suggestedFilename)
 
@@ -322,7 +339,21 @@ final class APIServer {
     }
 
     private func handleWhisperCalStatus() -> (Int, String) {
-        return (200, #"{"state":"\#(lifecycleState.rawValue)"}"#)
+        // Echo the active recording's identity while a session is in flight, so the
+        // caller can show *which* meeting is recording. Omitted when idle/complete,
+        // or when there's no subject/filename to report.
+        let recording: WhisperCalRecordingInfo?
+        if lifecycleState == .recording || lifecycleState == .transcribing,
+           recordingSubject != nil || recordingFilename != nil {
+            recording = WhisperCalRecordingInfo(
+                subject: recordingSubject, suggestedFilename: recordingFilename
+            )
+        } else {
+            recording = nil
+        }
+        return (200, encode(WhisperCalStatusResponse(
+            state: lifecycleState.rawValue, recording: recording
+        )))
     }
 
     // MARK: - Session Handlers
@@ -353,7 +384,11 @@ final class APIServer {
         currentSessionId = sessionId
         sessionElapsed = 0
         hasDiarizationCompleted = false
-        lifecycleState = .recording  // Set synchronously to prevent race with rapid duplicate requests
+        // Set synchronously to prevent races with rapid duplicate requests and with
+        // a /status poll landing before the async sessionDidStart fires.
+        lifecycleState = .recording
+        recordingSubject = req.meetingContext?.subject
+        recordingFilename = nil
 
         onStartSession?(type, sessionId, req.meetingContext, nil)
 
@@ -836,11 +871,11 @@ final class APIServer {
         "/status": {
           "get": {
             "summary": "Session lifecycle state (WhisperCal)",
-            "description": "Returns the lifecycle state of the current or most recent session. WhisperCal polls this after calling /stop, waiting for 'complete'.",
+            "description": "Returns the lifecycle state of the current or most recent session. WhisperCal polls this after calling /stop, waiting for 'complete'. While recording (or transcribing), also echoes the active recording's subject/suggestedFilename so the caller can show which meeting is captured; the 'recording' object is omitted when idle/complete.",
             "responses": {
               "200": {
-                "description": "Lifecycle state",
-                "content": { "application/json": { "schema": { "type": "object", "properties": { "state": { "type": "string", "enum": ["idle", "recording", "transcribing", "complete"] } } } } }
+                "description": "Lifecycle state, plus the active recording's identity while in flight.",
+                "content": { "application/json": { "schema": { "type": "object", "properties": { "state": { "type": "string", "enum": ["idle", "recording", "transcribing", "complete"] }, "recording": { "$ref": "#/components/schemas/RecordingInfo" } } } } }
               }
             }
           }
@@ -927,6 +962,14 @@ final class APIServer {
             "properties": {
               "suggestedFilename": { "type": "string", "description": "Output filename (without extension) for matching the transcript back to the meeting note." },
               "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
+            }
+          },
+          "RecordingInfo": {
+            "type": "object",
+            "description": "The active recording's identity, present on /status only while recording or transcribing.",
+            "properties": {
+              "subject": { "type": "string", "description": "Subject/title of the meeting being recorded, from the start request's meetingContext (or Tome's autodetection)." },
+              "suggestedFilename": { "type": "string", "description": "The suggestedFilename supplied at start, if any." }
             }
           },
           "StartSessionRequest": {

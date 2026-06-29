@@ -36,6 +36,21 @@ struct HealthResponse: Codable, Sendable {
     let modelsReady: Bool
 }
 
+/// The active recording's identity, echoed by GET /status while a session is
+/// recording (or transcribing) so callers can show *which* meeting is captured.
+struct WhisperCalRecordingInfo: Codable, Sendable {
+    let subject: String?
+    let suggestedFilename: String?
+}
+
+/// Response body for GET /api/v1/status (WhisperCal integration). `recording` is
+/// present only while a session is active; nil optionals are dropped by the
+/// encoder, so an idle response stays `{"state":"idle"}`.
+struct WhisperCalStatusResponse: Codable, Sendable {
+    let state: String
+    let recording: WhisperCalRecordingInfo?
+}
+
 struct SessionStartResponse: Codable, Sendable {
     let sessionId: String
     let status: String
