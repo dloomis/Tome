@@ -153,6 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var sessionStore: SessionStore?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Instrumented build: capture the faulting backtrace on a fatal signal
+        // before the process dies, so a macOS-26 SwiftUI/DesignLibrary render crash
+        // is diagnosable without the system crash report (which ages out).
+        CrashBreadcrumb.install()
+
         // Tome is a single-window utility — disable AppKit's automatic window
         // tabbing so the View menu doesn't sprout "Show Tab Bar / Show All Tabs"
         // entries from a feature we never use.

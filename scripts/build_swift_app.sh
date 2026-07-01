@@ -25,7 +25,11 @@ echo "=== Building $APP_NAME (Swift) ==="
 # Use CLT Swift 6.2 explicitly; Xcode's 6.3 has stricter concurrency that breaks FluidAudio
 SWIFT="${TOOLCHAINS_SWIFT:-/Library/Developer/CommandLineTools/usr/bin/swift}"
 cd "$SWIFT_DIR"
-"$SWIFT" build -c release 2>&1
+# EXTRA_SWIFT_BUILD_FLAGS lets an instrumented build inject diagnostics, e.g.
+#   EXTRA_SWIFT_BUILD_FLAGS="-Xswiftc -enable-actor-data-race-checks" ./scripts/build_swift_app.sh
+# See scripts/build_instrumented.sh.
+# shellcheck disable=SC2086
+"$SWIFT" build -c release ${EXTRA_SWIFT_BUILD_FLAGS:-} 2>&1
 BINARY_PATH=".build/release/Tome"
 
 if [[ ! -f "$BINARY_PATH" ]]; then
