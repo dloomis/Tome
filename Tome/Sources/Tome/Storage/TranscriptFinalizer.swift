@@ -200,12 +200,13 @@ enum TranscriptFinalizer {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
         let line = "recording: \"[[\(audioFilename)]]\""
 
-        if let range = content.range(of: #"recording: ".*""#, options: .regularExpression) {
+        if let range = content.range(of: yamlField("recording"), options: .regularExpression) {
             content.replaceSubrange(range, with: line)
-        } else if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+        } else if let range = content.range(of: yamlField("source_file"), options: .regularExpression) {
             // Land the link right under source_file, inside the existing frontmatter.
             content.insert(contentsOf: "\n" + line, at: range.upperBound)
         } else {
+            diagLog("[FINALIZER] setRecordingLink: no recording:/source_file: anchor in \(filePath.lastPathComponent) — link not written")
             return
         }
 
@@ -224,11 +225,12 @@ enum TranscriptFinalizer {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
         let line = "voiceprints: \"\(sidecarFilename)\""
 
-        if let range = content.range(of: #"voiceprints: ".*""#, options: .regularExpression) {
+        if let range = content.range(of: yamlField("voiceprints"), options: .regularExpression) {
             content.replaceSubrange(range, with: line)
-        } else if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+        } else if let range = content.range(of: yamlField("source_file"), options: .regularExpression) {
             content.insert(contentsOf: "\n" + line, at: range.upperBound)
         } else {
+            diagLog("[FINALIZER] setVoiceprintsLink: no voiceprints:/source_file: anchor in \(filePath.lastPathComponent) — link not written")
             return
         }
 
@@ -237,6 +239,17 @@ enum TranscriptFinalizer {
         } catch {
             diagLog("[FINALIZER] setVoiceprintsLink write failed (non-fatal): \(error)")
         }
+    }
+
+    /// Matches a single-line YAML frontmatter scalar field by key, regardless of
+    /// whether the value is quoted. External tools (e.g. WhisperCal) round-trip Tome's
+    /// frontmatter through a real YAML serializer, which drops the quotes Tome writes
+    /// around values that don't strictly need them (`duration: "00:00"` becomes
+    /// `duration: 00:00`) — matching broadly here means our patches keep landing even
+    /// after that round-trip, instead of silently no-op'ing against a pattern that
+    /// required quotes that are no longer there.
+    private static func yamlField(_ key: String) -> String {
+        "\(key): .*"
     }
 
     private static func rewriteFrontmatter(
@@ -260,15 +273,22 @@ enum TranscriptFinalizer {
         let sortedSpeakers = speakers.sorted()
         let attendeesYaml = sortedSpeakers.isEmpty ? "[]" : "[\"\(sortedSpeakers.joined(separator: "\", \""))\"]"
 
-        if let range = content.range(of: #"duration: "\d{2}:\d{2}""#, options: .regularExpression) {
+        if let range = content.range(of: yamlField("duration"), options: .regularExpression) {
             content.replaceSubrange(range, with: "duration: \"\(durationStr)\"")
+        } else {
+            diagLog("[FINALIZER] rewriteFrontmatter: no duration: field to patch in \(filePath.lastPathComponent)")
         }
+        // attendees: intentionally left unmatched once external tooling (WhisperCal) has
+        // restructured it into a multi-line form — this inline-array pattern only matches
+        // Tome's own single-line `attendees: [...]`, by design.
         if let range = content.range(of: #"attendees: \[.*\]"#, options: .regularExpression) {
             content.replaceSubrange(range, with: "attendees: \(attendeesYaml)")
         }
 
         if let range = content.range(of: #"\*\*Duration:\*\* \d{2}:\d{2} \| \*\*Speakers:\*\* \d+"#, options: .regularExpression) {
             content.replaceSubrange(range, with: "**Duration:** \(durationStr) | **Speakers:** \(speakers.count)")
+        } else {
+            diagLog("[FINALIZER] rewriteFrontmatter: no body Duration header to patch in \(filePath.lastPathComponent)")
         }
 
         // File rename: suggestedFilename takes precedence over context-based rename
@@ -278,8 +298,10 @@ enum TranscriptFinalizer {
             let newFilename = "\(sanitized).md"
             let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 
-            if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+            if let range = content.range(of: yamlField("source_file"), options: .regularExpression) {
                 content.replaceSubrange(range, with: "source_file: \"\(newFilename)\"")
+            } else {
+                diagLog("[FINALIZER] rewriteFrontmatter: no source_file: field to patch (rename to \(newFilename))")
             }
 
             finalPath = newPath
@@ -289,8 +311,10 @@ enum TranscriptFinalizer {
             let newFilename = "\(datePrefix) \(truncated).md"
             let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 
-            if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
+            if let range = content.range(of: yamlField("source_file"), options: .regularExpression) {
                 content.replaceSubrange(range, with: "source_file: \"\(newFilename)\"")
+            } else {
+                diagLog("[FINALIZER] rewriteFrontmatter: no source_file: field to patch (rename to \(newFilename))")
             }
 
             finalPath = newPath
