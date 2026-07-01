@@ -56,6 +56,26 @@ fi
 # Copy Info.plist
 cp "$SWIFT_DIR/Sources/Tome/Info.plist" "$APP_DIR/Contents/Info.plist"
 
+# Stamp the version from git onto the COPY, leaving the committed source
+# Info.plist untouched. The release workflow (release-dmg.yml) patches
+# CFBundleVersion/CFBundleShortVersionString with PlistBuddy too, but only in
+# its ephemeral CI checkout — that bump is never committed back, so the
+# checked-in Info.plist is just a placeholder. Deriving it here means a local
+# build always reflects the real version instead of whatever was last
+# hand-edited into that placeholder.
+LATEST_TAG=$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null || true)
+if [[ -n "$LATEST_TAG" ]]; then
+  SHORT_VERSION="${LATEST_TAG#v}"
+  GIT_DESCRIBE=$(git -C "$ROOT_DIR" describe --tags --dirty --always 2>/dev/null || echo "$LATEST_TAG")
+  BUILD_VERSION="${GIT_DESCRIBE#v}"
+  PLIST="$APP_DIR/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" "$PLIST"
+  echo "Stamped version: $SHORT_VERSION (build $BUILD_VERSION)"
+else
+  echo "No git tags found — leaving Info.plist version as committed"
+fi
+
 # Copy app icon
 ICON_PATH="$SWIFT_DIR/Sources/Tome/Assets/AppIcon.icns"
 if [[ -f "$ICON_PATH" ]]; then
