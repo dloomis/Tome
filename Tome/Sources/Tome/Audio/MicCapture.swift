@@ -4,6 +4,15 @@ import Foundation
 import os
 
 final class MicCapture: @unchecked Sendable {
+    /// Crash-resilient WAV writer retaining the mic track, plus (when a
+    /// mid-session mic restart attached a device with a different native
+    /// sample rate) a converter resampling to `_establishedFormat`'s rate
+    /// before each write.
+    private struct RetentionWriter {
+        let writer: WAVStreamWriter
+        let converter: AVAudioConverter?
+    }
+
     private let engine = AVAudioEngine()
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
@@ -11,7 +20,19 @@ final class MicCapture: @unchecked Sendable {
     /// Optional crash-resilient WAV writer for retaining the mic track. Created in
     /// `bufferStream` when a `recordOutputURL` is provided, written from the tap
     /// callback, closed in `stop()`.
-    private let _recordWriter = OSAllocatedUnfairLock<WAVStreamWriter?>(uncheckedState: nil)
+    private let _retentionWriter = OSAllocatedUnfairLock<RetentionWriter?>(uncheckedState: nil)
+
+    /// The URL + sample rate the retention WAV was most recently created fresh
+    /// at. Unlike `_retentionWriter`, this deliberately survives `stop()` — a
+    /// mid-session mic device restart calls `stop()` (to tear down the old
+    /// device's tap) immediately before calling `bufferStream` again with the
+    /// SAME `recordOutputURL`, and that next call needs to recognize "this URL
+    /// already holds a real recording" to reopen it in `.append` mode instead
+    /// of recreating it, which would reset it to a bare 44-byte header and
+    /// discard everything captured before the swap. A genuinely new session
+    /// always gets a distinct URL, so comparing by URL naturally invalidates
+    /// stale entries from a prior session without needing explicit clearing.
+    private let _establishedFormat = OSAllocatedUnfairLock<(url: URL, sampleRate: Double)?>(uncheckedState: nil)
 
     /// Wall-clock time of the first buffer delivered by the tap. Used by the
     /// post-session mixer to align the mic track to the session start. Persisted
@@ -95,20 +116,72 @@ final class MicCapture: @unchecked Sendable {
 
             diagLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
 
-            // Open the retention WAV writer (mono float32) before the tap fires.
-            self._firstSampleTime.withLock { $0 = nil }
-            self._recordWriter.withLock { writer in
-                writer?.close()
-                writer = nil
-                guard let url = recordOutputURL else { return }
-                do {
-                    writer = try WAVStreamWriter(url: url, sampleRate: tapFormat.sampleRate, channels: 1)
-                } catch {
-                    diagLog("[MIC-WAV-FAIL] could not open writer at \(url.path): \(error)")
+            // Any previously-open writer instance should already be closed by
+            // `stop()` before a restart calls back into here; close defensively
+            // in case that invariant ever changes, to avoid leaking a FileHandle.
+            self._retentionWriter.withLock { state in
+                state?.writer.close()
+                state = nil
+            }
+
+            // Open the retention WAV writer (mono float32) before the tap fires. A
+            // mid-session mic restart (e.g. a Bluetooth headset connecting) calls
+            // back into here with the SAME `recordOutputURL` — reopen that file in
+            // `.append` mode and keep going rather than recreating it, which would
+            // reset it to a bare 44-byte header and discard everything captured
+            // before the swap. The file's sample rate is fixed at first open; if the
+            // newly-attached device's native rate differs, resample to match.
+            let established = self._establishedFormat.withLock { $0 }
+            var newRetention: RetentionWriter?
+            var isFreshRecording = true
+
+            if let url = recordOutputURL {
+                if let established, established.url == url {
+                    do {
+                        let writer = try WAVStreamWriter(
+                            url: url,
+                            sampleRate: established.sampleRate,
+                            channels: 1,
+                            mode: .append
+                        )
+                        var converter: AVAudioConverter?
+                        if tapFormat.sampleRate != established.sampleRate,
+                           let writerFormat = AVAudioFormat(
+                               standardFormatWithSampleRate: established.sampleRate,
+                               channels: tapFormat.channelCount
+                           ) {
+                            converter = AVAudioConverter(from: tapFormat, to: writerFormat)
+                        }
+                        newRetention = RetentionWriter(writer: writer, converter: converter)
+                        isFreshRecording = false
+                    } catch {
+                        diagLog("[MIC-WAV-FAIL] could not reopen writer at \(url.path) for append: \(error) — starting a fresh recording")
+                    }
+                }
+
+                if newRetention == nil {
+                    do {
+                        let writer = try WAVStreamWriter(url: url, sampleRate: tapFormat.sampleRate, channels: 1, mode: .create)
+                        newRetention = RetentionWriter(writer: writer, converter: nil)
+                        self._establishedFormat.withLock { $0 = (url: url, sampleRate: tapFormat.sampleRate) }
+                    } catch {
+                        diagLog("[MIC-WAV-FAIL] could not open writer at \(url.path): \(error)")
+                    }
                 }
             }
 
-            let recordWriter = self._recordWriter
+            let finalRetention = newRetention
+            self._retentionWriter.withLock { $0 = finalRetention }
+            // Only a genuinely fresh file resets the session-start anchor the
+            // post-session mixer aligns this track against — an appended
+            // continuation must keep the original timestamp or the preserved
+            // audio would be scheduled starting at the restart moment instead
+            // of the true session start.
+            if isFreshRecording {
+                self._firstSampleTime.withLock { $0 = nil }
+            }
+
+            let retentionWriter = self._retentionWriter
             let firstSampleTime = self._firstSampleTime
 
             var tapCallCount = 0
@@ -122,7 +195,15 @@ final class MicCapture: @unchecked Sendable {
                 }
 
                 firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
-                recordWriter.withLock { try? $0?.write(buffer) }
+                retentionWriter.withLock { state in
+                    guard let state else { return }
+                    guard let converter = state.converter else {
+                        try? state.writer.write(buffer)
+                        return
+                    }
+                    guard let resampled = Self.resample(buffer, using: converter) else { return }
+                    try? state.writer.write(resampled)
+                }
 
                 continuation.yield(buffer)
             }
@@ -149,10 +230,40 @@ final class MicCapture: @unchecked Sendable {
         _audioLevel.value = 0
         // Flush + finalize the retention WAV. firstSampleTime is intentionally
         // preserved so the engine can snapshot it after stop.
-        _recordWriter.withLock { writer in
-            writer?.close()
-            writer = nil
+        _retentionWriter.withLock { state in
+            state?.writer.close()
+            state = nil
         }
+    }
+
+    /// Resample `buffer` to `converter`'s output format (established when the
+    /// retention writer was first opened), for a mid-session mic restart whose
+    /// newly-attached device runs at a different native sample rate.
+    private static func resample(_ buffer: AVAudioPCMBuffer, using converter: AVAudioConverter) -> AVAudioPCMBuffer? {
+        let targetFormat = converter.outputFormat
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let outputFrames = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 8
+        guard outputFrames > 0,
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrames)
+        else { return nil }
+
+        var error: NSError?
+        var consumed = false
+        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+
+        if let error {
+            diagLog("[MIC-WAV-RESAMPLE-FAIL] \(error.localizedDescription)")
+            return nil
+        }
+        return outputBuffer
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {

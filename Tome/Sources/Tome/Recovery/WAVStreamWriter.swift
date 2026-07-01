@@ -23,6 +23,16 @@ import Foundation
 /// 48 kHz mono float32 would overflow the size fields — acceptable for now;
 /// meetings don't run that long and the alternative (RF64) isn't worth it.
 final class WAVStreamWriter: @unchecked Sendable {
+    enum OpenMode: Sendable {
+        /// Create a fresh file, overwriting anything already at `url`.
+        case create
+        /// Reopen an existing file at `url` and continue appending after its
+        /// current contents. The caller must pass the same `sampleRate`/
+        /// `channels`/`bitsPerSample` the file was originally created with —
+        /// this mode does not re-derive them from the on-disk header.
+        case append
+    }
+
     private let fileHandle: FileHandle
     private let sampleRate: UInt32
     private let channels: UInt16
@@ -33,33 +43,43 @@ final class WAVStreamWriter: @unchecked Sendable {
     private let syncInterval: TimeInterval = 1.0
     private var closed = false
 
-    /// Open a new WAV file at `url`. Overwrites any existing file. Writes the
-    /// 44-byte header with placeholder sizes; sizes are refreshed on every
-    /// subsequent `write` so the file is always parseable.
-    init(url: URL, sampleRate: Double, channels: UInt16 = 1, bitsPerSample: UInt16 = 32) throws {
+    /// Open a WAV file at `url`. In `.create` mode (the default), overwrites any
+    /// existing file and writes the 44-byte header with placeholder sizes; sizes
+    /// are refreshed on every subsequent `write` so the file is always parseable.
+    /// In `.append` mode, reopens an existing file and picks up `dataBytes` from
+    /// its current size so header refreshes stay accurate.
+    init(url: URL, sampleRate: Double, channels: UInt16 = 1, bitsPerSample: UInt16 = 32, mode: OpenMode = .create) throws {
         self.sampleRate = UInt32(sampleRate)
         self.channels = channels
         self.bitsPerSample = bitsPerSample
 
-        let header = Self.buildHeader(
-            sampleRate: self.sampleRate,
-            channels: channels,
-            bitsPerSample: bitsPerSample
-        )
-
-        // createFile + FileHandle(forUpdating:) — Data.write(to:) wouldn't leave
-        // us a writable handle for the seek-and-update dance below.
-        let created = FileManager.default.createFile(atPath: url.path, contents: header)
-        guard created else {
-            throw NSError(
-                domain: "WAVStreamWriter",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Could not create WAV file at \(url.path)"]
+        switch mode {
+        case .create:
+            let header = Self.buildHeader(
+                sampleRate: self.sampleRate,
+                channels: channels,
+                bitsPerSample: bitsPerSample
             )
+
+            // createFile + FileHandle(forUpdating:) — Data.write(to:) wouldn't leave
+            // us a writable handle for the seek-and-update dance below.
+            let created = FileManager.default.createFile(atPath: url.path, contents: header)
+            guard created else {
+                throw NSError(
+                    domain: "WAVStreamWriter",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not create WAV file at \(url.path)"]
+                )
+            }
+            let handle = try FileHandle(forUpdating: url)
+            try handle.seekToEnd()
+            self.fileHandle = handle
+        case .append:
+            let handle = try FileHandle(forUpdating: url)
+            let endOffset = try handle.seekToEnd()
+            self.dataBytes = endOffset > 44 ? UInt32(endOffset - 44) : 0
+            self.fileHandle = handle
         }
-        let handle = try FileHandle(forUpdating: url)
-        try handle.seekToEnd()
-        self.fileHandle = handle
     }
 
     /// Append a buffer's samples. Expects float32 non-interleaved single-channel
