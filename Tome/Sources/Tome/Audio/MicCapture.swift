@@ -13,7 +13,14 @@ final class MicCapture: @unchecked Sendable {
         let converter: AVAudioConverter?
     }
 
-    private let engine = AVAudioEngine()
+    /// Recreated on every `bufferStream` call. AVAudioEngine caches its input node's
+    /// hardware format; reusing one engine across device changes left every later
+    /// device reporting the previous device's format (observed: all inputs stuck at
+    /// AirPods-HFP 24 kHz / 3 ch after one AirPods session, so no device could
+    /// record until app relaunch). A fresh engine re-reads the real format each
+    /// time. Only touched from the main actor (TranscriptionEngine), like the rest
+    /// of this class's mutable state.
+    private var engine = AVAudioEngine()
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
 
@@ -44,8 +51,9 @@ final class MicCapture: @unchecked Sendable {
     var captureError: String? { _error.value }
 
     /// - Parameter recordOutputURL: when non-nil, the mic track is also written to a
-    ///   WAV at this path (float32 mono) for post-session retention. The first input
-    ///   channel only is captured for multi-channel devices.
+    ///   WAV at this path (float32 mono) for post-session retention. Multi-channel
+    ///   devices are downmixed to mono (all channels averaged) so the live mic
+    ///   survives regardless of which channel it lands on.
     func bufferStream(deviceID: AudioDeviceID? = nil, recordOutputURL: URL? = nil) -> AsyncStream<AVAudioPCMBuffer> {
         let level = _audioLevel
         let errorHolder = _error
@@ -54,6 +62,12 @@ final class MicCapture: @unchecked Sendable {
             errorHolder.value = nil
 
             diagLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
+
+            // Fresh engine per capture — see the `engine` property comment. Tear the
+            // old one down first so its HAL unit releases the previous device.
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.engine.stop()
+            self.engine = AVAudioEngine()
 
             // Set input device before accessing inputNode format
             if let id = deviceID {
@@ -103,10 +117,7 @@ final class MicCapture: @unchecked Sendable {
                 return
             }
 
-            guard let tapFormat = AVAudioFormat(
-                standardFormatWithSampleRate: format.sampleRate,
-                channels: format.channelCount
-            ) else {
+            guard let tapFormat = Self.makeTapFormat(from: format) else {
                 let msg = "Failed to build tap format from input format"
                 diagLog("[MIC-4-FAIL] \(msg)")
                 errorHolder.value = msg
@@ -144,13 +155,21 @@ final class MicCapture: @unchecked Sendable {
                             channels: 1,
                             mode: .append
                         )
+                        // Buffers reach the writer already downmixed to mono (see the
+                        // tap callback), so the resampler is built mono→mono — NOT at
+                        // tapFormat.channelCount, which for a multi-channel device
+                        // (AirPods HFP, aggregates) would mismatch the actual buffers.
                         var converter: AVAudioConverter?
                         if tapFormat.sampleRate != established.sampleRate,
+                           let tapMono = AVAudioFormat(
+                               standardFormatWithSampleRate: tapFormat.sampleRate,
+                               channels: 1
+                           ),
                            let writerFormat = AVAudioFormat(
                                standardFormatWithSampleRate: established.sampleRate,
-                               channels: tapFormat.channelCount
+                               channels: 1
                            ) {
-                            converter = AVAudioConverter(from: tapFormat, to: writerFormat)
+                            converter = AVAudioConverter(from: tapMono, to: writerFormat)
                         }
                         newRetention = RetentionWriter(writer: writer, converter: converter)
                         isFreshRecording = false
@@ -195,17 +214,23 @@ final class MicCapture: @unchecked Sendable {
                 }
 
                 firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
+
+                // Normalize to mono before writing/yielding: the WAV writer and the
+                // transcriber's fallback path both read channel 0 only, so a
+                // multi-channel device (aggregate, AirPods HFP) whose live mic sits
+                // on a later channel would otherwise record pure silence.
+                guard let mono = Self.downmixToMono(buffer) else { return }
                 retentionWriter.withLock { state in
                     guard let state else { return }
                     guard let converter = state.converter else {
-                        try? state.writer.write(buffer)
+                        try? state.writer.write(mono)
                         return
                     }
-                    guard let resampled = Self.resample(buffer, using: converter) else { return }
+                    guard let resampled = Self.resample(mono, using: converter) else { return }
                     try? state.writer.write(resampled)
                 }
 
-                continuation.yield(buffer)
+                continuation.yield(mono)
             }
 
             diagLog("[MIC-5] tap installed, preparing engine...")
@@ -239,6 +264,82 @@ final class MicCapture: @unchecked Sendable {
     /// Resample `buffer` to `converter`'s output format (established when the
     /// retention writer was first opened), for a mid-session mic restart whose
     /// newly-attached device runs at a different native sample rate.
+    /// Tap format for an input node. The "standard" initializer only covers mono and
+    /// stereo — it returns nil for >2 channels, which is exactly what AirPods-HFP and
+    /// aggregate devices report (e.g. 24 kHz / 3 ch); that nil made those devices
+    /// unrecordable (MIC-4-FAIL before the tap was ever installed). Fall back to the
+    /// node's own format — always installable on its own node — and let
+    /// `downmixToMono` normalize the buffers afterward.
+    static func makeTapFormat(from format: AVAudioFormat) -> AVAudioFormat? {
+        if let standard = AVAudioFormat(
+            standardFormatWithSampleRate: format.sampleRate,
+            channels: format.channelCount
+        ) {
+            return standard
+        }
+        return format
+    }
+
+    /// Average all channels into a mono float32 non-interleaved buffer at the same
+    /// sample rate. Downstream consumers (WAV writer, transcriber fallback) read
+    /// channel 0 only, so an aggregate whose live mic lands on a later channel would
+    /// record pure silence without this. Mono float32 input passes through untouched.
+    /// Returns nil for empty buffers or unsupported sample layouts.
+    static func downmixToMono(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return nil }
+
+        let fmt = buffer.format
+        if fmt.channelCount == 1 && fmt.commonFormat == .pcmFormatFloat32 && !fmt.isInterleaved {
+            return buffer
+        }
+
+        guard let monoFormat = AVAudioFormat(standardFormatWithSampleRate: fmt.sampleRate, channels: 1),
+              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(frames)) else {
+            return nil
+        }
+        mono.frameLength = AVAudioFrameCount(frames)
+        let out = mono.floatChannelData![0]
+        let channelCount = Int(max(fmt.channelCount, 1))
+        let scale = 1 / Float(channelCount)
+
+        func fill(_ sampleAt: (_ frame: Int, _ channel: Int) -> Float) {
+            for frame in 0..<frames {
+                var sum: Float = 0
+                for channel in 0..<channelCount {
+                    sum += sampleAt(frame, channel)
+                }
+                out[frame] = sum * scale
+            }
+        }
+
+        if let channelData = buffer.floatChannelData {
+            fill { frame, channel in
+                fmt.isInterleaved
+                    ? channelData[0][(frame * channelCount) + channel]
+                    : channelData[channel][frame]
+            }
+        } else if let channelData = buffer.int16ChannelData {
+            let s: Float = 1 / Float(Int16.max)
+            fill { frame, channel in
+                (fmt.isInterleaved
+                    ? Float(channelData[0][(frame * channelCount) + channel])
+                    : Float(channelData[channel][frame])) * s
+            }
+        } else if let channelData = buffer.int32ChannelData {
+            let s: Float = 1 / Float(Int32.max)
+            fill { frame, channel in
+                (fmt.isInterleaved
+                    ? Float(channelData[0][(frame * channelCount) + channel])
+                    : Float(channelData[channel][frame])) * s
+            }
+        } else {
+            return nil
+        }
+
+        return mono
+    }
+
     private static func resample(_ buffer: AVAudioPCMBuffer, using converter: AVAudioConverter) -> AVAudioPCMBuffer? {
         let targetFormat = converter.outputFormat
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
