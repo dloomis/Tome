@@ -15,9 +15,17 @@ let package = Package(
         .package(url: "https://github.com/argmaxinc/argmax-oss-swift", revision: "94cf6b120cf9dde32d9dea01acc326e77371302c"),
     ],
     targets: [
+        // ObjC shim to catch NSExceptions from AVFoundation (Swift can't) —
+        // an NSException unwinding through async frames corrupts the
+        // concurrency runtime and crashes later in an unrelated stack.
+        .target(
+            name: "ObjCExceptionGuard",
+            path: "Sources/ObjCExceptionGuard"
+        ),
         .executableTarget(
             name: "Tome",
             dependencies: [
+                "ObjCExceptionGuard",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "SpeakerKit", package: "argmax-oss-swift"),

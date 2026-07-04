@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
+import ObjCExceptionGuard
 import os
 
 final class MicCapture: @unchecked Sendable {
@@ -91,7 +92,11 @@ final class MicCapture: @unchecked Sendable {
             }
 
             let inputNode = self.engine.inputNode
-            let format = inputNode.outputFormat(forBus: 0)
+            // Tap format must match the HARDWARE input format. outputFormat(forBus:)
+            // can report a stale rate after the device's nominal sample rate changes
+            // (observed 2026-07-03: node said 44.1kHz, hw was 48kHz — installTap threw
+            // an NSException that later took down the whole process).
+            let format = inputNode.inputFormat(forBus: 0)
 
             diagLog("[MIC-3] inputNode format: sr=\(format.sampleRate) ch=\(format.channelCount) interleaved=\(format.isInterleaved) commonFormat=\(format.commonFormat.rawValue)")
 
@@ -185,7 +190,8 @@ final class MicCapture: @unchecked Sendable {
             let firstSampleTime = self._firstSampleTime
 
             var tapCallCount = 0
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
+            let installException = TomeCatchObjCException {
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
                 tapCallCount += 1
                 let rms = Self.normalizedRMS(from: buffer)
                 level.value = min(rms * 25, 1.0)
@@ -194,31 +200,57 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
                 }
 
-                firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
-                retentionWriter.withLock { state in
-                    guard let state else { return }
-                    guard let converter = state.converter else {
-                        try? state.writer.write(buffer)
-                        return
+                    firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
+                    retentionWriter.withLock { state in
+                        guard let state else { return }
+                        guard let converter = state.converter else {
+                            try? state.writer.write(buffer)
+                            return
+                        }
+                        guard let resampled = Self.resample(buffer, using: converter) else { return }
+                        try? state.writer.write(resampled)
                     }
-                    guard let resampled = Self.resample(buffer, using: converter) else { return }
-                    try? state.writer.write(resampled)
-                }
 
-                continuation.yield(buffer)
+                    continuation.yield(buffer)
+                }
+            }
+            if let installException {
+                // The device format can still change between the query above and the
+                // install (raising a "Format mismatch" NSException). Fail the capture
+                // cleanly — letting the exception escape corrupts the process.
+                let msg = "Mic tap failed: \(installException)"
+                diagLog("[MIC-5-FAIL] \(msg)")
+                errorHolder.value = msg
+                self._retentionWriter.withLock { state in
+                    state?.writer.close()
+                    state = nil
+                }
+                continuation.finish()
+                return
             }
 
             diagLog("[MIC-5] tap installed, preparing engine...")
 
-            do {
-                self.engine.prepare()
-                diagLog("[MIC-7] engine prepared, starting...")
-                try self.engine.start()
-                diagLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
-            } catch {
-                let msg = "Mic failed: \(error.localizedDescription)"
-                print("[MIC-8-FAIL] \(msg)")
+            var startError: Error?
+            let startException = TomeCatchObjCException {
+                do {
+                    self.engine.prepare()
+                    diagLog("[MIC-7] engine prepared, starting...")
+                    try self.engine.start()
+                    diagLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
+                } catch {
+                    startError = error
+                }
+            }
+            if startException != nil || startError != nil {
+                let msg = "Mic failed: \(startException ?? startError!.localizedDescription)"
+                diagLog("[MIC-8-FAIL] \(msg)")
                 errorHolder.value = msg
+                inputNode.removeTap(onBus: 0)
+                self._retentionWriter.withLock { state in
+                    state?.writer.close()
+                    state = nil
+                }
                 continuation.finish()
             }
         }
