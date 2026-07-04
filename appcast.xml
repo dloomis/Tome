@@ -6,6 +6,17 @@
     <description>Most recent updates to Tome</description>
     <language>en</language>
     <item>
+      <title>Version 1.4.2</title>
+      <pubDate>Sat, 04 Jul 2026 16:31:32 +0000</pubDate>
+      <sparkle:version>1.4.2</sparkle:version>
+      <sparkle:shortVersionString>1.4.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/dloomis/Tome/releases/download/v1.4.2/Tome.dmg"
+                 sparkle:edSignature="co8s9M6ZU7AJcc/7A2jRBVLM41LhPx08A6lwjs+l2CbGBkWHJOvzhoHwDt2RCKRxQz7dmfP433nxKlUykj3JAA=="
+                 length="7687588"
+                 type="application/octet-stream" />
+    </item>
+      <item>
       <title>Version 1.4.1</title>
       <pubDate>Sat, 04 Jul 2026 00:51:35 +0000</pubDate>
       <sparkle:version>1.4.1</sparkle:version>
