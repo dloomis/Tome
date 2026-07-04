@@ -76,11 +76,40 @@ else
   echo "No git tags found — leaving Info.plist version as committed"
 fi
 
-# Copy app icon
+# Copy app icon (legacy .icns — used by Finder previews and as fallback)
 ICON_PATH="$SWIFT_DIR/Sources/Tome/Assets/AppIcon.icns"
 if [[ -f "$ICON_PATH" ]]; then
   cp "$ICON_PATH" "$APP_DIR/Contents/Resources/AppIcon.icns"
   echo "App icon copied"
+fi
+
+# Compile the macOS 26 Liquid Glass icon (.icon → Assets.car). Without this,
+# Tahoe renders the legacy .icns shrunken inside a system tile ("icon jail").
+# Needs Xcode 26's actool; CLT alone doesn't ship it, so resolve Xcode
+# explicitly and fall back to the .icns-only bundle when unavailable.
+ICON_BUNDLE="$SWIFT_DIR/Sources/Tome/Assets/AppIcon.icon"
+ACTOOL_DEV_DIR="${ACTOOL_DEVELOPER_DIR:-}"
+if [[ -z "$ACTOOL_DEV_DIR" ]]; then
+  if xcrun --find actool >/dev/null 2>&1; then
+    ACTOOL_DEV_DIR="$(xcode-select -p)"   # already pointing at an Xcode (CI)
+  elif [[ -d /Applications/Xcode.app ]]; then
+    ACTOOL_DEV_DIR="/Applications/Xcode.app"
+  fi
+fi
+if [[ -d "$ICON_BUNDLE" && -n "$ACTOOL_DEV_DIR" ]]; then
+  if DEVELOPER_DIR="$ACTOOL_DEV_DIR" xcrun actool "$ICON_BUNDLE" \
+      --compile "$APP_DIR/Contents/Resources" \
+      --app-icon AppIcon --include-all-app-icons \
+      --minimum-deployment-target 26.0 --platform macosx \
+      --output-format human-readable-text \
+      --output-partial-info-plist /dev/null >/dev/null 2>&1 \
+      && [[ -f "$APP_DIR/Contents/Resources/Assets.car" ]]; then
+    echo "Liquid Glass icon compiled (Assets.car)"
+  else
+    echo "Warning: actool failed (Xcode license not accepted?) — shipping legacy .icns only"
+  fi
+else
+  echo "Warning: Xcode/actool not found — shipping legacy .icns only"
 fi
 
 # Copy Sparkle framework
