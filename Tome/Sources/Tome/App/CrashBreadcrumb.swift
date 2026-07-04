@@ -26,6 +26,12 @@ enum CrashBreadcrumb {
     /// fd for last-crash.log, opened once at install so the handler never allocates.
     nonisolated(unsafe) private static var crashFD: Int32 = -1
 
+    /// Backtrace frame buffer, allocated once at install. The handler must not
+    /// malloc: a fatal signal can arrive mid-allocation, and taking the allocator
+    /// lock again would deadlock — turning the crash into a silent hang.
+    private static let frameCapacity: Int32 = 128
+    nonisolated(unsafe) private static var frameBuffer: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+
     /// Fatal signals worth a backtrace. SIGBUS is the one that killed us on
     /// 2026-07-01 (EXC_BAD_ACCESS in DesignLibrary → ZStack update).
     private static let fatalSignals: [Int32] = [SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT]
@@ -43,6 +49,9 @@ enum CrashBreadcrumb {
             let path = dir.appendingPathComponent("last-crash.log").path
             crashFD = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         }
+
+        frameBuffer = .allocate(capacity: Int(frameCapacity))
+        frameBuffer?.initialize(repeating: nil, count: Int(frameCapacity))
 
         var action = sigaction()
         action.__sigaction_u.__sa_handler = { signalNumber in
@@ -81,19 +90,16 @@ enum CrashBreadcrumb {
         let tail: StaticString = " — backtrace follows ===\n"
         tail.withUTF8Buffer { _ = write(STDERR_FILENO, $0.baseAddress, $0.count) }
 
-        var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 128)
-        let count = frames.withUnsafeMutableBufferPointer { buf -> Int32 in
-            backtrace(buf.baseAddress, Int32(buf.count))
-        }
-        frames.withUnsafeMutableBufferPointer { buf in
-            backtrace_symbols_fd(buf.baseAddress, count, STDERR_FILENO)
+        if let frames = frameBuffer {
+            let count = backtrace(frames, frameCapacity)
+            backtrace_symbols_fd(frames, count, STDERR_FILENO)
             if crashFD >= 0 {
                 let hdr: StaticString = "=== Tome fatal signal: "
                 hdr.withUTF8Buffer { _ = write(crashFD, $0.baseAddress, $0.count) }
                 name(for: signalNumber).withUTF8Buffer { _ = write(crashFD, $0.baseAddress, $0.count) }
                 let hdr2: StaticString = " — instrumented backtrace ===\n"
                 hdr2.withUTF8Buffer { _ = write(crashFD, $0.baseAddress, $0.count) }
-                backtrace_symbols_fd(buf.baseAddress, count, crashFD)
+                backtrace_symbols_fd(frames, count, crashFD)
                 fsync(crashFD)
             }
         }
