@@ -75,9 +75,15 @@ jobs:
           # `find-identity -v` report no valid identity. Trust it in the system
           # keychain (headless via passwordless sudo). No-op for a Developer ID
           # cert, whose chain anchors to Apple's root.
-          openssl pkcs12 -in "$CERT_FILE" -passin "pass:$MACOS_CERTIFICATE_PWD" -clcerts -nokeys -out /tmp/signing-cert.pem
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain /tmp/signing-cert.pem || true
-          rm -f /tmp/signing-cert.pem
+          # Read certs back from the keychain rather than the .p12 —
+          # `security export` encrypts p12s with RC2, which OpenSSL 3 on the
+          # runner refuses to decode.
+          security find-certificate -a -p "$KEYCHAIN_FILE" \
+            | awk '/BEGIN CERTIFICATE/{n++} {print > ("/tmp/signing-cert-" n ".pem")}'
+          for pem in /tmp/signing-cert-*.pem; do
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$pem" || true
+          done
+          rm -f /tmp/signing-cert-*.pem
 
           rm -f "$CERT_FILE" /tmp/DeveloperIDG2CA.cer
 
