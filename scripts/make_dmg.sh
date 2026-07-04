@@ -31,7 +31,18 @@ hdiutil create -volname "Tome" -srcfolder "$STAGING_DIR" -ov -format UDRW "$TEMP
 MOUNT_OUTPUT=$(hdiutil attach "$TEMP_DMG" -readwrite -noverify)
 MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | grep -o '/Volumes/.*' | head -1)
 
-osascript <<APPLESCRIPT
+# If anything below fails under set -e, the image must not stay mounted —
+# a stale mount makes every subsequent run fail with resource-busy.
+cleanup_mount() {
+  if [[ -n "${MOUNT_POINT:-}" && -d "${MOUNT_POINT:-}" ]]; then
+    hdiutil detach "$MOUNT_POINT" -force -quiet || true
+  fi
+}
+trap cleanup_mount EXIT
+
+# Finder styling is cosmetic; on headless runners (no Finder) it can fail —
+# warn and ship an unstyled DMG rather than aborting the release.
+osascript <<APPLESCRIPT || echo "WARNING: Finder styling failed; DMG will be unstyled"
 tell application "Finder"
   tell disk "Tome"
     open
@@ -56,6 +67,7 @@ APPLESCRIPT
 # Ensure all writes are flushed, then detach
 sync
 hdiutil detach "$MOUNT_POINT" -quiet
+MOUNT_POINT=""  # detached — disarm the EXIT trap
 
 # Convert to compressed read-only DMG
 hdiutil convert "$TEMP_DMG" -format UDZO -o "$DMG_PATH"

@@ -138,7 +138,7 @@ final class APIServer {
             )
             listener = try NWListener(using: params)
         } catch {
-            print("[APIServer] Failed to create listener: \(error)")
+            diagLog("[APIServer] Failed to create listener: \(error)")
             return
         }
 
@@ -170,10 +170,10 @@ final class APIServer {
         case .ready:
             if let port = listener?.port {
                 writePortFile(port: port.rawValue)
-                print("[APIServer] Listening on http://127.0.0.1:\(port.rawValue)")
+                diagLog("[APIServer] Listening on http://127.0.0.1:\(port.rawValue)")
             }
         case .failed(let error):
-            print("[APIServer] Listener failed: \(error)")
+            diagLog("[APIServer] Listener failed: \(error)")
             listener?.cancel()
             listener = nil
             Task {
@@ -189,18 +189,60 @@ final class APIServer {
 
     private func acceptConnection(_ connection: NWConnection) {
         connection.start(queue: .main)
+        receiveRequest(on: connection, accumulated: Data())
+    }
+
+    /// Accumulate receives until the request is complete — headers plus the
+    /// declared Content-Length body. A single receive() is not enough: a request
+    /// split across TCP segments would otherwise parse as malformed and 400.
+    private func receiveRequest(on connection: NWConnection, accumulated: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
-            [weak self] data, _, _, error in
+            [weak self] data, _, isComplete, error in
             Task { @MainActor in
                 guard let self else { return }
-                if let data {
-                    await self.handleRequest(data, on: connection)
-                } else if let error {
-                    print("[APIServer] Receive error: \(error)")
+                var buffer = accumulated
+                if let data { buffer.append(data) }
+                if let error {
+                    diagLog("[APIServer] Receive error: \(error)")
+                    connection.cancel()
+                    return
+                }
+                switch Self.requestCompleteness(buffer) {
+                case .complete:
+                    await self.handleRequest(buffer, on: connection)
+                case .tooLarge:
+                    self.send(connection: connection, status: 413, json: #"{"error": "Request too large"}"#)
+                case .needsMore where !isComplete:
+                    self.receiveRequest(on: connection, accumulated: buffer)
+                case .needsMore:
+                    // Peer closed before sending a complete request.
                     connection.cancel()
                 }
             }
         }
+    }
+
+    private enum RequestCompleteness { case complete, needsMore, tooLarge }
+
+    /// 1 MB cap — far above any legitimate request to this local API, and low
+    /// enough that a broken client can't grow the buffer without bound.
+    private static let maxRequestBytes = 1_048_576
+
+    private static func requestCompleteness(_ data: Data) -> RequestCompleteness {
+        if data.count > maxRequestBytes { return .tooLarge }
+        guard let separator = data.range(of: Data("\r\n\r\n".utf8)) else { return .needsMore }
+        // Complete once the declared Content-Length has arrived (0 if absent).
+        var contentLength = 0
+        if let headerStr = String(data: data[..<separator.lowerBound], encoding: .utf8) {
+            for line in headerStr.components(separatedBy: "\r\n").dropFirst() {
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                if line[..<colon].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                    contentLength = Int(line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)) ?? 0
+                }
+            }
+        }
+        if contentLength > maxRequestBytes { return .tooLarge }
+        return data.count - separator.upperBound >= contentLength ? .complete : .needsMore
     }
 
     // MARK: - HTTP Request Handling
@@ -772,6 +814,7 @@ final class APIServer {
             case 400: "Bad Request"
             case 404: "Not Found"
             case 409: "Conflict"
+            case 413: "Payload Too Large"
             case 503: "Service Unavailable"
             default: "Unknown"
             }

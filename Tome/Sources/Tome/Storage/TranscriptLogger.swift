@@ -212,14 +212,22 @@ tags:
 
         // Atomic write — fsync the tmp file before replace so it lands on disk
         // before the rename. Without this, a crash between replace and the next
-        // sync can leave a zero-byte file.
+        // sync can leave a zero-byte file. The replace must only run if the tmp
+        // write fully succeeded — swapping a partial tmp (disk full) over the
+        // live transcript would destroy everything recorded so far.
         let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
-        try? content.write(to: tmpPath, atomically: true, encoding: .utf8)
-        if let tmpHandle = try? FileHandle(forUpdating: tmpPath) {
-            try? tmpHandle.synchronize()
-            try? tmpHandle.close()
+        do {
+            try content.write(to: tmpPath, atomically: true, encoding: .utf8)
+            if let tmpHandle = try? FileHandle(forUpdating: tmpPath) {
+                try? tmpHandle.synchronize()
+                try? tmpHandle.close()
+            }
+            _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
+        } catch {
+            lastError = "Context rewrite failed: \(error.localizedDescription)"
+            diagLog("[LOGGER] updateContext rewrite failed: \(error)")
+            try? FileManager.default.removeItem(at: tmpPath)
         }
-        _ = try? FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
 
         // Reopen file handle; surface a missing handle so the timer-driven UI banner notices.
         fileHandle = try? FileHandle(forWritingTo: filePath)

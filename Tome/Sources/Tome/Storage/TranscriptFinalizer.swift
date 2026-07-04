@@ -283,6 +283,8 @@ enum TranscriptFinalizer {
         // Tome's own single-line `attendees: [...]`, by design.
         if let range = content.range(of: #"attendees: \[.*\]"#, options: .regularExpression) {
             content.replaceSubrange(range, with: "attendees: \(attendeesYaml)")
+        } else {
+            diagLog("[FINALIZER] rewriteFrontmatter: no inline attendees: array to patch in \(filePath.lastPathComponent) (externally restructured?)")
         }
 
         if let range = content.range(of: #"\*\*Duration:\*\* \d{2}:\d{2} \| \*\*Speakers:\*\* \d+"#, options: .regularExpression) {

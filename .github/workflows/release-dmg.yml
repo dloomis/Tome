@@ -186,32 +186,53 @@ jobs:
           # Clone gh-pages branch
           git clone --branch gh-pages --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" /tmp/gh-pages
 
-          # Generate appcast.xml
-          cat > /tmp/gh-pages/appcast.xml <<APPCAST_EOF
-          <?xml version="1.0" encoding="utf-8"?>
+          # Merge into the existing appcast rather than overwriting it: keep prior
+          # release items (rollback targets), replace any existing item for this
+          # same version (tag re-run), newest first, capped at 10 items.
+          export VERSION PUB_DATE DMG_URL ED_SIGNATURE DMG_LENGTH
+          export APPCAST_PATH=/tmp/gh-pages/appcast.xml
+          export APPCAST_LINK="https://raw.githubusercontent.com/${{ github.repository }}/gh-pages/appcast.xml"
+          python3 <<'PY'
+          import os, re
+
+          env = os.environ
+          path = env["APPCAST_PATH"]
+          version = env["VERSION"]
+
+          new_item = f'''<item>
+                <title>Version {version}</title>
+                <pubDate>{env["PUB_DATE"]}</pubDate>
+                <sparkle:version>{version}</sparkle:version>
+                <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+                <enclosure url="{env["DMG_URL"]}"
+                           sparkle:edSignature="{env["ED_SIGNATURE"]}"
+                           length="{env["DMG_LENGTH"]}"
+                           type="application/octet-stream" />
+              </item>'''
+
+          old_items = []
+          if os.path.exists(path):
+              old = open(path).read()
+              old_items = [
+                  item.strip() for item in re.findall(r"<item>.*?</item>", old, re.S)
+                  if f"<sparkle:version>{version}</sparkle:version>" not in item
+              ]
+
+          items = "\n      ".join([new_item] + old_items[:9])
+          open(path, "w").write(f'''<?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
             <channel>
               <title>Tome Updates</title>
-              <link>https://raw.githubusercontent.com/${{ github.repository }}/gh-pages/appcast.xml</link>
+              <link>{env["APPCAST_LINK"]}</link>
               <description>Most recent updates to Tome</description>
               <language>en</language>
-              <item>
-                <title>Version ${VERSION}</title>
-                <pubDate>${PUB_DATE}</pubDate>
-                <sparkle:version>${VERSION}</sparkle:version>
-                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-                <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-                <enclosure url="${DMG_URL}"
-                           sparkle:edSignature="${ED_SIGNATURE}"
-                           length="${DMG_LENGTH}"
-                           type="application/octet-stream" />
-              </item>
+              {items}
             </channel>
           </rss>
-          APPCAST_EOF
-
-          # Remove leading whitespace from heredoc (macOS sed)
-          sed -i '' 's/^          //' /tmp/gh-pages/appcast.xml
+          ''')
+          print(f"appcast: 1 new + {min(len(old_items), 9)} retained item(s)")
+          PY
 
           cd /tmp/gh-pages
           git config user.name "github-actions[bot]"

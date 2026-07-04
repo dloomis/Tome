@@ -626,6 +626,14 @@ struct ContentView: View {
     }
 
     private func stopSession() {
+        // Re-entrance guard: a UI Stop racing an API /sessions/stop (both land on
+        // the MainActor, so the first caller clears activeSessionType before the
+        // second runs) must not tear down twice — the second pass would enqueue a
+        // duplicate PostProcessingJob for the same transcript snapshot.
+        guard activeSessionType != nil else {
+            diagLog("[STOP] stopSession ignored — no active session")
+            return
+        }
         let wasCallCapture = activeSessionType == .callCapture
         let sessionId = currentSessionId ?? SessionStore.generateSessionId()
         let sourceApp = currentSourceApp ?? "Call"

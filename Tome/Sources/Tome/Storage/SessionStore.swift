@@ -40,7 +40,7 @@ actor SessionStore {
             try fileHandle.write(contentsOf: "\n".data(using: .utf8)!)
             try fileHandle.synchronize()
         } catch {
-            print("SessionStore: failed to write record: \(error)")
+            diagLog("SessionStore: failed to write record: \(error)")
         }
     }
 
