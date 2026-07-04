@@ -6,15 +6,10 @@
     {
       "layers" : [
         {
-          "image-name" : "glyph.svg",
+          "image-name" : "glyph.png",
           "name" : "glyph"
         }
-      ],
-      "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.4
-      },
-      "specular" : true
+      ]
     }
   ],
   "supported-platforms" : {

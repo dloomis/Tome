@@ -1,11 +1,8 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <rect x="100" y="100" width="824" height="824" rx="186" fill="#2E3A59"/>
-  <g stroke="#FFF8EC" stroke-width="58" stroke-linecap="round">
-    <line x1="330" y1="442" x2="330" y2="582"/>
-    <line x1="426" y1="367" x2="426" y2="657"/>
-    <line x1="522" y1="412" x2="522" y2="612"/>
-    <line x1="610" y1="430" x2="756" y2="430"/>
-    <line x1="610" y1="512" x2="716" y2="512"/>
-    <line x1="610" y1="594" x2="740" y2="594"/>
+  <g transform="translate(212,212) scale(25)" fill="none" stroke="#FFF8EC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+    <line x1="12" x2="12" y1="19" y2="22"/>
   </g>
 </svg>
