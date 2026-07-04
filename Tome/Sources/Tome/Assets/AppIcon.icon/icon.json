@@ -1,34 +1,18 @@
 {
   "fill" : {
-    "linear-gradient" : [
-      "srgb:0.169,0.200,0.275,1.000",
-      "srgb:0.082,0.102,0.149,1.000"
-    ]
+    "solid" : "srgb:0.180,0.227,0.349,1.000"
   },
   "groups" : [
     {
       "layers" : [
         {
-          "image-name" : "waveform.svg",
-          "name" : "waveform"
+          "image-name" : "glyph.svg",
+          "name" : "glyph"
         }
       ],
       "shadow" : {
         "kind" : "neutral",
         "opacity" : 0.4
-      },
-      "specular" : true
-    },
-    {
-      "layers" : [
-        {
-          "image-name" : "book.svg",
-          "name" : "book"
-        }
-      ],
-      "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.5
       },
       "specular" : true
     }

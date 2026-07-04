@@ -1,49 +1,11 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2b3346"/>
-      <stop offset="1" stop-color="#151a26"/>
-    </linearGradient>
-    <linearGradient id="cover" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f6b73c"/>
-      <stop offset="1" stop-color="#d97706"/>
-    </linearGradient>
-    <linearGradient id="spine" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#b45309"/>
-      <stop offset="1" stop-color="#d97706"/>
-    </linearGradient>
-    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
-    </linearGradient>
-  </defs>
-
-  <!-- macOS icon grid: 824x824 squircle centered on 1024 canvas -->
-  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
-  <!-- top sheen on background -->
-  <path d="M 286 100 h 452 c 103 0 186 83 186 186 v 60 c -270 90 -554 90 -824 0 v -60 c 0 -103 83 -186 186 -186 z" fill="#ffffff" opacity="0.045"/>
-
-  <!-- page block (right edge of closed book) -->
-  <rect x="330" y="308" width="404" height="428" rx="28" fill="#efe5d0"/>
-  <rect x="330" y="308" width="404" height="428" rx="28" fill="none" stroke="#d8c9a8" stroke-width="6"/>
-  <!-- page edge lines -->
-  <line x1="712" y1="340" x2="712" y2="704" stroke="#d8c9a8" stroke-width="8" stroke-linecap="round"/>
-  <line x1="690" y1="348" x2="690" y2="696" stroke="#e3d7ba" stroke-width="6" stroke-linecap="round"/>
-
-  <!-- cover, offset up-left of pages -->
-  <path d="M 302 288 h 380 c 18 0 32 14 32 32 v 384 c 0 18 -14 32 -32 32 h -380 c -30 0 -54 -24 -54 -54 v -340 c 0 -30 24 -54 54 -54 z" fill="url(#cover)"/>
-  <!-- spine band -->
-  <path d="M 302 288 c -30 0 -54 24 -54 54 v 340 c 0 30 24 54 54 54 h 42 v -448 z" fill="url(#spine)"/>
-  <!-- spine hinge line -->
-  <line x1="344" y1="304" x2="344" y2="720" stroke="#92400e" stroke-width="7" stroke-linecap="round" opacity="0.7"/>
-  <!-- cover sheen -->
-  <path d="M 302 288 h 380 c 18 0 32 14 32 32 v 74 c -160 40 -306 40 -466 0 v -52 c 0 -30 24 -54 54 -54 z" fill="url(#shine)"/>
-
-  <!-- waveform across the cover -->
-  <g stroke="#fff7e6" stroke-width="34" stroke-linecap="round">
-    <line x1="416" y1="478" x2="416" y2="546"/>
-    <line x1="486" y1="432" x2="486" y2="592"/>
-    <line x1="556" y1="396" x2="556" y2="628"/>
-    <line x1="626" y1="452" x2="626" y2="572"/>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#2E3A59"/>
+  <g stroke="#FFF8EC" stroke-width="58" stroke-linecap="round">
+    <line x1="330" y1="442" x2="330" y2="582"/>
+    <line x1="426" y1="367" x2="426" y2="657"/>
+    <line x1="522" y1="412" x2="522" y2="612"/>
+    <line x1="610" y1="430" x2="756" y2="430"/>
+    <line x1="610" y1="512" x2="716" y2="512"/>
+    <line x1="610" y1="594" x2="740" y2="594"/>
   </g>
 </svg>

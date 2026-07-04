@@ -1,0 +1,11 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Speech (waveform bars) becoming notes (text lines) -->
+  <g stroke="#FFF8EC" stroke-width="72" stroke-linecap="round">
+    <line x1="286" y1="425" x2="286" y2="599"/>
+    <line x1="405" y1="332" x2="405" y2="692"/>
+    <line x1="524" y1="388" x2="524" y2="636"/>
+    <line x1="634" y1="410" x2="815" y2="410"/>
+    <line x1="634" y1="512" x2="766" y2="512"/>
+    <line x1="634" y1="614" x2="795" y2="614"/>
+  </g>
+</svg>
