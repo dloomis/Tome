@@ -27,3 +27,10 @@ jobs:
       - name: Test
         working-directory: Tome
         run: swift test
+
+      - name: Smoke test (selfcheck)
+        working-directory: Tome
+        # Runs the real binary's preflight: sessions dir writable, WAV writer
+        # round-trip. Permission items are informational (headless runners have
+        # no mic/screen access) and don't affect the exit code.
+        run: swift run Tome --selfcheck

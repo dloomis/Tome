@@ -19,6 +19,31 @@ import Testing
         )
     }
 
+    @Test func emitWritesSidecarNextToWAV() throws {
+        // Shared emission helper — used by SystemAudioCapture for call captures
+        // and by the engine for mic-only sessions (which previously never got a
+        // sidecar and were invisible to crash recovery).
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let wav = dir.appendingPathComponent("memo.mic.wav")
+        let context = SessionRecordingContext(
+            sessionId: "memo",
+            transcriptURL: URL(fileURLWithPath: "/vault/Memo.md"),
+            sourceApp: "Voice Memo",
+            sessionType: .voiceMemo,
+            startedAt: Date(timeIntervalSince1970: 1_780_000_000)
+        )
+        SessionSidecar.emit(forWAV: wav, context: context, sampleRate: 48_000)
+
+        let read = try SessionSidecar.read(from: SessionSidecar.sidecarURL(forWAV: wav))
+        #expect(read.sessionId == "memo")
+        #expect(read.sessionType == .voiceMemo)
+        #expect(read.transcriptPath == "/vault/Memo.md")
+        #expect(read.startedAt == Date(timeIntervalSince1970: 1_780_000_000))
+        #expect(read.schema == SessionSidecar.currentSchema)
+    }
+
     @Test func roundTrip() throws {
         let dir = try TestSupport.makeTempDir()
         defer { TestSupport.remove(dir) }

@@ -2,18 +2,25 @@ import AppKit
 import Sparkle
 
 @MainActor
-final class AppUpdaterController {
-    let updater: SPUUpdater
+final class AppUpdaterController: NSObject, SPUUpdaterDelegate {
+    private(set) var updater: SPUUpdater!
     private let userDriver: TomeUserDriver
 
-    init() {
+    /// Queried before every update check (scheduled or user-initiated). While it
+    /// returns true the check is refused — an update flow ends in an "Install
+    /// and Relaunch" prompt that would terminate a live recording. Wired by
+    /// `TomeApp` to `AppServices.isRecording`.
+    var isRecordingProvider: (() -> Bool)?
+
+    override init() {
         let hostBundle = Bundle.main
         userDriver = TomeUserDriver(hostBundle: hostBundle, delegate: nil)
+        super.init()
         updater = SPUUpdater(
             hostBundle: hostBundle,
             applicationBundle: hostBundle,
             userDriver: userDriver,
-            delegate: nil
+            delegate: self
         )
 
         // Only start updater if EdDSA signing key is configured
@@ -24,6 +31,15 @@ final class AppUpdaterController {
             try updater.start()
         } catch {
             presentStartupError()
+        }
+    }
+
+    // MARK: - SPUUpdaterDelegate
+
+    /// Sparkle invokes this on the main thread before any update check.
+    nonisolated func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
+        try MainActor.assumeIsolated {
+            try UpdatePolicy.mayPerformCheck(isRecording: isRecordingProvider?() ?? false)
         }
     }
 

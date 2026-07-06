@@ -44,7 +44,21 @@ private func openDiagnosticLogs() {
     }
 }
 
+/// Custom entry point so `tome --selfcheck` can run its preflight and exit
+/// without ever constructing the App (no updater start, no windows, no
+/// side effects) — usable headless by CI and by users before a meeting.
 @main
+enum TomeMain {
+    static func main() {
+        if CommandLine.arguments.contains("--selfcheck") {
+            let result = SelfCheck.run()
+            print(result.report)
+            exit(result.ok ? 0 : 1)
+        }
+        TomeApp.main()
+    }
+}
+
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var settings = AppSettings()
@@ -63,6 +77,11 @@ struct TomeApp: App {
                     appDelegate.postProcessingQueue = services.postProcessingQueue
                     appDelegate.transcriptLogger = services.transcriptLogger
                     appDelegate.sessionStore = services.sessionStore
+                    // Sparkle interlock: refuse update checks while recording so an
+                    // "Install and Relaunch" prompt can't kill a live capture.
+                    updaterController.isRecordingProvider = { [weak services] in
+                        services?.isRecording ?? false
+                    }
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -193,16 +212,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Emergency flush: if a session is live, drain its writer state so the last
         // utterance and JSONL record reach disk before we exit. Hard 2s cap so a stuck
-        // FS doesn't block quit. The session's WAV in /var/folders is discarded — no
-        // diarization for the in-flight session, but the markdown transcript is durable.
+        // FS doesn't block quit. The session's WAV stays in the sessions directory as
+        // an orphan the next launch offers to recover. See `TerminationFlush` for why
+        // this must run on a detached task rather than an inline `Task {}`.
         if let logger = transcriptLogger, let store = sessionStore {
-            let sema = DispatchSemaphore(value: 0)
-            Task {
-                _ = await logger.endSession()
-                await store.endSession()
-                sema.signal()
-            }
-            _ = sema.wait(timeout: .now() + 2.0)
+            let flushed = TerminationFlush.run(logger: logger, store: store, timeout: 2.0)
+            if !flushed { diagLog("[QUIT] emergency flush timed out — proceeding with termination") }
         }
 
         // If any post-processing job is in flight, briefly block termination with a

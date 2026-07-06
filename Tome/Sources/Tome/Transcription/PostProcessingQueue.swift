@@ -26,6 +26,17 @@ final class PostProcessingQueue {
         let sessionType: SessionType
     }
 
+    /// Published when a job throws. Observers (ContentView) surface it to the
+    /// user and walk the API lifecycle out of `.transcribing` — a failure that
+    /// only reaches `diagLog` looks exactly like success to everyone else.
+    private(set) var lastFailure: JobFailure?
+
+    struct JobFailure: Equatable, Sendable {
+        let jobId: String
+        let message: String
+        let sessionType: SessionType
+    }
+
     /// Bindable summary for UI: true while any job is queued or running.
     var isAnyJobRunning: Bool { activeJob != nil || !pendingJobs.isEmpty }
 
@@ -80,10 +91,25 @@ final class PostProcessingQueue {
                 )
             } catch {
                 diagLog("[QUEUE] Job \(job.id) failed: \(error)")
+                lastFailure = JobFailure(
+                    jobId: job.id,
+                    message: failureMessage(for: error),
+                    sessionType: job.handle.sessionType
+                )
             }
 
             ProcessInfo.processInfo.endActivity(activity)
             activeJob = nil
+        }
+    }
+
+    private func failureMessage(for error: PostProcessingError) -> String {
+        switch error {
+        case .diarizeFailed(let m): return "Diarization failed: \(m)"
+        case .reTranscribeFailed(let m): return "Re-transcription failed: \(m)"
+        case .markdownReadFailed(let m): return "Couldn't read the transcript: \(m)"
+        case .markdownWriteFailed(let m): return "Couldn't write the transcript: \(m)"
+        case .cancelled: return "Finalization was cancelled"
         }
     }
 }

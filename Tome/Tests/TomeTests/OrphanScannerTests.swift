@@ -43,6 +43,42 @@ import Testing
         #expect(b.sidecar == nil)
     }
 
+    @Test func micOnlySessionSurfacesAsPrimaryOrphan() throws {
+        // A crashed voice memo leaves ONLY <sid>.mic.wav (+sidecar). It must be
+        // listed — it is the session's sole audio — with its sidecar paired.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let micWAV = try TestSupport.writeWAV(at: dir.appendingPathComponent("memo.mic.wav"), seconds: 1.5)
+        try SessionSidecar.write(
+            SessionSidecar(
+                schema: SessionSidecar.currentSchema, sessionId: "memo",
+                transcriptPath: "/vault/Memo.md", startedAt: Date(), sourceApp: "Voice Memo",
+                sessionType: .voiceMemo, sampleRate: 48_000, channels: 1,
+                bitsPerSample: 32, appVersion: "test"
+            ),
+            to: SessionSidecar.sidecarURL(forWAV: micWAV)
+        )
+
+        let orphans = OrphanScanner.findOrphans(in: dir)
+        #expect(orphans.count == 1, "mic-only session must be recoverable, got \(orphans.map(\.wavURL.lastPathComponent))")
+        #expect(orphans.first?.wavURL.lastPathComponent == "memo.mic.wav")
+        #expect(orphans.first?.sidecar?.sessionType == .voiceMemo)
+    }
+
+    @Test func micCompanionStaysHiddenWhenSystemWAVExists() throws {
+        // The mic-primary rule must not regress call captures: when <sid>.wav
+        // exists, <sid>.mic.wav remains a hidden companion (one listing per session).
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        try TestSupport.writeWAV(at: dir.appendingPathComponent("call.wav"), seconds: 1.5)
+        try TestSupport.writeWAV(at: dir.appendingPathComponent("call.mic.wav"), seconds: 1.5)
+
+        let names = OrphanScanner.findOrphans(in: dir).map { $0.wavURL.lastPathComponent }
+        #expect(names == ["call.wav"], "got \(names)")
+    }
+
     @Test func emptyDirectoryYieldsNoOrphans() throws {
         let dir = try TestSupport.makeTempDir()
         defer { TestSupport.remove(dir) }

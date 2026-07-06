@@ -304,6 +304,8 @@ final class PostProcessingJob: Identifiable {
         }
         if let micURL = handle.micWavPath {
             try? FileManager.default.removeItem(at: micURL)
+            // Mic-only sessions carry their crash-recovery sidecar on the mic WAV.
+            SessionSidecar.deleteIfExists(forWAV: micURL)
         }
         // Rotated segments share the session-id stem: `<sid>.pre-<ts>.wav` /
         // `<sid>.pre-<ts>.mic.wav`, always next to the capture WAVs.

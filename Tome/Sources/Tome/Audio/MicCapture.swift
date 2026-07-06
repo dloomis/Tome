@@ -48,6 +48,16 @@ final class MicCapture: @unchecked Sendable {
     private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
 
+    /// Wall-clock time of the most recent buffer delivered by the tap while
+    /// capture is active; `nil` when not capturing. The engine's watchdog reads
+    /// this to detect a mic that has silently stopped delivering (device pulled,
+    /// HAL wedge) — AVAudioEngine reports no error in those cases, mirroring the
+    /// SCStream behavior `SystemAudioCapture.lastSampleTime` exists for. Seeded
+    /// at successful engine start so watchdog grace begins then, not at the
+    /// first (possibly never-arriving) buffer.
+    private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
+
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
@@ -207,6 +217,7 @@ final class MicCapture: @unchecked Sendable {
 
             let retentionWriter = self._retentionWriter
             let firstSampleTime = self._firstSampleTime
+            let lastSampleTime = self._lastSampleTime
 
             var tapCallCount = 0
             let installException = TomeCatchObjCException {
@@ -220,6 +231,7 @@ final class MicCapture: @unchecked Sendable {
                 }
 
                 firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
+                lastSampleTime.withLock { $0 = Date() }
 
                 // Normalize to mono before writing/yielding: the WAV writer and the
                 // transcriber's fallback path both read channel 0 only, so a
@@ -263,6 +275,9 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-7] engine prepared, starting...")
                     try self.engine.start()
                     diagLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
+                    // Seed the watchdog clock now — grace period starts at engine
+                    // start, not at the first buffer (which a wedged device never sends).
+                    self._lastSampleTime.withLock { $0 = Date() }
                 } catch {
                     startError = error
                 }
@@ -285,6 +300,7 @@ final class MicCapture: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         _audioLevel.value = 0
+        _lastSampleTime.withLock { $0 = nil }
         // Flush + finalize the retention WAV. firstSampleTime is intentionally
         // preserved so the engine can snapshot it after stop.
         _retentionWriter.withLock { state in

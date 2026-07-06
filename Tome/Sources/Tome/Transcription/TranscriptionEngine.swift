@@ -134,7 +134,33 @@ final class TranscriptionEngine {
             try? SystemAudioCapture.sessionsDirectory().appendingPathComponent("\(ctx.sessionId).mic.wav")
         }
         diagLog("[ENGINE-3] starting mic capture, targetMicID=\(String(describing: targetMicID)), micBuffer=\(currentMicBufferURL?.lastPathComponent ?? "nil")")
+
+        // Mic-only sessions carry their crash-recovery sidecar on the mic WAV.
+        // SystemAudioCapture emits one for call captures, but voice memos never
+        // reach it — which left crashed memos invisible to the orphan scanner.
+        // Sample rate is nominal; recovery reads the WAV header itself.
+        if !captureSystemAudio, let ctx = recordingContext, let micURL = currentMicBufferURL {
+            SessionSidecar.emit(forWAV: micURL, context: ctx, sampleRate: 48_000)
+        }
+
         let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
+
+        // The stream-setup closure runs synchronously inside `bufferStream`, so any
+        // setup failure (no HAL input, device-set failure, tap format exception,
+        // engine-start throw) is already in `captureError` here. A session with no
+        // working mic must not pretend to record — fail the start and let
+        // ContentView's rollback unwind the bookkeeping. (`captureError` previously
+        // had no readers at all: a wedged input device produced a session that
+        // looked live and recorded nothing.)
+        if let micError = micCapture.captureError {
+            diagLog("[ENGINE-3-FAIL] mic capture failed at start: \(micError)")
+            lastError = micError
+            micCapture.stop()
+            assetStatus = "Ready"
+            isRunning = false
+            endLiveActivity()
+            return
+        }
 
         // 3. Start system audio capture. Skipped for mic-only sessions (voice memos /
         //    in-person meetings) — there the mic is the sole source and diarization runs
@@ -215,8 +241,13 @@ final class TranscriptionEngine {
                     reportSysError("System audio transcription failed — restart session")
                 }
             }
-            startSystemAudioWatchdog()
         }
+
+        // Watch BOTH capture legs, not just system audio — a mic that stops
+        // delivering (device pulled, HAL wedge) is silent loss of the user's own
+        // side, and flowing system audio masks it from the level-based silence
+        // detection entirely.
+        startCaptureWatchdog(systemLegActive: sysStreams != nil)
 
         assetStatus = "Transcribing (Parakeet-TDT v3)"
         diagLog("[ENGINE-6] all transcription tasks started")
@@ -227,7 +258,9 @@ final class TranscriptionEngine {
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
-    func restartMic(inputDeviceID: AudioDeviceID) {
+    /// `force` skips the same-device short-circuit — used by the capture watchdog to
+    /// re-establish a mic whose tap stopped delivering on the SAME device.
+    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
         guard isRunning, let vadManager else { return }
 
         // Only update user selection when explicitly changed (not from OS listener)
@@ -235,7 +268,7 @@ final class TranscriptionEngine {
             userSelectedDeviceID = inputDeviceID
         }
         let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID() ?? 0
-        guard targetMicID != currentMicDeviceID else {
+        guard force || targetMicID != currentMicDeviceID else {
             diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
             return
         }
@@ -249,10 +282,19 @@ final class TranscriptionEngine {
 
         currentMicDeviceID = targetMicID
 
-        // Start new mic stream. The retention writer reopens (overwriting) at the same
-        // path — a mid-session mic device change truncates the kept recording to the
-        // post-swap segment, so retained recordings assume a stable mic for the session.
+        // Start new mic stream. The retention writer reopens in `.append` mode at
+        // the same path, so the pre-swap audio is preserved (see MicCapture).
         let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
+
+        // Setup failures are synchronous (see start()) — a failed restart means the
+        // user's side is NOT being recorded. Surface loudly; the session continues
+        // (system audio may still be flowing) and the watchdog keeps monitoring.
+        if let micError = micCapture.captureError {
+            let msg = "Mic restart failed: \(micError)"
+            lastError = msg
+            diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
+            Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
+        }
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
@@ -386,41 +428,71 @@ final class TranscriptionEngine {
     }
 
     /// SCStream can pause silently (no `didStopWithError` callback) when the display
-    /// sleeps, the captured app quits, or capture permission is revoked. Poll the
-    /// last-sample timestamp; if the gap exceeds the threshold while running, surface
-    /// a visible warning so a future regression here is loud instead of silent.
-    private func startSystemAudioWatchdog() {
+    /// sleeps, the captured app quits, or capture permission is revoked — and the
+    /// mic tap can likewise stop delivering with no error when the device is pulled
+    /// or the HAL wedges. Poll both legs' last-sample timestamps through
+    /// `CaptureStallDetector`s. On a stall: set `lastError` AND post a notification
+    /// (the Tome window is usually hidden behind the meeting app exactly when this
+    /// matters). A stalled mic additionally gets one automatic restart attempt per
+    /// stall episode.
+    private func startCaptureWatchdog(systemLegActive: Bool) {
         sysWatchdogTask?.cancel()
-        let capture = systemCapture
+        let sysCapture = systemCapture
+        let mic = micCapture
         sysWatchdogTask = Task { [weak self] in
-            let stallThreshold: TimeInterval = 15
-            var warned = false
+            var sysDetector = CaptureStallDetector(threshold: 15)
+            var micDetector = CaptureStallDetector(threshold: 15)
+            var micRestartAttempted = false
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 if Task.isCancelled { return }
-                let last = capture.lastSampleTime
+                let now = Date()
+                let sysEvent = systemLegActive
+                    ? sysDetector.evaluate(lastSample: sysCapture.lastSampleTime, now: now)
+                    : nil
+                let micEvent = micDetector.evaluate(lastSample: mic.lastSampleTime, now: now)
+
+                var attemptMicRestart = false
+                if let micEvent {
+                    switch micEvent {
+                    case .stalled:
+                        if !micRestartAttempted {
+                            micRestartAttempted = true
+                            attemptMicRestart = true
+                        }
+                    case .resumed:
+                        micRestartAttempted = false
+                    }
+                }
+
+                guard sysEvent != nil || micEvent != nil else { continue }
+                let restart = attemptMicRestart
                 await MainActor.run {
-                    guard let self else { return }
-                    guard self.isRunning else { return }
-                    guard let last else { return }
-                    let gap = Date().timeIntervalSince(last)
-                    if gap > stallThreshold {
-                        if !warned {
-                            let msg = "System audio capture stalled (\(Int(gap))s) — restart the session"
-                            self.lastError = msg
-                            diagLog("[WATCHDOG] system audio gap=\(Int(gap))s — \(msg)")
-                            warned = true
-                        }
-                    } else if warned {
-                        // Samples resumed flowing — clear the warning if we set it.
-                        if self.lastError?.hasPrefix("System audio capture stalled") == true {
-                            self.lastError = nil
-                        }
-                        warned = false
-                        diagLog("[WATCHDOG] system audio resumed")
+                    guard let self, self.isRunning else { return }
+                    if let sysEvent { self.handleStallEvent(sysEvent, leg: "System audio") }
+                    if let micEvent { self.handleStallEvent(micEvent, leg: "Microphone") }
+                    if restart {
+                        diagLog("[WATCHDOG] attempting automatic mic restart")
+                        self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
                     }
                 }
             }
+        }
+    }
+
+    private func handleStallEvent(_ event: CaptureStallDetector.Event, leg: String) {
+        switch event {
+        case .stalled(let gap):
+            let msg = "\(leg) capture stalled (\(gap)s) — audio is not being recorded"
+            lastError = msg
+            diagLog("[WATCHDOG] \(msg)")
+            Task { await NotificationPresenter.shared.postCaptureStall(leg: leg, detail: msg) }
+        case .resumed:
+            diagLog("[WATCHDOG] \(leg) capture resumed")
+            if lastError?.contains("capture stalled") == true {
+                lastError = nil
+            }
+            NotificationPresenter.shared.clearCaptureStall(leg: leg)
         }
     }
 

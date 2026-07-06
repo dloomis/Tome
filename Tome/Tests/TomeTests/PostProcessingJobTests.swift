@@ -73,6 +73,17 @@ import Testing
         // A rotated pre-swap segment from a mid-session mic change.
         let rotated = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j2.pre-111.mic.wav"), seconds: 1)
 
+        // Mic-only sessions emit a sidecar next to the mic WAV; success must remove it.
+        try SessionSidecar.write(
+            SessionSidecar(
+                schema: SessionSidecar.currentSchema, sessionId: "j2",
+                transcriptPath: fx.snapshot.filePath.path, startedAt: fx.snapshot.sessionStartTime,
+                sourceApp: "Test", sessionType: .voiceMemo, sampleRate: 48_000,
+                channels: 1, bitsPerSample: 32, appVersion: "test"
+            ),
+            to: SessionSidecar.sidecarURL(forWAV: fx.micWAV)
+        )
+
         let keepFolder = fx.dir.appendingPathComponent("keep", isDirectory: true)
         let job = makeJob(makeHandle(id: "j2", fixture: fx), retention: RecordingRetentionConfig(folder: keepFolder))
 
@@ -82,6 +93,8 @@ import Testing
         #expect(kept.count == 1, "combined recording must exist, got \(kept)")
         #expect(!FileManager.default.fileExists(atPath: fx.micWAV.path), "verified success deletes the capture WAV")
         #expect(!FileManager.default.fileExists(atPath: rotated.path), "verified success deletes rotated segments")
+        #expect(!FileManager.default.fileExists(atPath: SessionSidecar.sidecarURL(forWAV: fx.micWAV).path),
+                "verified success deletes the mic WAV's sidecar (mic-only sessions emit one)")
         #expect(try String(contentsOf: saved, encoding: .utf8).contains("recording: \"[["),
                 "transcript links to the retained audio")
     }

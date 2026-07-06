@@ -281,6 +281,20 @@ struct ContentView: View {
             guard let new else { return }
             handleJobCompleted(jobId: new.jobId, savedURL: new.savedURL, sessionType: new.sessionType)
         }
+        .onChange(of: services.postProcessingQueue.lastFailure) { _, failure in
+            guard let failure else { return }
+            // Walk the API lifecycle out of `.transcribing` — without this a failed
+            // job left /status reporting a transcription that would never finish.
+            apiServer.sessionDidComplete(id: failure.jobId)
+            // The WAVs were preserved; tell the user now, not at next launch.
+            Task {
+                await NotificationPresenter.shared.postJobFailure(
+                    message: failure.message,
+                    sessionType: failure.sessionType
+                )
+            }
+            transcriptionEngine?.lastError = failure.message
+        }
     }
 
     private func saveTranscriptToFile() {
@@ -808,7 +822,10 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
-                    exportVoiceprints: settings.exportVoiceprints
+                    exportVoiceprints: settings.exportVoiceprints,
+                    // Mic-only orphans (voice memos): the WAV IS the mic, so keeping
+                    // the live "You" lines would duplicate every word.
+                    preserveYou: orphan.sidecar?.sessionType != .voiceMemo
                 )
                 OrphanScanner.discard(orphan)
                 recovered += 1
@@ -927,7 +944,9 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
-                    exportVoiceprints: settings.exportVoiceprints
+                    exportVoiceprints: settings.exportVoiceprints,
+                    // Manual path has no sidecar; infer from the filename convention.
+                    preserveYou: !wavURL.lastPathComponent.hasSuffix(".mic.wav")
                 )
                 result = .success(saved)
             } catch {

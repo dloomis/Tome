@@ -113,6 +113,67 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         seconds < 120 ? "\(seconds) seconds" : "\(seconds / 60) minutes"
     }
 
+    // MARK: - Capture stall
+
+    /// One fixed identifier per leg so a re-post replaces (not stacks) and the
+    /// alert can be withdrawn when samples resume.
+    private nonisolated static func stallRequestID(leg: String) -> String {
+        "tome-capture-stall-\(leg.lowercased().replacingOccurrences(of: " ", with: "-"))"
+    }
+
+    /// A capture leg (microphone / system audio) stopped delivering samples
+    /// mid-recording. The control-bar error text is invisible behind the meeting
+    /// app — this is the signal that actually reaches the user in time to save
+    /// the rest of the meeting.
+    func postCaptureStall(leg: String, detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: \(leg) capture stalled"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: Self.stallRequestID(leg: leg),
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw a leg's stall alert after samples resume. Safe when nothing is posted.
+    func clearCaptureStall(leg: String) {
+        let center = UNUserNotificationCenter.current()
+        let id = Self.stallRequestID(leg: leg)
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+    }
+
+    // MARK: - Post-processing failure
+
+    /// A finalization job failed after the session ended. The capture WAVs were
+    /// preserved (see PostProcessingJob's verified-success cleanup) and the next
+    /// launch offers recovery — but the user needs to know now, not at next launch.
+    func postJobFailure(message: String, sessionType: SessionType) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = sessionType == .voiceMemo
+            ? "Voice memo finalization failed"
+            : "Meeting finalization failed"
+        content.body = "\(message) The audio was kept — Tome will offer recovery at next launch."
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(

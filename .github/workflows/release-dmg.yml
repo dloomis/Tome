@@ -7,6 +7,11 @@ on:
         description: "Release tag to build and publish (e.g. v1.3.0)"
         required: true
         type: string
+      allow_unsigned:
+        description: "Build without a signing certificate (TESTING ONLY — an ad-hoc signature changes every build, so installing it over a signed release revokes the user's Microphone and Screen Recording grants)"
+        required: false
+        type: boolean
+        default: false
   release:
     types: [published]
 
@@ -40,9 +45,19 @@ jobs:
       - name: Check for signing certificate
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
         run: |
           if [[ -n "$MACOS_CERTIFICATE" ]]; then
             echo "HAS_CERT=true" >> "$GITHUB_ENV"
+          elif [[ "$ALLOW_UNSIGNED" == "true" ]]; then
+            echo "::warning::Building UNSIGNED (allow_unsigned=true). Do not ship this build: installing it over a signed release resets users' TCC grants and the next meeting records no system audio."
+          else
+            # Hard gate: an ad-hoc signature changes every build. If Sparkle installs
+            # an ad-hoc release over a properly signed one, macOS silently revokes
+            # Microphone and Screen Recording — the next meeting is half- or
+            # un-captured with no visible error. Never let that ship by accident.
+            echo "::error::MACOS_CERTIFICATE secret is not configured. Refusing to build an unsigned release — set the secret, or re-run via workflow_dispatch with allow_unsigned=true for a test build."
+            exit 1
           fi
 
       - name: Import signing certificate

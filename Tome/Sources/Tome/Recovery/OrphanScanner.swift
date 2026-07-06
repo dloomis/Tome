@@ -53,11 +53,20 @@ enum OrphanScanner {
             at: dir,
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
         )) ?? []
-        // `.mic.wav` files are mic-track companions of a `<sid>.wav`, not diarization
-        // primaries — skip them so a session is listed once and recovery never offers
-        // a mic-only WAV.
-        let wavURLs = urls.filter {
-            $0.pathExtension.lowercased() == "wav" && !$0.lastPathComponent.hasSuffix(".mic.wav")
+        // `.mic.wav` files are usually mic-track companions of a `<sid>.wav` (call
+        // captures) — hidden so a session is listed once. But for a mic-only session
+        // (voice memo / in-person meeting) the mic WAV is the session's ONLY audio:
+        // when no sibling `<sid>.wav` exists, it surfaces as the primary. Rotated
+        // mic segments (`<sid>.pre-<ts>.mic.wav`) stay hidden — their session is
+        // already represented by its current-generation files.
+        let wavURLs = urls.filter { url in
+            guard url.pathExtension.lowercased() == "wav" else { return false }
+            let name = url.lastPathComponent
+            guard name.hasSuffix(".mic.wav") else { return true }
+            let base = String(name.dropLast(".mic.wav".count))
+            if base.contains(".pre-") { return false }
+            let sibling = url.deletingLastPathComponent().appendingPathComponent("\(base).wav")
+            return !FileManager.default.fileExists(atPath: sibling.path)
         }
         var orphans: [Orphan] = []
         for wavURL in wavURLs {
