@@ -68,6 +68,20 @@ final class MicCapture: @unchecked Sendable {
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
+    /// Hold a retiring engine for 15s before release. See the retire call site in
+    /// `bufferStream` — AVFAudio's async device-change callbacks reference the
+    /// engine that registered them, and deallocating it while they're queued is a
+    /// use-after-free inside the framework. The task's capture of `old` IS the
+    /// mechanism: release happens when the closure completes, long after any
+    /// in-flight AVAudioIOUnit-queue blocks have drained.
+    private static func retire(_ old: AVAudioEngine) {
+        Task.detached(priority: .background) {
+            try? await Task.sleep(for: .seconds(15))
+            _ = old
+            diagLog("[MIC-RETIRE] released a retired engine")
+        }
+    }
+
     /// Fired when the running engine posts `AVAudioEngineConfigurationChange` —
     /// Apple's contract is that the engine STOPS on audio-route/graph changes
     /// (Bluetooth connect, HFP↔A2DP renegotiation, device unplug) and the app
@@ -133,6 +147,17 @@ final class MicCapture: @unchecked Sendable {
             if let teardownException {
                 diagLog("[MIC-1-WARN] old engine teardown raised \(teardownException) — abandoning old engine instance")
             }
+            // Do NOT let the old engine deallocate here. AVFAudio queues
+            // IOUnitPropertyListener / IOBindingChanged blocks asynchronously on
+            // its AVAudioIOUnit queue when a device changes (AirPods connecting),
+            // and those blocks capture pointers into the engine that registered
+            // them. Releasing the engine while blocks are still queued is a
+            // use-after-free inside AVFAudio — field crash 2026-07-06 (macOS
+            // 26.2): SIGSEGV in objc_msgSend(sampleRate) from
+            // AVAudioIOUnit::IOUnitPropertyListener, PAC failure on a freed
+            // pointer. Park the retiring engine long enough for any queued
+            // callbacks to drain against a live (stopped, harmless) object.
+            Self.retire(self.engine)
             self.engine = AVAudioEngine()
 
             // Set input device before accessing inputNode format
