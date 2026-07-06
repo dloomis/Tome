@@ -149,6 +149,11 @@ struct RecordingRetentionConfig: Sendable {
 enum PostProcessingError: Error, Sendable {
     case diarizeFailed(String)
     case reTranscribeFailed(String)
+    /// The transcript on disk couldn't be read (or lacks the `## Transcript`
+    /// section a rewrite anchors on). Distinct from `markdownWriteFailed` because
+    /// callers must treat it as "the vault is unavailable / the note changed" —
+    /// never as success, and never as license to delete the source WAVs.
+    case markdownReadFailed(String)
     case markdownWriteFailed(String)
     case cancelled
 }

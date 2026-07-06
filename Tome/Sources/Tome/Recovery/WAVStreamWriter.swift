@@ -43,11 +43,19 @@ final class WAVStreamWriter: @unchecked Sendable {
     private let syncInterval: TimeInterval = 1.0
     private var closed = false
 
-    /// Open a WAV file at `url`. In `.create` mode (the default), overwrites any
-    /// existing file and writes the 44-byte header with placeholder sizes; sizes
-    /// are refreshed on every subsequent `write` so the file is always parseable.
-    /// In `.append` mode, reopens an existing file and picks up `dataBytes` from
-    /// its current size so header refreshes stay accurate.
+    /// Open a WAV file at `url`.
+    ///
+    /// `.create` (the default) starts a fresh file — but never destroys existing
+    /// audio: anything already at `url` is rotated aside to
+    /// `<stem>.pre-<millis>[.mic].wav` first (a reused session id would otherwise
+    /// truncate the previous session's capture). Rotated segments are removed by
+    /// the post-processing job's verified-success cleanup, or surfaced by the
+    /// orphan scan after a crash. Writes the 44-byte header with placeholder
+    /// sizes; sizes are refreshed on every subsequent `write` so the file is
+    /// always parseable.
+    ///
+    /// `.append` reopens an existing file (mid-session mic device swap) and picks
+    /// up `dataBytes` from its current size so header refreshes stay accurate.
     init(url: URL, sampleRate: Double, channels: UInt16 = 1, bitsPerSample: UInt16 = 32, mode: OpenMode = .create) throws {
         self.sampleRate = UInt32(sampleRate)
         self.channels = channels
@@ -55,6 +63,18 @@ final class WAVStreamWriter: @unchecked Sendable {
 
         switch mode {
         case .create:
+            if FileManager.default.fileExists(atPath: url.path) {
+                let rotated = Self.rotationURL(for: url)
+                do {
+                    try FileManager.default.moveItem(at: url, to: rotated)
+                    diagLog("[WAV-WRITER] rotated existing \(url.lastPathComponent) → \(rotated.lastPathComponent)")
+                } catch {
+                    // Rotation is best-effort: failing to preserve the old segment must
+                    // not block the new capture — recording continuity wins.
+                    diagLog("[WAV-WRITER] rotation failed for \(url.lastPathComponent) (overwriting): \(error)")
+                }
+            }
+
             let header = Self.buildHeader(
                 sampleRate: self.sampleRate,
                 channels: channels,
@@ -133,6 +153,24 @@ final class WAVStreamWriter: @unchecked Sendable {
         try fileHandle.write(contentsOf: Data(bytes: &dataSize, count: 4))
 
         try fileHandle.seek(toOffset: currentPos)
+    }
+
+    /// Sibling path an existing file is moved to before this writer claims `url`.
+    /// Keeps the `.mic.wav` tail intact (`<sid>.pre-<ts>.mic.wav`) so the orphan
+    /// scanner continues to treat mic segments as companions, never as diarization
+    /// primaries; system segments (`<sid>.pre-<ts>.wav`) do surface as orphans —
+    /// which is correct, they're unfinalized audio.
+    private static func rotationURL(for url: URL) -> URL {
+        let dir = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+        let ts = UInt64(Date().timeIntervalSince1970 * 1000)
+        if name.lowercased().hasSuffix(".mic.wav") {
+            let base = String(name.dropLast(".mic.wav".count))
+            return dir.appendingPathComponent("\(base).pre-\(ts).mic.wav")
+        }
+        let stem = url.deletingPathExtension().lastPathComponent
+        let ext = url.pathExtension
+        return dir.appendingPathComponent("\(stem).pre-\(ts).\(ext)")
     }
 
     /// Build the canonical 44-byte WAV header (RIFF/WAVE, fmt, data) with size

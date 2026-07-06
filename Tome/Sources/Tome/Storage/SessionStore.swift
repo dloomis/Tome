@@ -26,8 +26,15 @@ actor SessionStore {
         let filename = "\(sessionId).jsonl"
         currentFile = sessionsDirectory.appendingPathComponent(filename)
 
-        FileManager.default.createFile(atPath: currentFile!.path, contents: nil)
+        // `createFile` truncates, so only create when absent — a reused session id
+        // (second-granularity ids, or an API caller repeating one) must append to
+        // the existing journal rather than destroy it. `appendRecord` seeks to end
+        // before every write, so appending is already the write-path behavior.
+        if !FileManager.default.fileExists(atPath: currentFile!.path) {
+            FileManager.default.createFile(atPath: currentFile!.path, contents: nil)
+        }
         fileHandle = try? FileHandle(forWritingTo: currentFile!)
+        _ = try? fileHandle?.seekToEnd()
     }
 
     func appendRecord(_ record: SessionRecord) {

@@ -84,16 +84,21 @@ actor TranscriptLogger {
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
-        let filename: String
+        let stem: String
         if let suggested = suggestedFilename,
            let cleaned = FilenameSanitizer.sanitize(suggested) {
-            filename = "\(cleaned).md"
+            stem = cleaned
         } else {
             let datePrefix = FilenameSanitizer.formattedDate(now, format: filenameDateFormat)
-            let stem = sanitizedTypeLabel.isEmpty ? datePrefix : "\(datePrefix) \(sanitizedTypeLabel)"
-            filename = "\(stem).md"
+            stem = sanitizedTypeLabel.isEmpty ? datePrefix : "\(datePrefix) \(sanitizedTypeLabel)"
         }
-        currentFilePath = directory.appendingPathComponent(filename)
+        // Never clobber an existing note. `createFile` truncates whatever is at the
+        // path, so a repeated suggestedFilename (recurring meeting via the API) or
+        // two sessions in the same second would silently destroy the earlier
+        // transcript. Suffix "-1", "-2", … — same convention as the finalizer's
+        // rename-collision handling.
+        currentFilePath = Self.collisionFreeURL(in: directory, stem: stem)
+        let filename = currentFilePath!.lastPathComponent
 
         let content = """
 ---
@@ -133,6 +138,18 @@ tags:
         fileHandle = try FileHandle(forWritingTo: currentFilePath!)
         fileHandle?.seekToEndOfFile()
         return currentFilePath!
+    }
+
+    /// First free `<stem>.md`, `<stem>-1.md`, `<stem>-2.md`, … in `directory`.
+    /// Falls back to a UUID suffix rather than ever reusing an occupied path.
+    private static func collisionFreeURL(in directory: URL, stem: String) -> URL {
+        let first = directory.appendingPathComponent("\(stem).md")
+        guard FileManager.default.fileExists(atPath: first.path) else { return first }
+        for n in 1...100 {
+            let candidate = directory.appendingPathComponent("\(stem)-\(n).md")
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return directory.appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(8)).md")
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -214,8 +231,12 @@ tags:
         // before the rename. Without this, a crash between replace and the next
         // sync can leave a zero-byte file. The replace must only run if the tmp
         // write fully succeeded — swapping a partial tmp (disk full) over the
-        // live transcript would destroy everything recorded so far.
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".tome_tmp.md")
+        // live transcript would destroy everything recorded so far. The tmp name
+        // is unique per call: this runs while a previous session may be finalizing
+        // tmp files into the same folder, and a shared name would let one
+        // session's content replace the other's note.
+        let tmpPath = filePath.deletingLastPathComponent()
+            .appendingPathComponent(".tome_ctx_tmp-\(UUID().uuidString.prefix(8)).md")
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             if let tmpHandle = try? FileHandle(forUpdating: tmpPath) {

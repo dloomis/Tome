@@ -104,7 +104,10 @@ final class PostProcessingJob: Identifiable {
             diagLog("[JOB \(id)] diarization returned: \(diar == nil ? "nil" : "\(diar!.segments.count) segments")")
 
             if Task.isCancelled {
-                cleanupCaptureFiles()
+                // Leave the WAVs + sidecar in place: a cancelled job is an
+                // *unfinished* session, and the launch-time orphan scan is its
+                // recovery path. Deleting here would turn cancellation into
+                // permanent loss of the only diarization source.
                 phase = .cancelled
                 throw .cancelled
             }
@@ -133,7 +136,7 @@ final class PostProcessingJob: Identifiable {
                 )
 
                 if Task.isCancelled {
-                    cleanupCaptureFiles()
+                    // As above: keep the capture files so the orphan scan can recover.
                     phase = .cancelled
                     throw .cancelled
                 }
@@ -175,11 +178,20 @@ final class PostProcessingJob: Identifiable {
         do {
             savedPath = try TranscriptFinalizer.finalizeFrontmatter(snapshot: handle.transcript)
         } catch {
-            if let bufferURL = handle.wavBufferPath {
+            // Mic-only sessions have no system WAV — their preserved audio is the
+            // mic track, so log whichever capture file recovery will lean on.
+            if let bufferURL = handle.wavBufferPath ?? handle.micWavPath {
                 handleDurableWriteFailure(bufferURL: bufferURL, error: error)
             }
             phase = .failed(error)
             throw error
+        }
+
+        // Finalization may have renamed the note; the crash-recovery sidecar still
+        // points at the old path. Refresh it so a crash/quit between here and
+        // cleanup leaves an orphan that auto-recovery can actually pair up.
+        if savedPath != handle.transcript.filePath, let wavPath = handle.wavBufferPath {
+            SessionSidecar.updateTranscriptPath(forWAV: wavPath, to: savedPath)
         }
 
         // 2b. Emit per-speaker voiceprints next to the finalized transcript (opt-in).
@@ -207,43 +219,61 @@ final class PostProcessingJob: Identifiable {
             }
         }
 
-        // 3. Retain the combined recording before deleting the source WAVs. Failure
-        //    here is non-fatal — the transcript is already saved. On success, link the
-        //    transcript to its audio via an Obsidian wikilink in the frontmatter.
+        // 3. Retain the combined recording before deleting the source WAVs. The
+        //    transcript is already saved, so a retention failure doesn't fail the
+        //    job — but it MUST block cleanup: the user explicitly asked to keep this
+        //    audio, and the source WAVs are the only copy until the .m4a exists.
+        //    Preserved WAVs surface through the next-launch orphan scan.
+        var sourceAudioDisposition = SourceAudioDisposition.deletable
         if let retention {
-            if let audioURL = await exportRetainedRecording(to: retention.folder, transcriptPath: savedPath) {
+            switch await exportRetainedRecording(to: retention.folder, transcriptPath: savedPath) {
+            case .exported(let audioURL):
                 TranscriptFinalizer.setRecordingLink(filePath: savedPath, audioFilename: audioURL.lastPathComponent)
+            case .noSource:
+                break  // nothing to retain, nothing lost by cleanup
+            case .failed:
+                sourceAudioDisposition = .preserve
+                diagLog("[JOB \(id)] retention export failed — keeping capture WAVs in the sessions dir so the audio isn't lost (orphan scan will offer them next launch)")
             }
         }
 
-        cleanupCaptureFiles()
+        if sourceAudioDisposition == .deletable {
+            cleanupCaptureFiles()
+        }
 
         phase = .complete(savedPath)
         diagLog("[JOB \(id)] complete → \(savedPath.lastPathComponent)")
         return savedPath
     }
 
+    /// Whether the source capture WAVs may be deleted at the end of the job.
+    /// `.preserve` means a retention export the user asked for didn't land — the
+    /// WAVs are then the only copy of the audio and must survive the job.
+    private enum SourceAudioDisposition { case deletable, preserve }
+
+    /// Outcome of a retention export, distinguishing "nothing to export" (cleanup
+    /// is safe) from "export failed" (cleanup would destroy the only audio).
+    enum RetentionOutcome { case exported(URL), noSource, failed }
+
     /// Combine the session's mic + system WAVs into one `.m4a` in `folder`, named to
     /// match the transcript stem (with a numeric suffix on collision). Voice memos
     /// export the mic track only.
-    /// Returns the URL of the written `.m4a` on success, or nil if there was no source
-    /// audio, the folder couldn't be created, or the combine failed.
-    private func exportRetainedRecording(to folder: URL, transcriptPath: URL) async -> URL? {
+    private func exportRetainedRecording(to folder: URL, transcriptPath: URL) async -> RetentionOutcome {
         let micArg: (url: URL, firstSample: Date)? = pair(handle.micWavPath, handle.micFirstSampleTime)
         let systemArg: (url: URL, firstSample: Date)? = handle.sessionType == .callCapture
             ? pair(handle.wavBufferPath, handle.systemFirstSampleTime)
             : nil
         guard micArg != nil || systemArg != nil else {
             diagLog("[JOB \(id)] retention: no source audio to combine, skipping")
-            return nil
+            return .noSource
         }
 
         let sessionStart = handle.transcript.sessionStartTime
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
-            diagLog("[JOB \(id)] retention: could not create folder (non-fatal): \(error)")
-            return nil
+            diagLog("[JOB \(id)] retention: could not create folder: \(error)")
+            return .failed
         }
         let outputURL = uniqueURL(in: folder, stem: transcriptPath.deletingPathExtension().lastPathComponent, ext: "m4a")
 
@@ -255,23 +285,33 @@ final class PostProcessingJob: Identifiable {
                 diagLog("[JOB] retention: wrote \(outputURL.lastPathComponent)")
                 return true
             } catch {
-                diagLog("[JOB] retention: combine failed (non-fatal): \(error)")
+                diagLog("[JOB] retention: combine failed: \(error)")
                 return false
             }
         }.value
 
-        return produced ? outputURL : nil
+        return produced ? .exported(outputURL) : .failed
     }
 
     /// Delete both transient capture WAVs (and the system sidecar) for this session,
-    /// regardless of session type or retention. Runs on the success and cancellation
-    /// paths so neither file is orphaned.
+    /// plus any rotated `.pre-…` segments `WAVStreamWriter` set aside during the
+    /// session (e.g. a mid-session mic device swap). Runs ONLY on the verified
+    /// success path: every failure/cancellation path leaves the files in place for
+    /// the launch-time orphan scan — they are the only recovery source.
     private func cleanupCaptureFiles() {
         if let bufferURL = handle.wavBufferPath {
             SystemAudioCapture.cleanupBufferFile(bufferURL)
         }
         if let micURL = handle.micWavPath {
             try? FileManager.default.removeItem(at: micURL)
+        }
+        // Rotated segments share the session-id stem: `<sid>.pre-<ts>.wav` /
+        // `<sid>.pre-<ts>.mic.wav`, always next to the capture WAVs.
+        if let dir = (handle.wavBufferPath ?? handle.micWavPath)?.deletingLastPathComponent(),
+           let siblings = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for url in siblings where url.lastPathComponent.hasPrefix("\(id).pre-") {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 
