@@ -299,9 +299,20 @@ final class TranscriptionEngine {
         installDefaultDeviceListener()
     }
 
+    /// Timestamps of recent config-driven rebuilds — loop suppression window.
+    private var recentMicRebuilds: [Date] = []
+
     /// Schedule a debounced mic rebuild on the CURRENT device selection. Fired by
     /// `AVAudioEngineConfigurationChange`; coalesces the notification flurries a
     /// Bluetooth transition produces into one restart after the graph settles.
+    ///
+    /// The notification is only a HINT: on this macOS the engine can post it
+    /// after a (re)start even though capture is healthy, so an ungated rebuild
+    /// tears down a working mic and re-triggers itself — observed in the field as
+    /// Micro Snitch showing the mic bouncing every ~1.2s until the HAL refused
+    /// further binds with 'nope'. Two gates below: ground truth (tap still
+    /// delivering → never rebuild) and a rate limiter (4/minute → stand down and
+    /// leave recovery to the stall watchdog).
     private func scheduleMicRebuild(reason: String) {
         guard isRunning else { return }
         micRebuildTask?.cancel()
@@ -309,6 +320,26 @@ final class TranscriptionEngine {
             try? await Task.sleep(for: .milliseconds(1200))
             guard !Task.isCancelled else { return }
             guard let self, self.isRunning else { return }
+
+            // Gate 1 — ground truth: a tap that delivered within the last 2s is
+            // alive; the notification was informational. Touch nothing.
+            if let last = self.micCapture.lastSampleTime,
+               Date().timeIntervalSince(last) < 2.0 {
+                diagLog("[ENGINE-MIC-REBUILD] skipped (\(reason)) — tap is delivering")
+                return
+            }
+
+            // Gate 2 — loop breaker: a rebuild whose replacement also dies re-fires
+            // the notification; without a cap that storm hammers the HAL. After 4
+            // rebuilds in 60s, stand down — the watchdog retries on its own cadence.
+            let now = Date()
+            self.recentMicRebuilds.removeAll { now.timeIntervalSince($0) > 60 }
+            guard self.recentMicRebuilds.count < 4 else {
+                diagLog("[ENGINE-MIC-REBUILD] suppressed (\(reason)) — \(self.recentMicRebuilds.count) rebuilds in 60s; deferring to the watchdog")
+                return
+            }
+            self.recentMicRebuilds.append(now)
+
             diagLog("[ENGINE-MIC-REBUILD] \(reason) — restarting mic on current selection")
             self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
         }
@@ -468,6 +499,7 @@ final class TranscriptionEngine {
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil
+        recentMicRebuilds = []
         sysWatchdogTask?.cancel()
         sysWatchdogTask = nil
         micTask?.cancel()
