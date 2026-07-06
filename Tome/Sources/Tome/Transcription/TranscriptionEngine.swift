@@ -349,13 +349,22 @@ final class TranscriptionEngine {
         let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
         // Setup failures are synchronous (see start()) — a failed restart means the
-        // user's side is NOT being recorded. Surface loudly; the session continues
-        // (system audio may still be flowing) and the watchdog keeps monitoring.
+        // user's side is NOT being recorded. Surface loudly, and try ONE fallback
+        // to the system default before giving up: a specific device refusing to
+        // bind (HAL 'nope' during a Bluetooth transition, a stale id) shouldn't
+        // leave the mic dead when another input would work. The watchdog keeps
+        // monitoring either way.
         if let micError = micCapture.captureError {
             let msg = "Mic restart failed: \(micError)"
             lastError = msg
             diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
             Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
+            if targetMicID != 0,
+               let fallback = MicCapture.defaultInputDeviceID(), fallback != targetMicID {
+                diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback))")
+                restartMic(inputDeviceID: 0, force: true)
+            }
+            return
         }
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(

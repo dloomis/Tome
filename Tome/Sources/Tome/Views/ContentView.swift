@@ -150,6 +150,17 @@ struct ContentView: View {
             guard let engine = transcriptionEngine else { return }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
 
+            // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
+            // so a device chosen last session (AirPods) may be absent — or worse,
+            // its numeric id reassigned — at this launch. An absent selection left
+            // the Settings picker EMPTY and sessions targeting a dead id. Fall
+            // back to System Default, which is always valid.
+            if settings.inputDeviceID != 0,
+               !MicCapture.availableInputDevices().contains(where: { $0.id == settings.inputDeviceID }) {
+                diagLog("[BOOT] persisted mic device \(settings.inputDeviceID) not present — resetting to System Default")
+                settings.inputDeviceID = 0
+            }
+
             // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
             if utteranceWriterTask == nil {
                 let (stream, cont) = AsyncStream.makeStream(of: UtteranceWrite.self)

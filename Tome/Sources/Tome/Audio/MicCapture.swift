@@ -114,10 +114,25 @@ final class MicCapture: @unchecked Sendable {
 
             diagLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
+            // Detach the config-change observer BEFORE touching the old engine:
+            // teardown can itself fire AVAudioEngineConfigurationChange on that
+            // engine, and an observer still attached would schedule a rebuild of
+            // the capture we are deliberately replacing — a self-sustaining
+            // restart loop that hammers the HAL (which then starts refusing
+            // device binds with 'nope').
+            self.removeConfigObserver()
+
             // Fresh engine per capture — see the `engine` property comment. Tear the
             // old one down first so its HAL unit releases the previous device.
-            self.engine.inputNode.removeTap(onBus: 0)
-            self.engine.stop()
+            // Teardown of a wedged engine (mid Bluetooth-graph transition) can raise
+            // an NSException just like tap installation — guard it the same way.
+            let teardownException = TomeCatchObjCException {
+                self.engine.inputNode.removeTap(onBus: 0)
+                self.engine.stop()
+            }
+            if let teardownException {
+                diagLog("[MIC-1-WARN] old engine teardown raised \(teardownException) — abandoning old engine instance")
+            }
             self.engine = AVAudioEngine()
 
             // Set input device before accessing inputNode format
@@ -342,8 +357,13 @@ final class MicCapture: @unchecked Sendable {
 
     func stop() {
         removeConfigObserver()
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        let teardownException = TomeCatchObjCException {
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.engine.stop()
+        }
+        if let teardownException {
+            diagLog("[MIC-STOP-WARN] engine teardown raised \(teardownException)")
+        }
         _audioLevel.value = 0
         _lastSampleTime.withLock { $0 = nil }
         _captureStartTime.withLock { $0 = nil }
