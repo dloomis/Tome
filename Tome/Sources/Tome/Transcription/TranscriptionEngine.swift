@@ -79,6 +79,14 @@ final class TranscriptionEngine {
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
+    /// Debounced mic rebuild scheduled by `AVAudioEngineConfigurationChange`.
+    /// Bluetooth transitions (AirPods connect, HFP↔A2DP renegotiation) fire the
+    /// notification in flurries and kill the tap each time; the debounce lets the
+    /// audio graph settle so the rebuild lands on stable ground. If a rebuild
+    /// itself gets killed by a late transition, the next notification simply
+    /// schedules another — a self-healing loop with natural backoff.
+    private var micRebuildTask: Task<Void, Never>?
+
     init(transcriptStore: TranscriptStore, asrCoordinator: ASRCoordinator) {
         self.transcriptStore = transcriptStore
         self.asrCoordinator = asrCoordinator
@@ -138,6 +146,12 @@ final class TranscriptionEngine {
         }
 
         // 2. Start mic capture
+        // Route/graph changes stop the engine silently (observed: AirPods
+        // connecting killed a running Brio tap with zero errors) — rebuild the
+        // mic when that happens instead of waiting for the 15s stall watchdog.
+        micCapture.onConfigurationChange = { [weak self] in
+            Task { @MainActor in self?.scheduleMicRebuild(reason: "engine configuration change") }
+        }
         userSelectedDeviceID = inputDeviceID
         let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID()
         currentMicDeviceID = targetMicID ?? 0
@@ -285,6 +299,21 @@ final class TranscriptionEngine {
         installDefaultDeviceListener()
     }
 
+    /// Schedule a debounced mic rebuild on the CURRENT device selection. Fired by
+    /// `AVAudioEngineConfigurationChange`; coalesces the notification flurries a
+    /// Bluetooth transition produces into one restart after the graph settles.
+    private func scheduleMicRebuild(reason: String) {
+        guard isRunning else { return }
+        micRebuildTask?.cancel()
+        micRebuildTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            guard let self, self.isRunning else { return }
+            diagLog("[ENGINE-MIC-REBUILD] \(reason) — restarting mic on current selection")
+            self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+        }
+    }
+
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
     /// `force` skips the same-device short-circuit — used by the capture watchdog to
@@ -303,6 +332,10 @@ final class TranscriptionEngine {
         }
 
         diagLog("[ENGINE-MIC-SWAP] switching mic from \(currentMicDeviceID) to \(targetMicID)")
+
+        // A user/watchdog-initiated restart supersedes any pending debounced rebuild.
+        micRebuildTask?.cancel()
+        micRebuildTask = nil
 
         // Tear down old mic
         micTask?.cancel()
@@ -423,6 +456,9 @@ final class TranscriptionEngine {
     func stop() async {
         lastError = nil
         removeDefaultDeviceListener()
+        micRebuildTask?.cancel()
+        micRebuildTask = nil
+        micCapture.onConfigurationChange = nil
         sysWatchdogTask?.cancel()
         sysWatchdogTask = nil
         micTask?.cancel()
@@ -471,7 +507,7 @@ final class TranscriptionEngine {
         sysWatchdogTask = Task { [weak self] in
             var sysDetector = CaptureStallDetector(threshold: 15)
             var micDetector = CaptureStallDetector(threshold: 15)
-            var micRestartAttempted = false
+            var stalledTicksSinceRestart = 0
             var lastTick = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -509,16 +545,25 @@ final class TranscriptionEngine {
                 if let micEvent {
                     switch micEvent {
                     case .stalled:
-                        if !micRestartAttempted {
-                            micRestartAttempted = true
-                            attemptMicRestart = true
-                        }
+                        attemptMicRestart = true
+                        stalledTicksSinceRestart = 0
                     case .resumed:
-                        micRestartAttempted = false
+                        stalledTicksSinceRestart = 0
+                    }
+                } else if micDetector.isStalled {
+                    // Still latched with no fresh event: re-attempt periodically
+                    // rather than once per episode — a restart that lands inside a
+                    // mid-transition Bluetooth graph dies too, and the next attempt
+                    // a few ticks later finds settled ground (observed 2026-07-06).
+                    stalledTicksSinceRestart += 1
+                    if stalledTicksSinceRestart >= 3 {
+                        stalledTicksSinceRestart = 0
+                        attemptMicRestart = true
+                        diagLog("[WATCHDOG] mic still stalled — re-attempting restart")
                     }
                 }
 
-                guard sysEvent != nil || micEvent != nil else { continue }
+                guard sysEvent != nil || micEvent != nil || attemptMicRestart else { continue }
                 let restart = attemptMicRestart
                 await MainActor.run {
                     guard let self, self.isRunning else { return }

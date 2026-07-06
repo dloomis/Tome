@@ -68,6 +68,39 @@ final class MicCapture: @unchecked Sendable {
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
+    /// Fired when the running engine posts `AVAudioEngineConfigurationChange` —
+    /// Apple's contract is that the engine STOPS on audio-route/graph changes
+    /// (Bluetooth connect, HFP↔A2DP renegotiation, device unplug) and the app
+    /// must bring it back up. Without this, the tap dies silently and only the
+    /// 15s watchdog notices (observed 2026-07-06: AirPods connecting killed a
+    /// running Brio tap with zero errors). The engine layer debounces and
+    /// rebuilds on the CURRENT device.
+    var onConfigurationChange: (@Sendable () -> Void)?
+
+    /// Observer token for the current engine's configuration-change notification.
+    private let _configObserver = OSAllocatedUnfairLock<NSObjectProtocol?>(uncheckedState: nil)
+
+    private func removeConfigObserver() {
+        _configObserver.withLock { token in
+            if let token { NotificationCenter.default.removeObserver(token) }
+            token = nil
+        }
+    }
+
+    private func installConfigObserver(for engine: AVAudioEngine) {
+        removeConfigObserver()
+        let callback = { [weak self] in self?.onConfigurationChange?() }
+        let token = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { _ in
+            diagLog("[MIC-CONFIG] AVAudioEngineConfigurationChange — engine stopped by a route/graph change")
+            callback()
+        }
+        _configObserver.withLock { $0 = token }
+    }
+
     /// - Parameter recordOutputURL: when non-nil, the mic track is also written to a
     ///   WAV at this path (float32 mono) for post-session retention. Multi-channel
     ///   devices are downmixed to mono (all channels averaged) so the live mic
@@ -287,6 +320,8 @@ final class MicCapture: @unchecked Sendable {
                     // sends). Deliberately NOT _lastSampleTime: only real tap
                     // buffers may clear a stall.
                     self._captureStartTime.withLock { $0 = Date() }
+                    // Route/graph changes stop this engine silently; watch for them.
+                    self.installConfigObserver(for: self.engine)
                 } catch {
                     startError = error
                 }
@@ -306,6 +341,7 @@ final class MicCapture: @unchecked Sendable {
     }
 
     func stop() {
+        removeConfigObserver()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         _audioLevel.value = 0

@@ -53,16 +53,57 @@ private struct GeneralTab: View {
 
 // MARK: - Audio
 
+/// Live input-device list: enumerates on start and re-enumerates whenever
+/// CoreAudio's device set changes (AirPods connecting, USB mic plugged in).
+/// The previous enumerate-once-in-onAppear left newly attached devices
+/// invisible until the user bounced between Settings tabs.
+@Observable
+@MainActor
+private final class InputDeviceList {
+    private(set) var devices: [(id: AudioDeviceID, name: String)] = []
+    private var listenerBlock: AudioObjectPropertyListenerBlock?
+
+    private var devicesAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    func start() {
+        refresh()
+        guard listenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        listenerBlock = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devicesAddress, DispatchQueue.main, block
+        )
+    }
+
+    func stop() {
+        guard let block = listenerBlock else { return }
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devicesAddress, DispatchQueue.main, block
+        )
+        listenerBlock = nil
+    }
+
+    private func refresh() {
+        devices = MicCapture.availableInputDevices()
+    }
+}
+
 private struct AudioTab: View {
     @Bindable var settings: AppSettings
-    @State private var inputDevices: [(id: AudioDeviceID, name: String)] = []
+    @State private var deviceList = InputDeviceList()
 
     var body: some View {
         Form {
             Section("Input") {
                 Picker("Microphone", selection: $settings.inputDeviceID) {
                     Text("System Default").tag(AudioDeviceID(0))
-                    ForEach(inputDevices, id: \.id) { device in
+                    ForEach(deviceList.devices, id: \.id) { device in
                         Text(device.name).tag(device.id)
                     }
                 }
@@ -89,9 +130,8 @@ private struct AudioTab: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear {
-            inputDevices = MicCapture.availableInputDevices()
-        }
+        .onAppear { deviceList.start() }
+        .onDisappear { deviceList.stop() }
     }
 }
 
