@@ -102,12 +102,15 @@ private struct AudioTab: View {
         Form {
             Section("Input") {
                 Picker("Microphone", selection: $settings.inputDeviceID) {
-                    Text("System Default").tag(AudioDeviceID(0))
+                    Text("System Default (recommended)").tag(AudioDeviceID(0))
                     ForEach(deviceList.devices, id: \.id) { device in
                         Text(device.name).tag(device.id)
                     }
                 }
                 .font(.system(size: 12))
+                Text("System Default follows macOS — when AirPods connect, recording moves with them. Pinning a specific mic fights macOS's automatic switching and can drop out during Bluetooth transitions; if a pinned mic keeps failing mid-session, Tome falls back to System Default for that session.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             Section("Silence") {

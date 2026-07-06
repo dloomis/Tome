@@ -553,6 +553,7 @@ final class TranscriptionEngine {
             var sysDetector = CaptureStallDetector(threshold: 15)
             var micDetector = CaptureStallDetector(threshold: 15)
             var stalledTicksSinceRestart = 0
+            var failedRecoveryAttempts = 0
             var lastTick = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -623,13 +624,33 @@ final class TranscriptionEngine {
                     stalledTicksSinceRestart = 0
                 }
 
+                // Track recovery outcomes: any sign of life resets the counter.
+                if micEvent == .resumed || (micTapSample.map { now.timeIntervalSince($0) < 10 } ?? false) {
+                    failedRecoveryAttempts = 0
+                }
+                if attemptMicRestart { failedRecoveryAttempts += 1 }
+
+                // Graceful surrender: a pinned device that keeps failing recovery
+                // (macOS deliberately moves input to AirPods on connect; fighting
+                // that bounces capture on/off indefinitely — field-observed
+                // 2026-07-06). After 3 failed cycles, follow the system default for
+                // THIS session; Settings keeps the user's pin for next time.
+                let surrenderPin = attemptMicRestart && failedRecoveryAttempts >= 3
+
                 guard sysEvent != nil || micEvent != nil || attemptMicRestart else { continue }
                 let restart = attemptMicRestart
                 await MainActor.run {
                     guard let self, self.isRunning else { return }
                     if let sysEvent { self.handleStallEvent(sysEvent, leg: "System audio") }
                     if let micEvent { self.handleStallEvent(micEvent, leg: "Microphone") }
-                    if restart {
+                    if surrenderPin && self.userSelectedDeviceID != 0 {
+                        diagLog("[WATCHDOG] pinned mic failed \(failedRecoveryAttempts) recovery cycles — following System Default for this session")
+                        let msg = "The selected microphone kept failing — following the system default for this session. Your Settings choice is unchanged."
+                        self.lastError = msg
+                        Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
+                        self.userSelectedDeviceID = 0
+                        self.restartMic(inputDeviceID: 0, force: true)
+                    } else if restart {
                         diagLog("[WATCHDOG] attempting automatic mic restart")
                         self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
                     }
