@@ -6,9 +6,15 @@ actor SessionStore {
     private var fileHandle: FileHandle?
     private let encoder = JSONEncoder()
 
-    init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        sessionsDirectory = appSupport.appendingPathComponent("Tome/sessions", isDirectory: true)
+    /// - Parameter directory: override for tests; production uses
+    ///   `~/Library/Application Support/Tome/sessions/`.
+    init(directory: URL? = nil) {
+        if let directory {
+            sessionsDirectory = directory
+        } else {
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            sessionsDirectory = appSupport.appendingPathComponent("Tome/sessions", isDirectory: true)
+        }
 
         try? FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
 
