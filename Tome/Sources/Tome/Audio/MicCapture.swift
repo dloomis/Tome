@@ -48,15 +48,22 @@ final class MicCapture: @unchecked Sendable {
     private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
 
-    /// Wall-clock time of the most recent buffer delivered by the tap while
-    /// capture is active; `nil` when not capturing. The engine's watchdog reads
-    /// this to detect a mic that has silently stopped delivering (device pulled,
-    /// HAL wedge) — AVAudioEngine reports no error in those cases, mirroring the
-    /// SCStream behavior `SystemAudioCapture.lastSampleTime` exists for. Seeded
-    /// at successful engine start so watchdog grace begins then, not at the
-    /// first (possibly never-arriving) buffer.
+    /// Wall-clock time of the most recent buffer delivered by the TAP while
+    /// capture is active; `nil` when not capturing or before the first buffer.
+    /// The engine's watchdog reads this to detect a mic that silently stopped
+    /// delivering (device pulled, HAL wedge) — AVAudioEngine reports no error in
+    /// those cases, mirroring `SystemAudioCapture.lastSampleTime`. Written ONLY
+    /// by the tap callback: the watchdog treats it as authoritative evidence of
+    /// real audio (a stall may only clear on this, never on the start seed below).
     private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
+
+    /// Wall-clock time capture was (re)started, seeded on successful engine
+    /// start. The watchdog uses it as the stall baseline while the tap hasn't
+    /// delivered yet — so a device that never sends a single buffer still alarms
+    /// ~threshold seconds after start — but it can never CLEAR a stall.
+    private let _captureStartTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var captureStartTime: Date? { _captureStartTime.withLock { $0 } }
 
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
@@ -275,9 +282,11 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-7] engine prepared, starting...")
                     try self.engine.start()
                     diagLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
-                    // Seed the watchdog clock now — grace period starts at engine
-                    // start, not at the first buffer (which a wedged device never sends).
-                    self._lastSampleTime.withLock { $0 = Date() }
+                    // Seed the watchdog baseline — grace period starts at engine
+                    // start, not at the first buffer (which a wedged device never
+                    // sends). Deliberately NOT _lastSampleTime: only real tap
+                    // buffers may clear a stall.
+                    self._captureStartTime.withLock { $0 = Date() }
                 } catch {
                     startError = error
                 }
@@ -301,6 +310,7 @@ final class MicCapture: @unchecked Sendable {
         engine.stop()
         _audioLevel.value = 0
         _lastSampleTime.withLock { $0 = nil }
+        _captureStartTime.withLock { $0 = nil }
         // Flush + finalize the retention WAV. firstSampleTime is intentionally
         // preserved so the engine can snapshot it after stop.
         _retentionWriter.withLock { state in

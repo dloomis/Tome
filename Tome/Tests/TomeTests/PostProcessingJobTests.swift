@@ -66,12 +66,16 @@ import Testing
                 "a failed retention export must never delete the only copy of the audio")
     }
 
-    @Test func retentionSuccessExportsThenCleansUpIncludingRotatedSegments() async throws {
+    @Test func retentionSuccessExportsThenCleansUpButKeepsUnmixedRotations() async throws {
         let fx = try await makeFixture(id: "j2")
         defer { TestSupport.remove(fx.dir) }
 
-        // A rotated pre-swap segment from a mid-session mic change.
-        let rotated = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j2.pre-111.mic.wav"), seconds: 1)
+        // A rotated pre-swap segment from THIS session (timestamp after session
+        // start). The mixer only reads the current-generation WAV, so this audio
+        // is NOT in the exported .m4a — with retention on, deleting it would
+        // silently drop the pre-swap audio the user asked to keep.
+        let ownTs = UInt64((fx.snapshot.sessionStartTime.timeIntervalSince1970 + 1) * 1000)
+        let rotated = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j2.pre-\(ownTs).mic.wav"), seconds: 1)
 
         // Mic-only sessions emit a sidecar next to the mic WAV; success must remove it.
         try SessionSidecar.write(
@@ -92,11 +96,35 @@ import Testing
         let kept = try FileManager.default.contentsOfDirectory(atPath: keepFolder.path).filter { $0.hasSuffix(".m4a") }
         #expect(kept.count == 1, "combined recording must exist, got \(kept)")
         #expect(!FileManager.default.fileExists(atPath: fx.micWAV.path), "verified success deletes the capture WAV")
-        #expect(!FileManager.default.fileExists(atPath: rotated.path), "verified success deletes rotated segments")
+        #expect(FileManager.default.fileExists(atPath: rotated.path),
+                "with retention ON, an unmixed same-session rotation is kept — it holds audio absent from the export")
         #expect(!FileManager.default.fileExists(atPath: SessionSidecar.sidecarURL(forWAV: fx.micWAV).path),
                 "verified success deletes the mic WAV's sidecar (mic-only sessions emit one)")
         #expect(try String(contentsOf: saved, encoding: .utf8).contains("recording: \"[["),
                 "transcript links to the retained audio")
+    }
+
+    @Test func retentionOffCleanupRemovesOwnRotationsOnly() async throws {
+        // With retention OFF the session's audio is discarded by design — its own
+        // rotations go too. But a rotation stamped BEFORE this session started is
+        // a PRIOR session's preserved audio (rotated aside when this session
+        // claimed the path after that session failed to finalize) — this
+        // session's success says nothing about it.
+        let fx = try await makeFixture(id: "j7")
+        defer { TestSupport.remove(fx.dir) }
+
+        let ownTs = UInt64((fx.snapshot.sessionStartTime.timeIntervalSince1970 + 1) * 1000)
+        let own = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j7.pre-\(ownTs).mic.wav"), seconds: 1)
+        let priorTs = UInt64((fx.snapshot.sessionStartTime.timeIntervalSince1970 - 3600) * 1000)
+        let prior = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j7.pre-\(priorTs).wav"), seconds: 1)
+
+        let job = makeJob(makeHandle(id: "j7", fixture: fx))
+        _ = try await job.run(using: ASRCoordinator())
+
+        #expect(!FileManager.default.fileExists(atPath: own.path),
+                "retention off: this session's rotations are discarded with its audio")
+        #expect(FileManager.default.fileExists(atPath: prior.path),
+                "a prior session's preserved (unfinalized) audio must survive this session's success")
     }
 
     @Test func finalizeFailurePreservesSourceAudio() async throws {

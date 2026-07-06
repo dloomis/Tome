@@ -45,4 +45,45 @@ import Testing
         #expect(f.sessionType == .voiceMemo)
         #expect(queue.lastCompletion == nil, "a failed job must not look like a completion")
     }
+
+    @Test func consecutiveIdenticalFailuresAreDistinctEvents() async throws {
+        // ContentView observes lastFailure via onChange, which fires only when
+        // the VALUE changes. Session ids are second-granular and reusable by API
+        // callers — two failures with the same id and message must still compare
+        // unequal, or the second one is invisible: no notification, and the API
+        // lifecycle stuck in `transcribing` forever.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let vault = dir.appendingPathComponent("vault", isDirectory: true)
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+
+        func failingJob() -> PostProcessingJob {
+            // Identical failure identity on purpose: same id, same missing note.
+            let snap = TestSupport.snapshot(filePath: vault.appendingPathComponent("gone.md"))
+            let handle = SessionHandle(
+                id: "dup", sessionType: .voiceMemo, sourceApp: "T",
+                wavBufferPath: nil, micWavPath: nil, micFirstSampleTime: nil,
+                systemFirstSampleTime: nil, transcript: snap
+            )
+            return PostProcessingJob(handle: handle, clusterThreshold: 0.7, numberOfSpeakers: 0)
+        }
+
+        let queue = PostProcessingQueue(asr: ASRCoordinator())
+        queue.enqueue(failingJob())
+        var first: PostProcessingQueue.JobFailure?
+        for _ in 0..<100 {
+            if let f = queue.lastFailure { first = f; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let f1 = try #require(first)
+
+        queue.enqueue(failingJob())
+        var second: PostProcessingQueue.JobFailure?
+        for _ in 0..<100 {
+            if let f = queue.lastFailure, f != f1 { second = f; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(second != nil,
+                "a second identical failure must be a distinct value or onChange observers never see it")
+    }
 }

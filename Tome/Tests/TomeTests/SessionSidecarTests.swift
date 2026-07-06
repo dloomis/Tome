@@ -96,4 +96,21 @@ import Testing
         try #"{"schema": 0, "sessionId": "s"}"#.write(to: url, atomically: true, encoding: .utf8)
         #expect(throws: (any Error).self) { try SessionSidecar.read(from: url) }
     }
+
+    @Test func futureSchemaSidecarIsRejectedNotTrusted() throws {
+        // A NEWER app's sidecar may be field-compatible but semantically
+        // different — an older build must refuse it (degrading to manual
+        // recovery) rather than acting on fields it doesn't understand.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let url = dir.appendingPathComponent("future.session.json")
+        let json = """
+        {"schema": 999, "sessionId": "s", "transcriptPath": "/vault/N.md",
+         "startedAt": "2026-07-05T10:00:00Z", "sourceApp": "T", "sessionType": "callCapture",
+         "sampleRate": 48000, "channels": 1, "bitsPerSample": 32, "appVersion": "9.9"}
+        """
+        try json.write(to: url, atomically: true, encoding: .utf8)
+        #expect(throws: (any Error).self) { try SessionSidecar.read(from: url) }
+    }
 }

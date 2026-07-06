@@ -126,6 +126,17 @@ final class TranscriptionEngine {
 
         guard let vadManager else { return }
 
+        // stopSession can run while the model load above was suspended: stop()
+        // flips isRunning false and tears down (nothing yet). Without this
+        // re-check, start would proceed to bring up capture + watchdog for a
+        // session the UI already considers dead — mic left recording with the
+        // app showing idle.
+        guard isRunning else {
+            diagLog("[ENGINE-2-ABORT] stopped during model load — not starting capture")
+            assetStatus = "Ready"
+            return
+        }
+
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
         let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID()
@@ -156,6 +167,13 @@ final class TranscriptionEngine {
             diagLog("[ENGINE-3-FAIL] mic capture failed at start: \(micError)")
             lastError = micError
             micCapture.stop()
+            // No audio was ever delivered — remove the just-provisioned mic
+            // artifacts (header-only WAV + sidecar) so they don't accumulate as
+            // sub-threshold junk the orphan scanner can never surface.
+            if let micURL = currentMicBufferURL {
+                try? FileManager.default.removeItem(at: micURL)
+                SessionSidecar.deleteIfExists(forWAV: micURL)
+            }
             assetStatus = "Ready"
             isRunning = false
             endLiveActivity()
@@ -186,6 +204,17 @@ final class TranscriptionEngine {
             diagLog("[ENGINE-4] system audio capture skipped (mic-only session)")
             sysStreams = nil
             currentBufferURL = nil
+        }
+
+        // Same stop-during-await race as after model load: the system-audio
+        // bring-up suspended above. If stop ran meanwhile, unwind the capture we
+        // just started instead of leaving a headless recording.
+        guard isRunning else {
+            diagLog("[ENGINE-4-ABORT] stopped during capture bring-up — unwinding")
+            micCapture.stop()
+            await systemCapture.stop()
+            assetStatus = "Ready"
+            return
         }
 
         // 4. Start mic transcription
@@ -443,14 +472,38 @@ final class TranscriptionEngine {
             var sysDetector = CaptureStallDetector(threshold: 15)
             var micDetector = CaptureStallDetector(threshold: 15)
             var micRestartAttempted = false
+            var lastTick = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 if Task.isCancelled { return }
                 let now = Date()
+                // System sleep detection: Task.sleep runs on a clock that keeps
+                // counting across a lid-close, so after wake the sample gaps
+                // include the entire sleep. That's not a capture stall — reset
+                // both detectors and let a fresh window elapse before alarming
+                // (a real post-wake stall alarms one threshold later).
+                if now.timeIntervalSince(lastTick) > 15 {
+                    diagLog("[WATCHDOG] tick gap \(Int(now.timeIntervalSince(lastTick)))s — system slept; resetting stall windows")
+                    sysDetector = CaptureStallDetector(threshold: 15)
+                    micDetector = CaptureStallDetector(threshold: 15)
+                    lastTick = now
+                    continue
+                }
+                lastTick = now
+
+                // The mic's tap-written timestamp is authoritative; the start
+                // seed is only a baseline so a never-delivering device still
+                // alarms. A seeded clock must never CLEAR a stall (see
+                // CaptureStallDetector.evaluate(canResume:)).
+                let micTapSample = mic.lastSampleTime
                 let sysEvent = systemLegActive
                     ? sysDetector.evaluate(lastSample: sysCapture.lastSampleTime, now: now)
                     : nil
-                let micEvent = micDetector.evaluate(lastSample: mic.lastSampleTime, now: now)
+                let micEvent = micDetector.evaluate(
+                    lastSample: micTapSample ?? mic.captureStartTime,
+                    now: now,
+                    canResume: micTapSample != nil
+                )
 
                 var attemptMicRestart = false
                 if let micEvent {
@@ -489,7 +542,9 @@ final class TranscriptionEngine {
             Task { await NotificationPresenter.shared.postCaptureStall(leg: leg, detail: msg) }
         case .resumed:
             diagLog("[WATCHDOG] \(leg) capture resumed")
-            if lastError?.contains("capture stalled") == true {
+            // Leg-specific clear: a mic resume must not wipe a still-active
+            // system-audio stall banner (or vice versa).
+            if lastError?.hasPrefix("\(leg) capture stalled") == true {
                 lastError = nil
             }
             NotificationPresenter.shared.clearCaptureStall(leg: leg)

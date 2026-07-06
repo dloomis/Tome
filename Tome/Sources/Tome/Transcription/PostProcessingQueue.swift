@@ -24,6 +24,9 @@ final class PostProcessingQueue {
         let savedURL: URL
         let sourceApp: String
         let sessionType: SessionType
+        /// Occurrence stamp — same rationale as `JobFailure.failedAt`: a reused
+        /// session id finishing at the same path must still read as a new event.
+        let completedAt: Date
     }
 
     /// Published when a job throws. Observers (ContentView) surface it to the
@@ -35,6 +38,10 @@ final class PostProcessingQueue {
         let jobId: String
         let message: String
         let sessionType: SessionType
+        /// Occurrence stamp. Session ids are second-granular and reusable by API
+        /// callers, so two consecutive identical failures would otherwise compare
+        /// equal — and `.onChange` observers would never see the second one.
+        let failedAt: Date
     }
 
     /// Bindable summary for UI: true while any job is queued or running.
@@ -87,14 +94,16 @@ final class PostProcessingQueue {
                     jobId: job.id,
                     savedURL: savedURL,
                     sourceApp: job.handle.sourceApp,
-                    sessionType: job.handle.sessionType
+                    sessionType: job.handle.sessionType,
+                    completedAt: Date()
                 )
             } catch {
                 diagLog("[QUEUE] Job \(job.id) failed: \(error)")
                 lastFailure = JobFailure(
                     jobId: job.id,
                     message: failureMessage(for: error),
-                    sessionType: job.handle.sessionType
+                    sessionType: job.handle.sessionType,
+                    failedAt: Date()
                 )
             }
 

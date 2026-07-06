@@ -87,11 +87,23 @@ struct SessionSidecar: Codable, Sendable {
         try data.write(to: url, options: .atomic)
     }
 
+    struct SchemaTooNew: Error {
+        let found: Int
+    }
+
     static func read(from url: URL) throws -> SessionSidecar {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(SessionSidecar.self, from: data)
+        let decoded = try decoder.decode(SessionSidecar.self, from: data)
+        // A NEWER app's sidecar may be field-compatible but semantically
+        // different. Refuse it — callers `try?` this into "no sidecar", which
+        // degrades to manual recovery instead of acting on fields this build
+        // doesn't understand.
+        guard decoded.schema <= currentSchema else {
+            throw SchemaTooNew(found: decoded.schema)
+        }
+        return decoded
     }
 
     /// Best-effort cleanup. Used by `cleanupBufferFile` and friends so callers

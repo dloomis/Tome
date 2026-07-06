@@ -83,6 +83,29 @@ import Testing
         #expect(names == ["session_A.mic.wav"], "append must not rotate, got \(names)")
     }
 
+    @Test func appendToTruncatedFileThrowsRatherThanCorrupting() throws {
+        // A torn create (disk full, crash) can leave < 44 bytes. Appending would
+        // place samples inside the header region and extend size fields past
+        // EOF — MicCapture's catch then falls back to .create, which rotates.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let url = dir.appendingPathComponent("torn.mic.wav")
+        try Data(repeating: 0x52, count: 10).write(to: url)
+        #expect(throws: (any Error).self) {
+            _ = try WAVStreamWriter(url: url, sampleRate: 48_000, mode: .append)
+        }
+    }
+
+    @Test func appendToMissingFileThrows() throws {
+        // Pins the assumption MicCapture's fallback-to-create relies on.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        #expect(throws: (any Error).self) {
+            _ = try WAVStreamWriter(url: dir.appendingPathComponent("nope.wav"), sampleRate: 48_000, mode: .append)
+        }
+    }
+
     @Test func freshPathNeedsNoRotation() throws {
         let dir = try TestSupport.makeTempDir()
         defer { TestSupport.remove(dir) }

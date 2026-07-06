@@ -30,15 +30,36 @@ import Testing
         #expect(!result.ok, "unwritable sessions dir is a critical failure:\n\(result.report)")
     }
 
-    @Test func permissionChecksAreInformational() throws {
-        // Whatever this machine's TCC state, permission items must never flip
-        // the structural verdict — CI runners have no mic or screen access.
+    @Test func okIgnoresFailingInformationalItems() {
+        // The property the CI smoke test depends on: a headless runner's denied
+        // permissions must never flip the structural verdict.
+        let check = SelfCheck(items: [
+            .init(name: "structural", ok: true, detail: "", critical: true),
+            .init(name: "mic", ok: false, detail: "denied", critical: false),
+        ])
+        #expect(check.ok)
+        #expect(check.report.contains("[WARN] mic"))
+    }
+
+    @Test func okFailsOnFailingCriticalItem() {
+        let check = SelfCheck(items: [.init(name: "dir", ok: false, detail: "", critical: true)])
+        #expect(!check.ok)
+        #expect(check.report.contains("RESULT: FAIL"))
+    }
+
+    @Test func runEmitsInformationalItems() throws {
+        // Guards the categorization itself: run() must actually produce
+        // non-critical items for the ok-ignores-informational property to matter.
         let dir = try TestSupport.makeTempDir()
         defer { TestSupport.remove(dir) }
+        #expect(SelfCheck.run(sessionsDirectory: dir).items.contains { !$0.critical })
+    }
 
-        let result = SelfCheck.run(sessionsDirectory: dir)
-        for item in result.items where !item.critical {
-            #expect(result.ok, "informational item '\(item.name)' must not affect ok")
-        }
+    @Test func failsWhenSessionsPathIsARegularFile() throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let file = dir.appendingPathComponent("occupied")
+        try Data("x".utf8).write(to: file)
+        #expect(!SelfCheck.run(sessionsDirectory: file).ok)
     }
 }

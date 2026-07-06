@@ -78,6 +78,19 @@ import Testing
         #expect(!(try #require(nonEmpty).speakersDetected.isEmpty))
     }
 
+    @Test func flushIfNeededFlagsDisappearedNote() async throws {
+        // The vault-unmounted banner depends on this lastError; previously untested.
+        let vault = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(vault) }
+
+        let logger = TranscriptLogger()
+        let url = try await logger.startSession(sourceApp: "T", vaultPath: vault.path)
+        try FileManager.default.removeItem(at: url)
+        await logger.flushIfNeeded()
+        #expect(await logger.lastError?.contains("disappeared") == true)
+        _ = await logger.endSession()
+    }
+
     @Test func updateContextLeavesNoStrayTempFiles() async throws {
         let vault = try TestSupport.makeTempDir()
         defer { TestSupport.remove(vault) }

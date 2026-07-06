@@ -97,7 +97,27 @@ final class WAVStreamWriter: @unchecked Sendable {
         case .append:
             let handle = try FileHandle(forUpdating: url)
             let endOffset = try handle.seekToEnd()
-            self.dataBytes = endOffset > 44 ? UInt32(endOffset - 44) : 0
+            // A torn create (disk full, crash) can leave less than a header:
+            // appending would put samples inside the header region and extend
+            // the size fields past EOF. Throw instead — MicCapture's catch falls
+            // back to `.create`, which rotates the torn file aside.
+            guard endOffset >= 44 else {
+                try? handle.close()
+                throw NSError(
+                    domain: "WAVStreamWriter", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Cannot append to \(url.lastPathComponent): existing file (\(endOffset) bytes) is smaller than a WAV header"]
+                )
+            }
+            // Past 4 GB the UInt32 size fields can't represent the file; the
+            // unchecked conversion would trap mid-recording. Refuse instead.
+            guard endOffset - 44 <= UInt64(UInt32.max) else {
+                try? handle.close()
+                throw NSError(
+                    domain: "WAVStreamWriter", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Cannot append to \(url.lastPathComponent): file exceeds the 4 GB WAV limit"]
+                )
+            }
+            self.dataBytes = UInt32(endOffset - 44)
             self.fileHandle = handle
         }
     }

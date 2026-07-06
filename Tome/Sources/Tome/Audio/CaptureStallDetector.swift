@@ -16,7 +16,13 @@ struct CaptureStallDetector {
     /// Feed the leg's most recent sample timestamp. `nil` means the leg hasn't
     /// delivered yet (capture initializing, or intentionally absent) — callers
     /// seed the timestamp at capture start, so nil is never treated as a stall.
-    mutating func evaluate(lastSample: Date?, now: Date) -> Event? {
+    ///
+    /// `canResume`: pass false when `lastSample` is a *seeded* clock (set at
+    /// engine start) rather than a real delivered buffer. A restart re-seeds the
+    /// clock even when the tap never delivers — without this gate the watchdog
+    /// would cycle restart → phantom resume → restart forever on a wedged
+    /// device, withdrawing the stall alert each time while recording nothing.
+    mutating func evaluate(lastSample: Date?, now: Date, canResume: Bool = true) -> Event? {
         guard let lastSample else { return nil }
         let gap = now.timeIntervalSince(lastSample)
         if gap > threshold {
@@ -24,7 +30,7 @@ struct CaptureStallDetector {
             isStalled = true
             return .stalled(gapSeconds: Int(gap))
         }
-        if isStalled {
+        if isStalled && canResume {
             isStalled = false
             return .resumed
         }

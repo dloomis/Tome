@@ -54,19 +54,30 @@ enum OrphanScanner {
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
         )) ?? []
         // `.mic.wav` files are usually mic-track companions of a `<sid>.wav` (call
-        // captures) — hidden so a session is listed once. But for a mic-only session
-        // (voice memo / in-person meeting) the mic WAV is the session's ONLY audio:
-        // when no sibling `<sid>.wav` exists, it surfaces as the primary. Rotated
-        // mic segments (`<sid>.pre-<ts>.mic.wav`) stay hidden — their session is
-        // already represented by its current-generation files.
+        // captures) — hidden so a session is listed once. But a mic track is the
+        // session's ONLY real audio when the sibling system WAV is absent (voice
+        // memos) or a header-only stub (SCStream wedged at start) — then it must
+        // surface as the primary or no recovery path ever sees it. "Viable" means
+        // big enough to clear the same placeholder floor applied below. Rotated
+        // mic segments (`<sid>.pre-<ts>.mic.wav`) surface only when NO
+        // current-generation file of their session holds viable audio (reused id
+        // whose new capture died immediately).
+        func isViableAudio(_ url: URL) -> Bool {
+            let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            return size >= 4096
+        }
         let wavURLs = urls.filter { url in
             guard url.pathExtension.lowercased() == "wav" else { return false }
             let name = url.lastPathComponent
-            guard name.hasSuffix(".mic.wav") else { return true }
+            guard name.lowercased().hasSuffix(".mic.wav") else { return true }
+            let dir = url.deletingLastPathComponent()
             let base = String(name.dropLast(".mic.wav".count))
-            if base.contains(".pre-") { return false }
-            let sibling = url.deletingLastPathComponent().appendingPathComponent("\(base).wav")
-            return !FileManager.default.fileExists(atPath: sibling.path)
+            if let preRange = base.range(of: ".pre-") {
+                let sid = String(base[..<preRange.lowerBound])
+                return !isViableAudio(dir.appendingPathComponent("\(sid).wav"))
+                    && !isViableAudio(dir.appendingPathComponent("\(sid).mic.wav"))
+            }
+            return !isViableAudio(dir.appendingPathComponent("\(base).wav"))
         }
         var orphans: [Orphan] = []
         for wavURL in wavURLs {
