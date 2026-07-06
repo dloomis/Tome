@@ -349,11 +349,15 @@ final class TranscriptionEngine {
     /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
     /// `force` skips the same-device short-circuit — used by the capture watchdog to
     /// re-establish a mic whose tap stopped delivering on the SAME device.
-    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
+    /// `updateSelection: false` marks an EMERGENCY rebind (fallback to default after
+    /// a failed device bind): capture moves, but the user's intent is preserved so
+    /// watchdog retries keep aiming at the chosen device until it's bindable again.
+    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false, updateSelection: Bool = true) {
         guard isRunning, let vadManager else { return }
 
-        // Only update user selection when explicitly changed (not from OS listener)
-        if inputDeviceID != 0 || userSelectedDeviceID != 0 {
+        // Only update user selection when explicitly changed (not from OS listener,
+        // not from an emergency fallback)
+        if updateSelection, inputDeviceID != 0 || userSelectedDeviceID != 0 {
             userSelectedDeviceID = inputDeviceID
         }
         let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID() ?? 0
@@ -392,8 +396,8 @@ final class TranscriptionEngine {
             Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
             if targetMicID != 0,
                let fallback = MicCapture.defaultInputDeviceID(), fallback != targetMicID {
-                diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback))")
-                restartMic(inputDeviceID: 0, force: true)
+                diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback)) — user selection preserved")
+                restartMic(inputDeviceID: 0, force: true, updateSelection: false)
             }
             return
         }
@@ -602,6 +606,21 @@ final class TranscriptionEngine {
                         attemptMicRestart = true
                         diagLog("[WATCHDOG] mic still stalled — re-attempting restart")
                     }
+                } else if micTapSample == nil && mic.captureStartTime == nil {
+                    // Blind spot (observed 2026-07-06: "couldn't fail back" after
+                    // AirPods disconnect): a restart that FAILED at setup leaves
+                    // both timestamps nil — no engine ever started, so no stall
+                    // ever latches, and the detector reads the leg as intentionally
+                    // absent. A mic leg in a running session is never intentionally
+                    // absent: treat all-nil as down and retry on the same cadence.
+                    stalledTicksSinceRestart += 1
+                    if stalledTicksSinceRestart >= 3 {
+                        stalledTicksSinceRestart = 0
+                        attemptMicRestart = true
+                        diagLog("[WATCHDOG] mic is down (no capture running) — attempting restart")
+                    }
+                } else {
+                    stalledTicksSinceRestart = 0
                 }
 
                 guard sysEvent != nil || micEvent != nil || attemptMicRestart else { continue }
