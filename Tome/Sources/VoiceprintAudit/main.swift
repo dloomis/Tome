@@ -105,7 +105,8 @@ if let outPath = rawOutput {
     let transcript = m4a.replacingOccurrences(of: "/Audio/", with: "/Transcripts/").replacingOccurrences(of: ".m4a", with: ".md")
     let lines = parseTranscript(transcript) // may be empty — raw mode doesn't require it
 
-    struct RawCluster: Codable { let clusterId: Int; let label: String?; let embedding: [Float]; let activeSeconds: Double; let segmentCount: Int }
+    struct RawSegment: Codable { let start: Double; let end: Double }
+    struct RawCluster: Codable { let clusterId: Int; let label: String?; let embedding: [Float]; let activeSeconds: Double; let segmentCount: Int; let segments: [RawSegment] }
     struct RawOutput: Codable { let schema: Int; let model: String; let meeting: String; let clusters: [RawCluster] }
 
     let kitRaw = try await SpeakerKit(PyannoteConfig())
@@ -116,10 +117,16 @@ if let outPath = rawOutput {
     var votes: [Int: [String: Int]] = [:]
     var clusterSecs: [Int: Double] = [:]
     var clusterSegCount: [Int: Int] = [:]
+    // Segment time-ranges per cluster, so a downstream consumer (mw-relabel.mjs) can map
+    // its own transcript-line timestamps (read straight from the MacWhisper DB) back to
+    // the specific speaker cluster that produced them, e.g. to quote a speaker's own
+    // substantive lines in a review item rather than the whole meeting's.
+    var clusterSegments: [Int: [RawSegment]] = [:]
     for seg in result.segments {
         guard let cid = seg.speaker.speakerId else { continue }
         clusterSecs[cid, default: 0] += Double(seg.endTime - seg.startTime)
         clusterSegCount[cid, default: 0] += 1
+        clusterSegments[cid, default: []].append(RawSegment(start: Double(seg.startTime), end: Double(seg.endTime)))
         if let nm = nameAt(Double(seg.startTime), lines) { votes[cid, default: [:]][nm, default: 0] += 1 }
     }
     var clusters: [RawCluster] = []
@@ -131,7 +138,8 @@ if let outPath = rawOutput {
             label: (label.map(isStub) == true) ? nil : label,
             embedding: meanNorm([vec]),
             activeSeconds: clusterSecs[cid] ?? 0,
-            segmentCount: clusterSegCount[cid] ?? 0
+            segmentCount: clusterSegCount[cid] ?? 0,
+            segments: (clusterSegments[cid] ?? []).sorted { $0.start < $1.start }
         ))
     }
     clusters.sort { $0.clusterId < $1.clusterId }
