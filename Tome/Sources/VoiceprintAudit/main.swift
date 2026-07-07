@@ -5,6 +5,15 @@
 // schema as WhisperCal's live enroller, excluding instances the audit flags as mislabels.
 //
 //   swift run VoiceprintAudit [--enroll <Caches/Voiceprints folder>] "<m4a>" ["<m4a>" ...]
+//
+// --raw <output.json>: single-file mode for blind attribution (mw-relabel.mjs, Task 5 of
+// the audio-enrichment plan). Diarizes ONE m4a and emits every cluster's centroid —
+// including anonymous "Speaker N" clusters the audit/enroll paths above intentionally
+// skip via isStub() — so a downstream tool can cosine-match unlabeled speakers against
+// the enrolled library. No transcript pairing required. Named clusters (if a paired
+// transcript exists) are still vote-labeled and included for reference; unnamed ones are
+// emitted with label: null. Does not touch the audit or --enroll code paths.
+//   swift run VoiceprintAudit --raw <output.json> "<m4a>"
 import Foundation
 import SpeakerKit
 import WhisperKit
@@ -74,12 +83,65 @@ let FLAG_MARGIN: Float = 0.05
 let CONSISTENCY_WARN: Float = 0.45
 let MAX_SAMPLES = 12
 
-// MARK: args  ([--enroll <folder>] <m4a>...)
+// MARK: args  ([--enroll <folder>] <m4a>...) or (--raw <output.json> <m4a>)
 var argv = Array(CommandLine.arguments.dropFirst())
 var enrollFolder: String? = nil
+var rawOutput: String? = nil
 if argv.first == "--enroll", argv.count >= 2 { enrollFolder = argv[1]; argv.removeFirst(2) }
+if argv.first == "--raw", argv.count >= 2 { rawOutput = argv[1]; argv.removeFirst(2) }
 let files = argv
-guard !files.isEmpty else { print("usage: VoiceprintAudit [--enroll <folder>] <m4a>..."); exit(1) }
+guard !files.isEmpty else {
+    print("usage: VoiceprintAudit [--enroll <folder>] <m4a>...")
+    print("       VoiceprintAudit --raw <output.json> <m4a>")
+    exit(1)
+}
+
+if let outPath = rawOutput {
+    guard files.count == 1 else { print("--raw takes exactly one m4a"); exit(1) }
+    let m4a = files[0]
+    let meeting = (m4a as NSString).lastPathComponent
+        .replacingOccurrences(of: " - Transcript.m4a", with: "")
+        .replacingOccurrences(of: ".m4a", with: "")
+    let transcript = m4a.replacingOccurrences(of: "/Audio/", with: "/Transcripts/").replacingOccurrences(of: ".m4a", with: ".md")
+    let lines = parseTranscript(transcript) // may be empty — raw mode doesn't require it
+
+    struct RawCluster: Codable { let clusterId: Int; let label: String?; let embedding: [Float]; let activeSeconds: Double; let segmentCount: Int }
+    struct RawOutput: Codable { let schema: Int; let model: String; let meeting: String; let clusters: [RawCluster] }
+
+    let kitRaw = try await SpeakerKit(PyannoteConfig())
+    var samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: m4a)
+    let cap = Int(CAP_SECONDS * RATE); if samples.count > cap { samples = Array(samples[0..<cap]) }
+    let result = try await kitRaw.diarize(audioArray: samples, options: PyannoteDiarizationOptions())
+
+    var votes: [Int: [String: Int]] = [:]
+    var clusterSecs: [Int: Double] = [:]
+    var clusterSegCount: [Int: Int] = [:]
+    for seg in result.segments {
+        guard let cid = seg.speaker.speakerId else { continue }
+        clusterSecs[cid, default: 0] += Double(seg.endTime - seg.startTime)
+        clusterSegCount[cid, default: 0] += 1
+        if let nm = nameAt(Double(seg.startTime), lines) { votes[cid, default: [:]][nm, default: 0] += 1 }
+    }
+    var clusters: [RawCluster] = []
+    for (cid, vec) in result.speakerCentroidEmbeddings {
+        let best = (votes[cid] ?? [:]).max(by: { $0.value < $1.value })
+        let label = best.map { canon($0.key) }
+        clusters.append(RawCluster(
+            clusterId: cid,
+            label: (label.map(isStub) == true) ? nil : label,
+            embedding: meanNorm([vec]),
+            activeSeconds: clusterSecs[cid] ?? 0,
+            segmentCount: clusterSegCount[cid] ?? 0
+        ))
+    }
+    clusters.sort { $0.clusterId < $1.clusterId }
+    let out = RawOutput(schema: 1, model: MODEL, meeting: meeting, clusters: clusters)
+    let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try enc.encode(out)
+    try data.write(to: URL(fileURLWithPath: outPath))
+    print("ok: \(meeting) — \(clusters.count) clusters (\(clusters.filter { $0.label != nil }.count) named) → \(outPath)")
+    exit(0)
+}
 
 let kit = try await SpeakerKit(PyannoteConfig())
 var units: [Unit] = []
