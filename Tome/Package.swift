@@ -43,5 +43,14 @@ let package = Package(
             ],
             path: "Sources/VoiceprintAudit"
         ),
+        // Regression tests. SwiftPM tests the executable target directly (no
+        // library split needed): everything file-based — storage, finalization,
+        // recovery sidecars, WAV writing — is exercised against temp directories.
+        // Nothing here touches audio devices, permissions, or the ASR models.
+        .testTarget(
+            name: "TomeTests",
+            dependencies: ["Tome"],
+            path: "Tests/TomeTests"
+        ),
     ]
 )

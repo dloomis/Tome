@@ -308,7 +308,17 @@ struct ContentView: View {
             md += "\(u.text)\n\n"
         }
 
-        try? md.write(to: url, atomically: true, encoding: .utf8)
+        do {
+            try md.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            // Surface the failure — a silent `try?` here left the user believing
+            // the export existed when the write bounced (read-only target, etc.).
+            showAlert(
+                title: "Couldn't save transcript",
+                message: error.localizedDescription,
+                style: .critical
+            )
+        }
     }
 
     // MARK: - Top Bar
@@ -601,8 +611,11 @@ struct ContentView: View {
         }
 
         // Close the half-open transcript session and delete the empty note created
-        // before the failed start — no utterances landed, so there's nothing to keep.
-        if let snapshot = await services.transcriptLogger.endSession() {
+        // before the failed start. Guarded: only remove the note when no utterances
+        // ever landed in it (speakersDetected is populated per-append) — if capture
+        // partially came up before failing, whatever text made it to disk is kept.
+        if let snapshot = await services.transcriptLogger.endSession(),
+           snapshot.speakersDetected.isEmpty {
             try? FileManager.default.removeItem(at: snapshot.filePath)
         }
         await services.sessionStore.endSession()

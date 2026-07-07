@@ -45,8 +45,10 @@ enum OrphanScanner {
 
     /// Enumerate orphans. Sorted oldest-first so the user works through them in
     /// chronological order (matches the order recordings were attempted).
-    static func findOrphans() -> [Orphan] {
-        guard let dir = try? SystemAudioCapture.sessionsDirectory() else { return [] }
+    /// - Parameter directory: override for tests; production scans the app's
+    ///   sessions directory.
+    static func findOrphans(in directory: URL? = nil) -> [Orphan] {
+        guard let dir = directory ?? (try? SystemAudioCapture.sessionsDirectory()) else { return [] }
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: dir,
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]

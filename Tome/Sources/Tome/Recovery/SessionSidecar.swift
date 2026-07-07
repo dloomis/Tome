@@ -66,4 +66,31 @@ struct SessionSidecar: Codable, Sendable {
         let url = sidecarURL(forWAV: wavURL)
         try? FileManager.default.removeItem(at: url)
     }
+
+    /// Re-point the sidecar's `transcriptPath` after finalization renames the note,
+    /// so a crash between the rename and cleanup leaves an orphan that auto-recovery
+    /// can still pair with its transcript. Best-effort: on any failure the sidecar
+    /// keeps the stale path and recovery degrades to "transcript file missing"
+    /// (manual Cmd+Opt+R), exactly the pre-existing behavior.
+    static func updateTranscriptPath(forWAV wavURL: URL, to newTranscriptURL: URL) {
+        let url = sidecarURL(forWAV: wavURL)
+        guard let old = try? read(from: url) else { return }
+        let updated = SessionSidecar(
+            schema: old.schema,
+            sessionId: old.sessionId,
+            transcriptPath: newTranscriptURL.path,
+            startedAt: old.startedAt,
+            sourceApp: old.sourceApp,
+            sessionType: old.sessionType,
+            sampleRate: old.sampleRate,
+            channels: old.channels,
+            bitsPerSample: old.bitsPerSample,
+            appVersion: old.appVersion
+        )
+        do {
+            try write(updated, to: url)
+        } catch {
+            diagLog("[SIDECAR] transcriptPath refresh failed for \(url.lastPathComponent): \(error)")
+        }
+    }
 }

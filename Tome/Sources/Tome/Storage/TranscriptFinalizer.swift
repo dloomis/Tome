@@ -19,8 +19,12 @@ enum TranscriptFinalizer {
         preserveYou: Bool = true
     ) throws(PostProcessingError) {
         let filePath = snapshot.filePath
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
-        guard let transcriptStart = content.range(of: "## Transcript\n") else { return }
+        var content = try readContent(from: filePath, context: "rebuildFromDiarizedSegments")
+        guard let transcriptStart = content.range(of: "## Transcript\n") else {
+            // The note was edited (or replaced) out from under us — refuse to
+            // rewrite rather than silently succeeding, so the caller keeps the WAV.
+            throw .markdownReadFailed("rebuildFromDiarizedSegments: \(filePath.lastPathComponent) has no '## Transcript' section")
+        }
 
         let header = String(content[..<transcriptStart.upperBound])
         let body = String(content[transcriptStart.upperBound...])
@@ -93,7 +97,7 @@ enum TranscriptFinalizer {
         segments: [DiarizedSegment]
     ) throws(PostProcessingError) {
         let filePath = snapshot.filePath
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        var content = try readContent(from: filePath, context: "rewriteWithDiarization")
 
         // Build a map of unique diarization speaker IDs → friendly labels
         let diarSpeakerMap = speakerLabels(from: segments.map(\.speakerId))
@@ -197,7 +201,10 @@ enum TranscriptFinalizer {
     /// wikilinks to non-markdown files require it. Best-effort — a failure here leaves
     /// both the saved transcript and the exported audio intact.
     static func setRecordingLink(filePath: URL, audioFilename: String) {
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else {
+            diagLog("[FINALIZER] setRecordingLink: couldn't read \(filePath.lastPathComponent) (non-fatal — audio and transcript both intact)")
+            return
+        }
         let line = "recording: \"[[\(audioFilename)]]\""
 
         if let range = content.range(of: yamlField("recording"), options: .regularExpression) {
@@ -222,7 +229,10 @@ enum TranscriptFinalizer {
     /// note), so the association survives a later transcript rename. Best-effort: a
     /// failure just leaves the sibling `.voiceprints.json` as the fallback resolution.
     static func setVoiceprintsLink(filePath: URL, sidecarFilename: String) {
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else {
+            diagLog("[FINALIZER] setVoiceprintsLink: couldn't read \(filePath.lastPathComponent) (non-fatal — sibling sidecar remains the fallback)")
+            return
+        }
         let line = "voiceprints: \"\(sidecarFilename)\""
 
         if let range = content.range(of: yamlField("voiceprints"), options: .regularExpression) {
@@ -261,7 +271,7 @@ enum TranscriptFinalizer {
         suggestedFilename: String? = nil,
         filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss"
     ) throws(PostProcessingError) -> URL {
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return filePath }
+        var content = try readContent(from: filePath, context: "rewriteFrontmatter")
 
         // Measured at stop time (see `TranscriptSessionSnapshot.sessionEndTime`), not
         // `Date()` here — finalization runs in the background long after the user stopped.
@@ -352,6 +362,22 @@ enum TranscriptFinalizer {
         }
     }
 
+    /// Read the transcript for a rewrite step. Throws instead of letting callers
+    /// `try?`-swallow: an unreadable note (vault unmounted, iCloud-evicted,
+    /// permission change, user rename) must fail the step loudly — the caller's
+    /// contract is that source WAVs are only deleted after a *verified* rewrite.
+    private static func readContent(
+        from filePath: URL,
+        context: String
+    ) throws(PostProcessingError) -> String {
+        do {
+            return try String(contentsOf: filePath, encoding: .utf8)
+        } catch {
+            diagLog("[FINALIZER] \(context): transcript unreadable at \(filePath.path): \(error)")
+            throw .markdownReadFailed("\(context): couldn't read \(filePath.lastPathComponent) — \(error.localizedDescription)")
+        }
+    }
+
     /// Write `content` to `filePath` via a temp-file + atomic-replace dance. The
     /// `try?` swallowing of these errors was the root cause of the silent
     /// diarization data loss on iCloud-backed paths — surface them as throws now.
@@ -361,7 +387,12 @@ enum TranscriptFinalizer {
         tmpName: String = ".tome_diar_tmp.md",
         context: String
     ) throws(PostProcessingError) {
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(tmpName)
+        // Uniquify the tmp name per call: finalization of session N can overlap the
+        // live logger (and other finalize steps) writing into the same vault folder,
+        // and a shared tmp name lets one session's content be atomically installed
+        // over another session's note.
+        let uniqueTmpName = "\(tmpName.dropLast(3))-\(UUID().uuidString.prefix(8)).md"
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(uniqueTmpName)
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
         } catch {
