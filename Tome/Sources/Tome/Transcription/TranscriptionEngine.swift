@@ -235,14 +235,17 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
-            vadManager: vadManager,
+            vad: SileroVADStream(manager: vadManager),
             speaker: .you,
             audioSource: .microphone,
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
+            // Awaited (not fire-and-forget): stop() drains the transcriber task,
+            // and that drain must guarantee the utterance is IN the store when it
+            // returns — stopSession snapshots the transcript right after.
             onFinal: { text, startTime in
-                Task { @MainActor in
+                await MainActor.run {
                     store.volatileYouText = ""
                     store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
@@ -262,14 +265,14 @@ final class TranscriptionEngine {
         if let sysStream = sysStreams?.systemAudio {
             let sysTranscriber = StreamingTranscriber(
                 asrCoordinator: asrCoordinator,
-                vadManager: vadManager,
+                vad: SileroVADStream(manager: vadManager),
                 speaker: .them,
                 audioSource: .system,
                 onPartial: { text in
                     Task { @MainActor in store.volatileThemText = text }
                 },
                 onFinal: { text, startTime in
-                    Task { @MainActor in
+                    await MainActor.run {
                         store.volatileThemText = ""
                         store.append(Utterance(text: text, speaker: .them, timestamp: startTime))
                     }
@@ -405,14 +408,14 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
-            vadManager: vadManager,
+            vad: SileroVADStream(manager: vadManager),
             speaker: .you,
             audioSource: .microphone,
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
             onFinal: { text, startTime in
-                Task { @MainActor in
+                await MainActor.run {
                     store.volatileYouText = ""
                     store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
@@ -507,16 +510,41 @@ final class TranscriptionEngine {
         recentMicRebuilds = []
         sysWatchdogTask?.cancel()
         sysWatchdogTask = nil
-        micTask?.cancel()
-        sysTask?.cancel()
-        micTask = nil
-        sysTask = nil
+        // Stop the captures FIRST — each finishes its buffer stream, so the
+        // transcriber loops drain the queued audio and flush the in-progress
+        // utterance through ASR. Then AWAIT the transcriber tasks instead of
+        // cancelling them: FluidAudio and WhisperKit check
+        // `Task.checkCancellation()` throughout inference, so the old
+        // cancel-first teardown made the stop-time flush throw and silently
+        // dropped the tail of every recording that was mid-speech at stop
+        // (task-13 smoke test, 2026-07-09: "ASR error" at stop, truncated or
+        // empty transcripts with the speech intact in the retained audio).
         await systemCapture.stop()
         micCapture.stop()
+        await drainTranscriberTasks()
+        micTask = nil
+        sysTask = nil
         currentMicDeviceID = 0
         isRunning = false
         assetStatus = "Ready"
         endLiveActivity()
+    }
+
+    /// Wait for the transcriber tasks to finish their end-of-stream flush.
+    /// Bounded: a wedged ASR call must not hang stop forever — past the
+    /// deadline the tasks are cancelled, abandoning the pending segment (the
+    /// retained recording still preserves that audio).
+    private func drainTranscriberTasks(deadline: Duration = .seconds(15)) async {
+        let tasks = [micTask, sysTask].compactMap { $0 }
+        guard !tasks.isEmpty else { return }
+        let watchdog = Task {
+            try? await Task.sleep(for: deadline)
+            guard !Task.isCancelled else { return }
+            diagLog("[ENGINE-STOP] transcriber drain exceeded \(deadline) — cancelling")
+            for task in tasks { task.cancel() }
+        }
+        for task in tasks { await task.value }
+        watchdog.cancel()
     }
 
     // MARK: - Activity assertion + system-audio watchdog
