@@ -122,7 +122,7 @@ struct TomeApp: App {
             }
         }
         Settings {
-            SettingsView(settings: settings, updater: updaterController.updater)
+            SettingsView(settings: settings, updater: updaterController.updater, services: services)
         }
         MenuBarExtra {
             Text("Tome")
