@@ -11,71 +11,137 @@ enum SessionLifecycleState: String, Codable, Sendable {
 
 /// Local HTTP API server for WhisperCal integration.
 /// Binds to 127.0.0.1 only. Writes port to ~/Library/Application Support/Tome/api-port.
-@MainActor
-final class APIServer {
-    private var listener: NWListener?
-    private let portFilePath: URL
-    private let jsonEncoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.dateEncodingStrategy = .iso8601
-        return e
-    }()
-    private let iso8601 = ISO8601DateFormatter()
+///
+/// Deliberately NOT on the MainActor: modal alerts and panels (`NSAlert.runModal`,
+/// `NSOpenPanel.runModal`) spin nested run loops that starve main-queue dispatch —
+/// the launch orphan-recovery alert froze GET /health for as long as it was up.
+/// All networking runs on a private serial queue, and the endpoints WhisperCal
+/// depends on (/health, /status, /start, /stop and their gates) are answered from
+/// `state`, a lock-guarded mirror pushed synchronously from the MainActor. Only
+/// live-session detail reads (asset status, in-memory utterances) hop to the
+/// MainActor, and only while a session is active.
+final class APIServer: @unchecked Sendable {
 
-    // References to app state (set via register())
+    // MARK: - Mirrored State
+
+    /// Everything the MainActor-free endpoints answer from. Guarded by `lock`.
+    /// `isRecording` and `modelsReady` mirror MainActor sources
+    /// (`TranscriptionEngine.isRunning`, `ModelProvisioner.canStartRecording`)
+    /// via the update pushes below; the session fields are written by the
+    /// session mutators (called from ContentView) and by the /start handlers.
+    private struct State {
+        var currentSessionId: String?
+        var sessionElapsed = 0
+        var hasDiarizationCompleted = false
+        /// Per-session state so `/sessions/{id}/status` can answer correctly even
+        /// when a newer session is already recording. The top-level `lifecycleState`
+        /// tracks the most recent session for `/status` backwards compatibility.
+        var sessionStates: [String: SessionLifecycleState] = [:]
+        var lifecycleState: SessionLifecycleState = .idle
+        /// The active recording's subject/title and suggested filename, set at
+        /// start and echoed from GET /status while recording or transcribing.
+        /// Reset on each start (a no-context UI start clears them) and when the
+        /// session goes idle.
+        var recordingSubject: String?
+        var recordingFilename: String?
+        var isRecording = false
+        var modelsReady = false
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+
+    private func withState<T>(_ body: (inout State) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&state)
+    }
+
+    // MARK: - App references
+
+    /// MainActor-isolated objects. Written by `register()` (MainActor) and
+    /// dereferenced ONLY inside `MainActor.run` closures — the class itself is
+    /// nonisolated, so this isolation is by convention.
     private weak var transcriptStore: TranscriptStore?
     private weak var transcriptionEngine: TranscriptionEngine?
-    private var sessionStore: SessionStore?
 
-    /// Model readiness — sourced from ModelProvisioner via register().
-    /// Replaces /health's assetStatus string-matching: semantics preserved
-    /// ("a recording can start now"), response shape untouched (API freeze).
-    private var canStartRecording: (() -> Bool)?
+    // Guarded by `lock` (Sendable, so handlers may read them on the API queue).
+    private var _sessionStore: SessionStore?
+    private var _onStartSession: (@MainActor @Sendable (SessionType, String, MeetingContext?, String?) -> Void)?
+    private var _onStopSession: (@MainActor @Sendable () -> Void)?
 
-    // Session control callbacks (4th param is suggestedFilename from WhisperCal)
-    private var onStartSession: ((SessionType, String, MeetingContext?, String?) -> Void)?
-    private var onStopSession: (() -> Void)?
+    // MARK: - Networking
 
-    // Session tracking (written by ContentView, read by API handlers)
-    private(set) var currentSessionId: String?
-    var sessionElapsed: Int = 0
-    private(set) var hasDiarizationCompleted: Bool = false
-    /// Per-session state so `/sessions/{id}/status` can answer correctly even when
-    /// a newer session is already recording. The top-level `lifecycleState` tracks
-    /// the most recent session for `/status` backwards compatibility.
-    private(set) var sessionStates: [String: SessionLifecycleState] = [:]
-    private(set) var lifecycleState: SessionLifecycleState = .idle
+    /// All listener/connection callbacks land here — never on `.main`, so the
+    /// server keeps serving while a modal run loop starves main-queue dispatch.
+    private let queue = DispatchQueue(label: "com.dloomis.tome.APIServer")
+    private var listener: NWListener?  // guarded by `lock`
+    private let port: UInt16
+    private let portFilePath: URL
+    private let iso8601 = ISO8601DateFormatter()  // thread-safe per docs
 
-    /// The active recording's subject/title and suggested filename, set at start
-    /// and echoed from GET /status while recording or transcribing. Reset on each
-    /// start (a no-context UI start clears them) and when the session goes idle.
-    private(set) var recordingSubject: String?
-    private(set) var recordingFilename: String?
-
-    init() {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!
-        portFilePath = appSupport.appendingPathComponent("Tome/api-port")
+    /// `port` 0 binds an ephemeral port (tests); the assigned port is published
+    /// via the port file either way. `portFileURL` overrides the Application
+    /// Support location so tests don't clobber a running app's port file.
+    init(port: UInt16 = 27080, portFileURL: URL? = nil) {
+        self.port = port
+        if let portFileURL {
+            portFilePath = portFileURL
+        } else {
+            let appSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first!
+            portFilePath = appSupport.appendingPathComponent("Tome/api-port")
+        }
     }
 
     // MARK: - Registration
 
     /// Called by ContentView after TranscriptionEngine is initialized.
+    @MainActor
     func register(
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
-        canStartRecording: @escaping () -> Bool,
-        onStart: @escaping (SessionType, String, MeetingContext?, String?) -> Void,
-        onStop: @escaping () -> Void
+        onStart: @escaping @MainActor @Sendable (SessionType, String, MeetingContext?, String?) -> Void,
+        onStop: @escaping @MainActor @Sendable () -> Void
     ) {
         self.transcriptStore = transcriptStore
         self.transcriptionEngine = transcriptionEngine
-        self.sessionStore = sessionStore
-        self.canStartRecording = canStartRecording
-        self.onStartSession = onStart
-        self.onStopSession = onStop
+        lock.lock()
+        _sessionStore = sessionStore
+        _onStartSession = onStart
+        _onStopSession = onStop
+        lock.unlock()
+    }
+
+    // MARK: - State pushes from the MainActor
+
+    /// ContentView pushes `TranscriptionEngine.isRunning` changes here so
+    /// /health and the start/stop gates answer without touching the MainActor.
+    func updateIsRecording(_ running: Bool) {
+        withState { $0.isRecording = running }
+    }
+
+    /// ContentView pushes `ModelProvisioner.canStartRecording` changes here.
+    /// The value can be a render cycle stale; the authoritative re-check still
+    /// happens in ContentView.startSession on the MainActor.
+    func updateModelsReady(_ ready: Bool) {
+        withState { $0.modelsReady = ready }
+    }
+
+    /// Seconds elapsed in the current session, ticked by ContentView's timer.
+    var sessionElapsed: Int {
+        get { withState { $0.sessionElapsed } }
+        set { withState { $0.sessionElapsed = newValue } }
+    }
+
+    var currentSessionId: String? {
+        withState { $0.currentSessionId }
+    }
+
+    var lifecycleState: SessionLifecycleState {
+        withState { $0.lifecycleState }
     }
 
     /// Mark a session as started (called by ContentView after startSession succeeds).
@@ -83,52 +149,60 @@ final class APIServer {
     /// else autodetected, else nil) echoed by GET /status; passing them here also
     /// clears any stale values from a prior session on a no-context UI start.
     func sessionDidStart(id: String, subject: String? = nil, suggestedFilename: String? = nil) {
-        currentSessionId = id
-        sessionStates[id] = .recording
-        lifecycleState = .recording
-        hasDiarizationCompleted = false
-        recordingSubject = subject
-        recordingFilename = suggestedFilename
+        withState { s in
+            s.currentSessionId = id
+            s.sessionStates[id] = .recording
+            s.lifecycleState = .recording
+            s.hasDiarizationCompleted = false
+            s.recordingSubject = subject
+            s.recordingFilename = suggestedFilename
+        }
     }
 
     /// Mark that recording has stopped for a specific session — its post-processing
     /// has been handed off to the background queue. The `id` is required because a
     /// newer session may already be starting concurrently.
     func sessionDidStop(id: String) {
-        sessionStates[id] = .transcribing
-        if currentSessionId == id {
-            lifecycleState = .transcribing
+        withState { s in
+            s.sessionStates[id] = .transcribing
+            if s.currentSessionId == id {
+                s.lifecycleState = .transcribing
+            }
         }
     }
 
     /// Mark diarization as complete for the most recent session. Kept for the
     /// `hasBeenDiarized` field on live transcript responses.
     func diarizationDidComplete() {
-        hasDiarizationCompleted = true
+        withState { $0.hasDiarizationCompleted = true }
     }
 
     /// Mark that a specific session's transcript file has been finalized. The `id`
     /// is required because a different session may be recording when this fires
     /// from the background queue's completion event.
     func sessionDidComplete(id: String) {
-        sessionStates[id] = .complete
-        // Only advance the top-level lifecycle if this is the most recent session.
-        // A newer session's `.recording` takes precedence.
-        if lifecycleState != .recording {
-            lifecycleState = .complete
+        withState { s in
+            s.sessionStates[id] = .complete
+            // Only advance the top-level lifecycle if this is the most recent session.
+            // A newer session's `.recording` takes precedence.
+            if s.lifecycleState != .recording {
+                s.lifecycleState = .complete
+            }
         }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
             guard let self else { return }
-            sessionStates.removeValue(forKey: id)
-            if lifecycleState == .complete && currentSessionId == id {
-                lifecycleState = .idle
-                currentSessionId = nil
-                recordingSubject = nil
-                recordingFilename = nil
-            } else if lifecycleState == .complete {
-                // This was an older session's completion; don't touch currentSessionId.
-                lifecycleState = .idle
+            withState { s in
+                s.sessionStates.removeValue(forKey: id)
+                if s.lifecycleState == .complete && s.currentSessionId == id {
+                    s.lifecycleState = .idle
+                    s.currentSessionId = nil
+                    s.recordingSubject = nil
+                    s.recordingFilename = nil
+                } else if s.lifecycleState == .complete {
+                    // This was an older session's completion; don't touch currentSessionId.
+                    s.lifecycleState = .idle
+                }
             }
         }
     }
@@ -136,37 +210,41 @@ final class APIServer {
     // MARK: - Server Lifecycle
 
     func start() {
-        guard listener == nil else { return }
-
+        let newListener: NWListener
+        lock.lock()
+        guard listener == nil else {
+            lock.unlock()
+            return
+        }
         do {
             let params = NWParameters.tcp
             params.requiredLocalEndpoint = NWEndpoint.hostPort(
-                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: 27080)!
+                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
             )
-            listener = try NWListener(using: params)
+            newListener = try NWListener(using: params)
+            listener = newListener
         } catch {
+            lock.unlock()
             diagLog("[APIServer] Failed to create listener: \(error)")
             return
         }
+        lock.unlock()
 
-        listener?.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                self?.handleListenerState(state)
-            }
+        newListener.stateUpdateHandler = { [weak self] state in
+            self?.handleListenerState(state)
         }
-
-        listener?.newConnectionHandler = { [weak self] connection in
-            Task { @MainActor in
-                self?.acceptConnection(connection)
-            }
+        newListener.newConnectionHandler = { [weak self] connection in
+            self?.acceptConnection(connection)
         }
-
-        listener?.start(queue: .main)
+        newListener.start(queue: queue)
     }
 
     func stop() {
-        listener?.cancel()
+        lock.lock()
+        let current = listener
         listener = nil
+        lock.unlock()
+        current?.cancel()
         removePortFile()
     }
 
@@ -175,17 +253,20 @@ final class APIServer {
     private func handleListenerState(_ state: NWListener.State) {
         switch state {
         case .ready:
-            if let port = listener?.port {
+            let port = lock.withLock { listener?.port }
+            if let port {
                 writePortFile(port: port.rawValue)
                 diagLog("[APIServer] Listening on http://127.0.0.1:\(port.rawValue)")
             }
         case .failed(let error):
             diagLog("[APIServer] Listener failed: \(error)")
+            lock.lock()
             listener?.cancel()
             listener = nil
-            Task {
+            lock.unlock()
+            Task { [weak self] in
                 try? await Task.sleep(for: .seconds(2))
-                self.start()
+                self?.start()
             }
         default:
             break
@@ -195,7 +276,7 @@ final class APIServer {
     // MARK: - Connection Handling
 
     private func acceptConnection(_ connection: NWConnection) {
-        connection.start(queue: .main)
+        connection.start(queue: queue)
         receiveRequest(on: connection, accumulated: Data())
     }
 
@@ -205,26 +286,27 @@ final class APIServer {
     private func receiveRequest(on connection: NWConnection, accumulated: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
             [weak self] data, _, isComplete, error in
-            Task { @MainActor in
-                guard let self else { return }
-                var buffer = accumulated
-                if let data { buffer.append(data) }
-                if let error {
-                    diagLog("[APIServer] Receive error: \(error)")
-                    connection.cancel()
-                    return
-                }
-                switch Self.requestCompleteness(buffer) {
-                case .complete:
-                    await self.handleRequest(buffer, on: connection)
-                case .tooLarge:
-                    self.send(connection: connection, status: 413, json: #"{"error": "Request too large"}"#)
-                case .needsMore where !isComplete:
-                    self.receiveRequest(on: connection, accumulated: buffer)
-                case .needsMore:
-                    // Peer closed before sending a complete request.
-                    connection.cancel()
-                }
+            guard let self else { return }
+            var buffer = accumulated
+            if let data { buffer.append(data) }
+            if let error {
+                diagLog("[APIServer] Receive error: \(error)")
+                connection.cancel()
+                return
+            }
+            switch Self.requestCompleteness(buffer) {
+            case .complete:
+                // Handlers are async (session-store actor, live-session MainActor
+                // reads); state they touch is lock-guarded, so leaving the
+                // connection queue is safe.
+                Task { await self.handleRequest(buffer, on: connection) }
+            case .tooLarge:
+                self.send(connection: connection, status: 413, json: #"{"error": "Request too large"}"#)
+            case .needsMore where !isComplete:
+                self.receiveRequest(on: connection, accumulated: buffer)
+            case .needsMore:
+                // Peer closed before sending a complete request.
+                connection.cancel()
             }
         }
     }
@@ -331,9 +413,7 @@ final class APIServer {
     // MARK: - Handlers
 
     private func handleHealth() -> (Int, String) {
-        let isRecording = transcriptionEngine?.isRunning ?? false
-        let modelsReady = canStartRecording?() ?? false
-
+        let (isRecording, modelsReady) = withState { ($0.isRecording, $0.modelsReady) }
         return (200, encode(HealthResponse(
             status: "ok",
             version: "1.0.0",
@@ -345,17 +425,6 @@ final class APIServer {
     // MARK: - WhisperCal Handlers
 
     private func handleWhisperCalStart(body: Data?) -> (Int, String) {
-        // `.transcribing` is NOT a blocker anymore — post-processing of a previous
-        // session runs in the background so a new recording can start immediately.
-        guard transcriptionEngine?.isRunning != true,
-              lifecycleState != .recording else {
-            return (409, #"{"error":"Already recording"}"#)
-        }
-
-        guard canStartRecording?() ?? false else {
-            return (503, #"{"error":"Transcription model not ready"}"#)
-        }
-
         let req: WhisperCalStartRequest?
         if let body, !body.isEmpty {
             req = try? JSONDecoder().decode(WhisperCalStartRequest.self, from: body)
@@ -364,26 +433,51 @@ final class APIServer {
         }
 
         let sessionId = SessionStore.generateSessionId()
-        currentSessionId = sessionId
-        sessionElapsed = 0
-        hasDiarizationCompleted = false
-        // Set synchronously to prevent races with rapid duplicate requests and with
-        // a /status poll landing before the async sessionDidStart fires.
-        lifecycleState = .recording
-        recordingSubject = req?.meetingContext?.subject
-        recordingFilename = req?.suggestedFilename
 
-        onStartSession?(.callCapture, sessionId, req?.meetingContext, req?.suggestedFilename)
+        // One critical section: the gate check and the state transition are
+        // atomic, so rapid duplicate requests can't both pass, and a /status
+        // poll landing before the MainActor picks up onStartSession already
+        // sees .recording. `.transcribing` is NOT a blocker — post-processing
+        // of a previous session runs in the background so a new recording can
+        // start immediately.
+        enum Gate { case alreadyRecording, notReady, accepted }
+        let gate: Gate = withState { s in
+            if s.isRecording || s.lifecycleState == .recording { return .alreadyRecording }
+            guard s.modelsReady else { return .notReady }
+            s.currentSessionId = sessionId
+            s.sessionElapsed = 0
+            s.hasDiarizationCompleted = false
+            s.lifecycleState = .recording
+            s.recordingSubject = req?.meetingContext?.subject
+            s.recordingFilename = req?.suggestedFilename
+            return .accepted
+        }
+        switch gate {
+        case .alreadyRecording:
+            return (409, #"{"error":"Already recording"}"#)
+        case .notReady:
+            return (503, #"{"error":"Transcription model not ready"}"#)
+        case .accepted:
+            break
+        }
+
+        let onStart = lock.withLock { _onStartSession }
+        let context = req?.meetingContext
+        let filename = req?.suggestedFilename
+        Task { @MainActor in
+            onStart?(.callCapture, sessionId, context, filename)
+        }
 
         return (200, #"{"ok":true}"#)
     }
 
     private func handleWhisperCalStop() -> (Int, String) {
-        guard transcriptionEngine?.isRunning == true || lifecycleState == .recording else {
+        guard withState({ $0.isRecording || $0.lifecycleState == .recording }) else {
             return (409, #"{"error":"Not recording"}"#)
         }
 
-        onStopSession?()
+        let onStop = lock.withLock { _onStopSession }
+        Task { @MainActor in onStop?() }
 
         return (200, #"{"ok":true}"#)
     }
@@ -392,17 +486,20 @@ final class APIServer {
         // Echo the active recording's identity while a session is in flight, so the
         // caller can show *which* meeting is recording. Omitted when idle/complete,
         // or when there's no subject/filename to report.
+        let (lifecycle, subject, filename) = withState {
+            ($0.lifecycleState, $0.recordingSubject, $0.recordingFilename)
+        }
         let recording: WhisperCalRecordingInfo?
-        if lifecycleState == .recording || lifecycleState == .transcribing,
-           recordingSubject != nil || recordingFilename != nil {
+        if lifecycle == .recording || lifecycle == .transcribing,
+           subject != nil || filename != nil {
             recording = WhisperCalRecordingInfo(
-                subject: recordingSubject, suggestedFilename: recordingFilename
+                subject: subject, suggestedFilename: filename
             )
         } else {
             recording = nil
         }
         return (200, encode(WhisperCalStatusResponse(
-            state: lifecycleState.rawValue, recording: recording
+            state: lifecycle.rawValue, recording: recording
         )))
     }
 
@@ -415,17 +512,6 @@ final class APIServer {
             return (400, #"{"error":"Invalid request body"}"#)
         }
 
-        // `.transcribing` is NOT a blocker — previous session's post-processing runs
-        // in the background, not inline with the engine.
-        guard transcriptionEngine?.isRunning != true,
-              lifecycleState != .recording else {
-            return (409, #"{"error":"A session is already in progress"}"#)
-        }
-
-        guard canStartRecording?() ?? false else {
-            return (503, #"{"error":"Transcription model not ready"}"#)
-        }
-
         let type: SessionType
         switch req.type {
         case "voiceMemo": type = .voiceMemo
@@ -435,16 +521,34 @@ final class APIServer {
         }
 
         let sessionId = SessionStore.generateSessionId()
-        currentSessionId = sessionId
-        sessionElapsed = 0
-        hasDiarizationCompleted = false
-        // Set synchronously to prevent races with rapid duplicate requests and with
-        // a /status poll landing before the async sessionDidStart fires.
-        lifecycleState = .recording
-        recordingSubject = req.meetingContext?.subject
-        recordingFilename = nil
 
-        onStartSession?(type, sessionId, req.meetingContext, nil)
+        // Same atomic gate-and-transition as handleWhisperCalStart.
+        enum Gate { case alreadyRecording, notReady, accepted }
+        let gate: Gate = withState { s in
+            if s.isRecording || s.lifecycleState == .recording { return .alreadyRecording }
+            guard s.modelsReady else { return .notReady }
+            s.currentSessionId = sessionId
+            s.sessionElapsed = 0
+            s.hasDiarizationCompleted = false
+            s.lifecycleState = .recording
+            s.recordingSubject = req.meetingContext?.subject
+            s.recordingFilename = nil
+            return .accepted
+        }
+        switch gate {
+        case .alreadyRecording:
+            return (409, #"{"error":"A session is already in progress"}"#)
+        case .notReady:
+            return (503, #"{"error":"Transcription model not ready"}"#)
+        case .accepted:
+            break
+        }
+
+        let onStart = lock.withLock { _onStartSession }
+        let context = req.meetingContext
+        Task { @MainActor in
+            onStart?(type, sessionId, context, nil)
+        }
 
         return (200, encode(SessionStartResponse(
             sessionId: sessionId, status: "starting"
@@ -452,20 +556,22 @@ final class APIServer {
     }
 
     private func handleStopSession(body: Data?) -> (Int, String) {
-        guard transcriptionEngine?.isRunning == true else {
+        let (isRecording, currentId) = withState { ($0.isRecording, $0.currentSessionId) }
+        guard isRecording else {
             return (409, #"{"error":"No active session"}"#)
         }
 
         // Validate session ID if provided in the request body
         if let body,
            let req = try? JSONDecoder().decode(StopSessionRequest.self, from: body),
-           let current = currentSessionId,
+           let current = currentId,
            req.sessionId != current {
             return (409, encode(["error": "Session ID \"\(req.sessionId)\" does not match active session"]))
         }
 
-        let sessionId = currentSessionId ?? "unknown"
-        onStopSession?()
+        let sessionId = currentId ?? "unknown"
+        let onStop = lock.withLock { _onStopSession }
+        Task { @MainActor in onStop?() }
 
         return (200, encode(SessionStopResponse(
             sessionId: sessionId, status: "stopping"
@@ -473,11 +579,13 @@ final class APIServer {
     }
 
     private func handleSessionStatus(sessionId: String) async -> (Int, String) {
-        let isCurrentSession = currentSessionId == sessionId
+        let (isCurrentSession, perSessionState, elapsed) = withState {
+            ($0.currentSessionId == sessionId, $0.sessionStates[sessionId], $0.sessionElapsed)
+        }
 
         // Per-session state takes precedence over file-based lookup — it reflects
         // in-flight post-processing for sessions that just finished recording.
-        if let state = sessionStates[sessionId], !isCurrentSession {
+        if let state = perSessionState, !isCurrentSession {
             return (200, encode(SessionStatusResponse(
                 sessionId: sessionId,
                 status: state.rawValue,  // "transcribing" or "complete"
@@ -489,7 +597,7 @@ final class APIServer {
 
         // If not the current session and no in-flight state, verify it exists as a stored file
         if !isCurrentSession {
-            guard let sessionStore else {
+            guard let sessionStore = lock.withLock({ _sessionStore }) else {
                 return (404, #"{"error":"Session not found"}"#)
             }
             let dir = await sessionStore.sessionsDirectoryURL
@@ -506,9 +614,19 @@ final class APIServer {
             )))
         }
 
-        // Current session — report live status
-        let isRecording = transcriptionEngine?.isRunning ?? false
-        let assetStatus = transcriptionEngine?.assetStatus ?? "Ready"
+        // Current session — live status lives on the MainActor (engine + store).
+        // This is the one status path that can wait on a busy MainActor; the
+        // WhisperCal polling endpoints above never do.
+        let (isRecording, assetStatus, speakerCount, lineCount) = await MainActor.run {
+            () -> (Bool, String, Int, Int) in
+            let utterances = self.transcriptStore?.utterances ?? []
+            return (
+                self.transcriptionEngine?.isRunning ?? false,
+                self.transcriptionEngine?.assetStatus ?? "Ready",
+                Set(utterances.map(\.speaker)).count,
+                utterances.count
+            )
+        }
 
         let status: String
         if isRecording {
@@ -523,28 +641,27 @@ final class APIServer {
             status = "complete"
         }
 
-        let utterances = transcriptStore?.utterances ?? []
-        let speakers = Set(utterances.map(\.speaker))
-
         return (200, encode(SessionStatusResponse(
             sessionId: sessionId,
             status: status,
-            elapsedSeconds: sessionElapsed,
-            speakerCount: speakers.count,
-            lineCount: utterances.count
+            elapsedSeconds: elapsed,
+            speakerCount: speakerCount,
+            lineCount: lineCount
         )))
     }
 
     private func handleGetTranscript(sessionId: String) async -> (Int, String) {
-        // Live session — read from TranscriptStore
-        if let store = transcriptStore, currentSessionId == sessionId,
-           !store.utterances.isEmpty
-        {
-            return (200, transcriptFromStore(store))
+        // Live session — snapshot the MainActor store, then build the response
+        // off it (Utterance is Sendable).
+        if withState({ $0.currentSessionId == sessionId }) {
+            let utterances = await MainActor.run { self.transcriptStore?.utterances ?? [] }
+            if !utterances.isEmpty {
+                return (200, transcriptFromUtterances(utterances))
+            }
         }
 
         // Completed session — read JSONL file
-        guard let sessionStore else {
+        guard let sessionStore = lock.withLock({ _sessionStore }) else {
             return (503, #"{"error":"Session store not available"}"#)
         }
 
@@ -559,7 +676,7 @@ final class APIServer {
     }
 
     private func handleListSessions(query: [String: String]) async -> (Int, String) {
-        guard let sessionStore else {
+        guard let sessionStore = lock.withLock({ _sessionStore }) else {
             return (503, #"{"error":"Session store not available"}"#)
         }
 
@@ -596,15 +713,22 @@ final class APIServer {
             sessions.append(summary)
         }
 
-        // Include live session if active
-        if let sid = currentSessionId, transcriptionEngine?.isRunning == true {
+        // Include live session if active. The speaker count needs the MainActor
+        // store — hop only while actually recording, so an idle list never waits.
+        let (currentId, elapsed, isRecording) = withState {
+            ($0.currentSessionId, $0.sessionElapsed, $0.isRecording)
+        }
+        if let sid = currentId, isRecording {
+            let speakerCount = await MainActor.run {
+                Set(self.transcriptStore?.utterances.map(\.speaker) ?? []).count
+            }
             let liveSummary = SessionSummary(
                 sessionId: sid,
                 title: nil,
                 recordingStart: iso8601.string(from: Date()),
                 dateCreated: nil,
-                durationSeconds: sessionElapsed,
-                speakerCount: Set(transcriptStore?.utterances.map(\.speaker) ?? []).count,
+                durationSeconds: elapsed,
+                speakerCount: speakerCount,
                 status: "recording"
             )
             sessions.insert(liveSummary, at: 0)
@@ -615,8 +739,10 @@ final class APIServer {
 
     // MARK: - Transcript Builders
 
-    private func transcriptFromStore(_ store: TranscriptStore) -> String {
-        let utterances = store.utterances
+    private func transcriptFromUtterances(_ utterances: [Utterance]) -> String {
+        let (hasDiarized, elapsed) = withState {
+            ($0.hasDiarizationCompleted, $0.sessionElapsed)
+        }
         let sessionStart = utterances.first?.timestamp ?? Date()
 
         var lines: [TranscriptLine] = []
@@ -641,8 +767,8 @@ final class APIServer {
         let metadata = TranscriptMetadata(
             title: nil,
             dateCreated: iso8601.string(from: sessionStart),
-            hasBeenDiarized: hasDiarizationCompleted,
-            durationSec: sessionElapsed,
+            hasBeenDiarized: hasDiarized,
+            durationSec: elapsed,
             sourceApp: nil
         )
 
@@ -862,7 +988,11 @@ final class APIServer {
     // MARK: - JSON Encoding
 
     private func encode<T: Encodable>(_ value: T) -> String {
-        guard let data = try? jsonEncoder.encode(value) else { return "{}" }
+        // Fresh encoder per call: encode runs on the API queue and on detached
+        // handler tasks — no shared mutable instance.
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(value) else { return "{}" }
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 

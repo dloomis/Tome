@@ -129,8 +129,17 @@ struct ContentView: View {
         }
         .onChange(of: transcriptionEngine?.isRunning ?? false) { _, running in
             // Mirror live recording state into AppServices so the MenuBarExtra
-            // scene (which can't see the engine) can show a recording indicator.
+            // scene (which can't see the engine) can show a recording indicator,
+            // and into the APIServer so /health and the start/stop gates answer
+            // off the MainActor.
             services.isRecording = running
+            apiServer.updateIsRecording(running)
+        }
+        .onChange(of: services.modelProvisioner.canStartRecording, initial: true) { _, ready in
+            // Mirror model readiness into the APIServer: /health's modelsReady
+            // and the /start 503 gate must respond even while a modal alert or
+            // panel has the MainActor parked in a nested run loop.
+            apiServer.updateModelsReady(ready)
         }
         .onChange(of: settings.transcriptionLanguage) {
             // Push setting changes to the ASR actor so subsequent transcribe calls
@@ -194,7 +203,6 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
-                canStartRecording: { services.modelProvisioner.canStartRecording },
                 onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
