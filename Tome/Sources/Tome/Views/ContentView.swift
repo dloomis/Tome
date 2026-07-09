@@ -100,7 +100,9 @@ struct ContentView: View {
                 silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
                 silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
-                errorMessage: transcriptionEngine?.lastError,
+                errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
+                modelStatus: modelStatusText,
+                canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession,
@@ -469,6 +471,38 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// Main-screen provisioning banner (spec §7). Display-uppercased here;
+    /// Settings shows the sentence-case versions.
+    private var modelStatusText: String? {
+        let provisioner = services.modelProvisioner
+        switch provisioner.activity {
+        case .downloading(_, let progress):
+            if let progress { return "DOWNLOADING MODEL… \(Int(progress * 100))%" }
+            return "DOWNLOADING MODEL…"
+        case .loading:
+            return "LOADING MODEL…"
+        case .none:
+            if provisioner.servingModel == nil, provisioner.lastFailure != nil {
+                return "MODEL DOWNLOAD FAILED — retry in Settings ▸ Transcription"
+            }
+            if provisioner.servingModel != settings.transcriberModel {
+                // Transient pre-kick / selection-write→onChange frames.
+                return "LOADING MODEL…"
+            }
+            return nil
+        }
+    }
+
+    /// Post-revert failure line (spec §7): shown while a failure is recorded
+    /// AND something is serving (the F3 no-fallback case renders through
+    /// modelStatusText instead).
+    private var modelFailureText: String? {
+        let provisioner = services.modelProvisioner
+        guard let failure = provisioner.lastFailure,
+              let serving = provisioner.servingModel else { return nil }
+        return "\(failure.model.displayName) failed — reverted to \(serving.displayName): \(failure.message)"
+    }
+
     /// The detected meeting to actually offer, after the global toggle, the per-meeting
     /// dismissal, and the not-recording gate. Nil → Call Capture uses the default label.
     private var suggestedMeeting: DetectedMeeting? {
@@ -503,6 +537,12 @@ struct ContentView: View {
     }
 
     private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
+        // UI gating makes this unreachable from the buttons; API starts and
+        // races land here. Surfaced via the same error row the UI already has.
+        guard services.modelProvisioner.canStartRecording else {
+            transcriptionEngine?.lastError = "Transcription model not ready — check Settings ▸ Transcription"
+            return
+        }
         transcriptStore.clear()
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
