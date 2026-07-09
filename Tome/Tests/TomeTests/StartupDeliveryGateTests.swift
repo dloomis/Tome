@@ -11,17 +11,17 @@ import Testing
 @Suite struct StartupDeliveryGateTests {
 
     @Test func forcesRestartWhenNeverDeliveredWhileRunning() {
-        // Engine up, tap never delivered a sample, gate hasn't fired yet — the
-        // exact cold-start silence case. Force one restart.
+        // Engine up, tap never delivered a sample, gate hasn't fired yet, no
+        // rebuild pending — the exact cold-start silence case. Force one restart.
         #expect(TranscriptionEngine.shouldForceStartupRestart(
-            firstSampleAt: nil, isRunning: true, alreadyFired: false
+            firstSampleAt: nil, isRunning: true, alreadyFired: false, rebuildInFlight: false
         ))
     }
 
     @Test func skipsWhenTapAlreadyDelivered() {
         // A single delivered buffer means capture is alive; never rebuild it.
         #expect(!TranscriptionEngine.shouldForceStartupRestart(
-            firstSampleAt: Date(), isRunning: true, alreadyFired: false
+            firstSampleAt: Date(), isRunning: true, alreadyFired: false, rebuildInFlight: false
         ))
     }
 
@@ -29,14 +29,23 @@ import Testing
         // Strictly one-shot per start(): if the forced restart didn't help, the
         // 15s watchdog remains the net — the gate must never loop.
         #expect(!TranscriptionEngine.shouldForceStartupRestart(
-            firstSampleAt: nil, isRunning: true, alreadyFired: true
+            firstSampleAt: nil, isRunning: true, alreadyFired: true, rebuildInFlight: false
         ))
     }
 
     @Test func skipsWhenEngineNotRunning() {
         // Session was stopped before the gate fired — nothing to rescue.
         #expect(!TranscriptionEngine.shouldForceStartupRestart(
-            firstSampleAt: nil, isRunning: false, alreadyFired: false
+            firstSampleAt: nil, isRunning: false, alreadyFired: false, rebuildInFlight: false
+        ))
+    }
+
+    @Test func skipsWhenRebuildInFlight() {
+        // A debounced config/HAL rebuild is already pending — it will re-open the
+        // mic on its own. Don't stack a second forced restart on top, even though
+        // every other condition matches the cold-start case.
+        #expect(!TranscriptionEngine.shouldForceStartupRestart(
+            firstSampleAt: nil, isRunning: true, alreadyFired: false, rebuildInFlight: true
         ))
     }
 }
