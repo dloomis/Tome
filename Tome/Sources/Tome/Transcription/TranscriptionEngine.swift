@@ -108,20 +108,20 @@ final class TranscriptionEngine {
         isRunning = true
         beginLiveActivity()
 
-        // 1. Load FluidAudio models
-        assetStatus = "Loading ASR model (~600MB first run)..."
-        diagLog("[ENGINE-1] loading FluidAudio ASR models...")
+        // 1. Verify ASR readiness. Model download/load lives in
+        //    ModelProvisioner; the UI gates recording on readiness, so this
+        //    is a formality — but API starts and races land here too.
         do {
-            guard await asrCoordinator.isReady else { throw ASRCoordinatorError.notInitialized }
-            assetStatus = "Initializing ASR..."
-
+            guard await asrCoordinator.isReady else {
+                throw ASRCoordinatorError.notInitialized
+            }
             assetStatus = "Loading VAD model..."
             diagLog("[ENGINE-1b] loading VAD model...")
             let vad = try await VadManager()
             self.vadManager = vad
 
             assetStatus = "Models ready"
-            diagLog("[ENGINE-2] FluidAudio models loaded")
+            diagLog("[ENGINE-2] models ready")
         } catch {
             let msg = "Failed to load models: \(error.localizedDescription)"
             diagLog("[ENGINE-2-FAIL] \(msg)")
@@ -292,7 +292,8 @@ final class TranscriptionEngine {
         // detection entirely.
         startCaptureWatchdog(systemLegActive: sysStreams != nil)
 
-        assetStatus = "Transcribing (Parakeet-TDT v3)"
+        let modelName = await asrCoordinator.activeModel?.displayName ?? "ASR"
+        assetStatus = "Transcribing (\(modelName))"
         diagLog("[ENGINE-6] all transcription tasks started")
 
         // Install CoreAudio listener for default input device changes

@@ -61,10 +61,16 @@ enum TomeMain {
 
 struct TomeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @State private var settings = AppSettings()
-    @State private var services = AppServices()
+    @State private var settings: AppSettings
+    @State private var services: AppServices
     private let updaterController = AppUpdaterController()
     private let apiServer = APIServer()
+
+    init() {
+        let settings = AppSettings()
+        _settings = State(initialValue: settings)
+        _services = State(initialValue: AppServices(settings: settings))
+    }
 
     var body: some Scene {
         // Single-instance Window (not WindowGroup) — on macOS 26, WindowGroup

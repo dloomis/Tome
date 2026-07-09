@@ -137,6 +137,9 @@ struct ContentView: View {
             let language = settings.transcriptionLanguage
             Task { await services.asrCoordinator.setLanguage(language) }
         }
+        .onChange(of: settings.transcriberModel) { _, model in
+            services.modelProvisioner.provision(model)
+        }
         .task {
             if !hasCompletedOnboarding {
                 showOnboarding = true
@@ -149,6 +152,11 @@ struct ContentView: View {
             }
             guard let engine = transcriptionEngine else { return }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
+
+            // Kick provisioning of the selected model before anything that
+            // needs ASR (notably the orphan scan at the end of this task,
+            // which awaits the provisioner settling).
+            services.modelProvisioner.provision(settings.transcriberModel)
 
             // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
             // so a device chosen last session (AirPods) may be absent — or worse,
@@ -811,6 +819,9 @@ struct ContentView: View {
 
     @MainActor
     private func recoverOrphans(_ orphans: [OrphanScanner.Orphan]) async {
+        services.isRecovering = true
+        defer { services.isRecovering = false }
+
         let total = orphans.count
         var recovered = 0
         var failed: [String] = []
@@ -833,6 +844,7 @@ struct ContentView: View {
                     wavURL: orphan.wavURL,
                     transcriptURL: transcriptURL,
                     asr: services.asrCoordinator,
+                    provisioner: services.modelProvisioner,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                     exportVoiceprints: settings.exportVoiceprints,
@@ -973,12 +985,16 @@ struct ContentView: View {
         }
 
         Task { [preserveYou] in
+            services.isRecovering = true
+            defer { services.isRecovering = false }
+
             let result: Result<URL, Error>
             do {
                 let saved = try await Recovery.run(
                     wavURL: wavURL,
                     transcriptURL: mdURL,
                     asr: services.asrCoordinator,
+                    provisioner: services.modelProvisioner,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                     exportVoiceprints: settings.exportVoiceprints,

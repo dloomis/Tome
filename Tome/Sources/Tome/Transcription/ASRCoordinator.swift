@@ -93,3 +93,12 @@ actor ASRCoordinator {
 enum ASRCoordinatorError: Error, Sendable {
     case notInitialized
 }
+
+extension ASRCoordinatorError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .notInitialized:
+            "Transcription model not ready — check Settings ▸ Transcription"
+        }
+    }
+}

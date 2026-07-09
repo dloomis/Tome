@@ -80,6 +80,7 @@ enum Recovery {
         wavURL: URL,
         transcriptURL: URL,
         asr: ASRCoordinator,
+        provisioner: ModelProvisioner,
         clusterThreshold: Float,
         numberOfSpeakers: Int,
         exportVoiceprints: Bool = false,
@@ -105,9 +106,12 @@ enum Recovery {
             filenameDateFormat: "yyyy-MM-dd HH-mm-ss"
         )
 
-        // Make sure FluidAudio's AsrManager is loaded before the re-transcribe step
-        // calls into it. If the app just launched and no recording has run, the
-        // models aren't loaded yet.
+        // Launch-time orphan recovery can race the provisioner's launch kick —
+        // wait for it to settle (including an F2 fallback chain) instead of
+        // triggering a second model load. If nothing is installed after
+        // settling (fresh install, download failed), recovery can't run;
+        // orphans stay on disk for a later launch or File ▸ Recover.
+        await provisioner.awaitSettled()
         guard await asr.isReady else { throw RecoveryError.modelNotReady }
 
         diagLog("[RECOVERY] diarizing \(wavURL.lastPathComponent), duration=\(Int(wav.durationSeconds))s, sessionStart=\(sessionStartTime)")
