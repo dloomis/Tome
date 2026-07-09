@@ -126,14 +126,20 @@ func benchWhisper(chunks: [[Float]], variant: String, base: URL) async throws ->
         "models/argmaxinc/whisperkit-coreml/\(variant)", isDirectory: true)
     let cached = FileManager.default.fileExists(
         atPath: expectedFolder.appendingPathComponent("TextDecoder.mlmodelc").path)
-    let tDownload = now()
-    let folder = try await WhisperKit.download(
-        variant: variant, downloadBase: base,
-        progressCallback: { progress in
-            let pct = Int(progress.fractionCompleted * 100)
-            if pct % 10 == 0 { print("whisper download: \(pct)%") }
-        })
-    let downloadSeconds: Double? = cached ? nil : now() - tDownload
+    let folder: URL
+    var downloadSeconds: Double? = nil
+    if cached {
+        folder = expectedFolder
+    } else {
+        let tDownload = now()
+        folder = try await WhisperKit.download(
+            variant: variant, downloadBase: base,
+            progressCallback: { progress in
+                let pct = Int(progress.fractionCompleted * 100)
+                if pct % 10 == 0 { print("whisper download: \(pct)%") }
+            })
+        downloadSeconds = now() - tDownload
+    }
 
     let config = WhisperKitConfig(
         model: variant, downloadBase: base,

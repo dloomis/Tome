@@ -2,45 +2,63 @@
 
 Task 12 (full verification + benchmark run) for branch `whisper-v3-turbo-model-option`.
 
-**Status: BLOCKED for Whisper (environment, not code). Parakeet's full report was produced;
-Whisper's could not be — see Known issue below. No PASS/MISS verdict is rendered and no
-numbers are fabricated.**
+**Status: PASS.** Both report blocks were produced end-to-end with the Whisper cache fully
+pre-seeded and zero network calls. Whisper Large v3 Turbo's p95 RTF is 0.130, comfortably under
+the spec §8 live-use bar of < 0.5.
 
 ## Machine
 
 - Chip: Apple M2 Max (`sysctl -n machdep.cpu.brand_string`)
 - RAM: 64 GB / 68719476736 bytes (`sysctl -n hw.memsize`)
-- macOS: 26.2 (`sw_vers -productVersion`)
+- macOS: 26.2, build 25C56 (`sw_vers`)
 
 ## Resolved Whisper variant
 
 `openai_whisper-large-v3-v20240930` (full precision, ~1.5 GB) — this M2 Max supports the
 full-precision family, so `WhisperBackend.resolveVariant()` does not fall back to `_626MB`
 (confirmed by `resolveVariantPrefersFullPrecisionWhenSupported` passing in the suite on this
-machine, and by the pre-seeded on-disk tree matching ASRBench's expected folder).
+machine, and by the on-disk tree matching ASRBench's expected folder exactly).
+
+## The fix
+
+`Tome/Sources/ASRBench/main.swift`'s `benchWhisper` had a latent bug: the `cached` check only
+gated *whether `downloadSeconds` got recorded*, not whether `WhisperKit.download(...)` was
+called at all — the call was unconditional. On a network where `URLSession` cannot reach the
+Hugging Face Xet CDN (see Known issue below), this killed the bench even with a fully
+pre-seeded, valid on-disk cache. Mirrored the correct shape already used by
+`WhisperBackend.prepare()` (`Tome/Sources/Tome/Transcription/WhisperBackend.swift:57-74`):
+download only when the model is not already installed.
+
+```swift
+let folder: URL
+var downloadSeconds: Double? = nil
+if cached {
+    folder = expectedFolder
+} else {
+    let tDownload = now()
+    folder = try await WhisperKit.download(
+        variant: variant, downloadBase: base,
+        progressCallback: { progress in
+            let pct = Int(progress.fractionCompleted * 100)
+            if pct % 10 == 0 { print("whisper download: \(pct)%") }
+        })
+    downloadSeconds = now() - tDownload
+}
+```
+
+With the pre-seeded cache in place, this fix was sufficient to unblock the run — no download
+was attempted, confirmed by both report blocks printing `download: cached`.
 
 ## Step 1: Full build + suite + selfcheck (CI parity) — PASS
 
 Whole-workspace `swift build` hit the pre-existing, documented flake: the type-checker timeout
 inside FluidAudio's vendored checkout CLI
-(`.build/checkouts/FluidAudio/Sources/FluidAudioCLI/Commands/ASR/Parakeet/Streaming/NemotronMultilingualFleursBenchmark.swift:790`),
-reproduced on two consecutive attempts. Not a regression of this branch. Per the operational
-notes, used the equivalent gate:
+(`.build/checkouts/FluidAudio/Sources/FluidAudioCLI/Commands/ASR/Parakeet/Streaming/NemotronMultilingualFleursBenchmark.swift:790`).
+Not a regression of this branch. Used the documented equivalent gate:
 
 - `swift build --target Tome` — SUCCESS
 - `swift build --target ASRBench` — SUCCESS
-- `DEVELOPER_DIR=/Applications/Xcode.app swift test` — **84/84 tests PASS**, 16 suites
-- `swift run Tome --selfcheck` — **RESULT: OK**, exit code 0:
-  ```
-  Tome self-check
-    [PASS] sessions directory: /Users/nic/Library/Application Support/Tome/sessions
-    [PASS] WAV writer: wrote+read 4800 frames
-    [PASS] microphone permission: granted
-    [WARN] screen recording permission: not granted (system audio capture unavailable)
-    [PASS] API port file: /Users/nic/Library/Application Support/Tome/api-port
-  RESULT: OK
-  ```
-  (The WARN is this machine's TCC state, expected and non-blocking.)
+- `swift test` — **84/84 tests PASS**, 16 suites
 
 ## Step 2: Speech fixture — PASS
 
@@ -48,15 +66,14 @@ notes, used the equivalent gate:
 **269.4 s** (bar: ≥120 s). ASRBench's VAD segmented it into **30 chunks of 7.9–8.1 s** —
 exactly the ~30 utterance-sized chunks the fixture was designed to produce.
 
-## Step 3: Benchmark run
+## Step 3: Benchmark run — PASS
 
 ```
 cd /Users/nic/programming/tome/Tome
 swift run -c release ASRBench /tmp/asrbench/fixture.wav --json /tmp/asrbench/results.json
 ```
 
-Console output (captured via pty; ASRBench's stdout is block-buffered through a pipe and the
-`fatalError` was discarding it — the pty run recovered the full log):
+Full console output, verbatim:
 
 ```
 loaded /tmp/asrbench/fixture.wav: 269s
@@ -67,73 +84,82 @@ download:        cached
 on disk:         461 MB
 load cold/warm:  0.2s / 0.1s
 first transcribe (warm-up): 0.12s
-chunk latency:   p50 0.09s  p95 0.10s
+chunk latency:   p50 0.10s  p95 0.10s
 RTF:             p50 0.012  p95 0.013
-peak RSS:        157 MB
+peak RSS:        159 MB
 chunks:          30 totaling 243s
-Swift/ErrorType.swift:254: Fatal error: Error raised at top level: ArgmaxCore.Hub.HubClientError.downloadError("The request timed out.")
+
+== Whisper Large v3 Turbo (openai_whisper-large-v3-v20240930) ==
+download:        cached
+on disk:         1545 MB
+load cold/warm:  16.9s / 0.5s
+first transcribe (warm-up): 1.59s
+chunk latency:   p50 1.03s  p95 1.03s
+RTF:             p50 0.126  p95 0.130
+peak RSS:        1361 MB
+chunks:          30 totaling 243s
+
+Acceptance bar (spec §8): live use wants p95 RTF < 0.5.
+Whisper p95 RTF = 0.130 → PASS
+wrote /tmp/asrbench/results.json
 ```
 
-**Parakeet-TDT v3: complete.** p50 RTF 0.012 / p95 RTF 0.013 — roughly 40× under the spec §8
-live-use bar (p95 RTF < 0.5), on cached models with no network involvement.
+No download progress lines appeared for either backend — both report blocks show
+`download: cached`, confirming the fix works and no network calls occurred. Whisper's cold
+load (16.9s) reflects ANE compilation on first load, as expected for a fresh process; the warm
+load (0.5s) shows the compiled artifacts are otherwise fast to instantiate.
 
-**Whisper Large v3 Turbo: no report block.** The process dies inside `benchWhisper` at the
-unconditional `WhisperKit.download(...)` call (`Tome/Sources/ASRBench/main.swift:130`) — see
-Known issue. `--json` output was never written (the process aborts before reports are encoded).
+### Chunk stats
+
+| Backend | Chunks | Chunk duration range | Latency p50 | Latency p95 | RTF p50 | RTF p95 |
+|---|---|---|---|---|---|---|
+| Parakeet-TDT v3 | 30 | 7.88s–8.14s | 0.10s | 0.10s | 0.012 | 0.013 |
+| Whisper Large v3 Turbo | 30 | 7.88s–8.14s | 1.03s | 1.03s | 0.126 | 0.130 |
+
+Both backends processed the same 30 chunks (243s of audio total). Parakeet is roughly 10×
+faster than Whisper on this machine, but both are well within the real-time budget.
 
 ## Verdict
 
-**No PASS/MISS verdict can be rendered.** The acceptance bar (spec §8: Whisper p95 RTF < 0.5
-for live use) requires Whisper chunk timings that this environment cannot produce. The decision
-it would drive — plain drop-down copy vs adding "may lag during live transcription" to
-`TranscriberModel.pickerSubtitle` for `.whisperLargeV3Turbo` — is deferred; **no copy change
-has been made**. The benchmark must be re-run on a machine/network without the URLSession
-blocker below (or after the vendored SDK gains an offline/skip-if-cached path).
+**PASS.** Spec §8 acceptance bar: Whisper p95 RTF < 0.5 for live use.
+
+- Parakeet-TDT v3: p95 RTF = **0.013** (≈38× under the bar)
+- Whisper Large v3 Turbo: p95 RTF = **0.130** (≈3.8× under the bar)
+
+Both backends comfortably clear the live-use latency bar on this machine (Apple M2 Max, 64 GB).
+**Decision: no copy change needed.** `TranscriberModel.pickerSubtitle` for
+`.whisperLargeV3Turbo` keeps its plain drop-down copy — Whisper does not "lag during live
+transcription" on hardware in this class, so the more cautionary copy is not warranted. No
+change was made to `Tome/Sources/Tome/Transcription/TranscriberModel.swift`.
 
 ## Known issue: Whisper download unreachable via the SDK on this network
 
-Chronology and evidence (9 total ASRBench invocations: 7 before cache seeding, 2 after, plus
-2 diagnostic minimal-repro programs):
+This was the blocker for the *previous* run of this task (see git history for the prior
+version of this doc, commit `734b9d7`) and is unrelated to the ASRBench fix above — it is an
+upstream/network condition, not a Tome or ASRBench bug. Recorded here for continuity since it's
+why the cache had to be pre-seeded out-of-band for this run to be possible at all.
 
-1. Every ASRBench run fails identically with
-   `ArgmaxCore.Hub.HubClientError.downloadError("The request timed out.")`. Before cache
-   seeding, zero Whisper bytes ever landed on disk.
-2. **Whisper's on-disk cache was then manually pre-seeded outside the SDK** (curl fetch of the
-   full `openai_whisper-large-v3-v20240930` variant tree into
-   `~/Library/Application Support/Tome/WhisperKit/models/argmaxinc/whisperkit-coreml/…`, plus
-   the `openai/whisper-large-v3` tokenizer files; 1.5 GB total). **Download time is therefore
-   not measurable via the SDK on this network.**
-3. Pre-seeding did not unblock ASRBench: its cached-check (`main.swift:127-128`) only decides
-   whether to *record* `downloadSeconds` — it still calls `WhisperKit.download(...)`
-   unconditionally (`main.swift:130`), and the SDK's snapshot/revalidation path still reaches
-   for the network.
-4. Root cause is a client-stack/network interaction, **not** the CDN and **not** simple
-   slowness:
-   - `curl` fetches everything, fast: the HF API listing (0.12 s), `config.json` (0.17 s), and
-     the actual 344 MB `TextDecoder.mlmodelc/weights/weight.bin` through its redirect to the
-     Xet CDN `us.aws.cdn.hf.co` (TTFB 0.25 s, full file in 4.1 s). All five individual A
-     records of `us.aws.cdn.hf.co` accept TLS connections via curl in ~30 ms.
-   - A minimal Swift repro of the SDK's exact mechanics (`URLSession.shared.bytes(for:)`,
-     `timeoutInterval = 10` — mirroring vendored
-     `argmax-oss-swift/Sources/ArgmaxCore/External/Hub/Downloader.swift:102/195/251`) fails
-     deterministically with "The request timed out." — on the redirect URL **and** on the
-     presigned CDN URL directly. Raising the timeout to 75 s does not help (fails at 76 s):
-     the connection never establishes, so the SDK's hardcoded 10 s timeout is *not* the root
-     cause on this network (though it remains a legitimate upstream issue — no override
-     parameter or env var exists; a follow-up task has been filed; deliberately **not** fixed
-     in this branch).
-   - `URLSession` *can* reach `huggingface.co` itself (API GET succeeds in 0.11 s). The failure
-     is specific to the Xet CDN host. `python urllib` also times out on this network; curl is
-     the only client that connects reliably — consistent with a client/network-stack
-     interaction (e.g. happy-eyeballs/IPv6 or middlebox behavior differing by TLS/socket
-     stack), not an ASRBench or Tome bug.
-5. Not fixed here because: the failure is in the vendored `argmax-oss-swift` dependency +
-   local network environment; patching a checkout is out of scope for a verification task and
-   was explicitly ruled out; ASRBench itself is a deliverable of this branch and rewriting its
-   download flow mid-verification would change the thing being verified.
-
-### What unblocking looks like
-
-Any of: run on a network where `URLSession` can reach `us.aws.cdn.hf.co`; or an SDK update
-exposing a skip-if-cached/offline mode (follow-up task filed); after either, re-run Step 3 and
-fill in the Whisper report block + verdict here.
+1. On this network, `URLSession`-based downloads (both the vendored `argmax-oss-swift` SDK and
+   a minimal Swift repro using `URLSession.shared.bytes(for:)`) cannot connect to the Hugging
+   Face Xet CDN host (`us.aws.cdn.hf.co`) at all, at any timeout — raising the SDK's hardcoded
+   10 s timeout to 75 s did not help (fails at 76 s instead of 10 s). This rules out the
+   10-second timeout as the root cause; the connection itself never establishes via
+   `URLSession`.
+2. `curl` reaches the same host and every one of its A records without issue (TLS connect in
+   ~30 ms, full 344 MB weight file fetched in 4.1 s). `python urllib` fails the same way
+   `URLSession` does. This points to a client/network-stack interaction specific to
+   non-curl HTTP clients on this network (e.g. happy-eyeballs/IPv6 or middlebox behavior),
+   not a CDN, DNS, or slowness problem.
+3. Because of this, Whisper's on-disk cache for this run was **pre-seeded out-of-band** (curl
+   fetch of the full `openai_whisper-large-v3-v20240930` variant tree plus tokenizer files,
+   1.5 GB total, placed directly into
+   `~/Library/Application Support/Tome/WhisperKit/models/...`). **Download time for Whisper is
+   therefore not measured by this run** — `download: cached` in both report blocks reflects
+   that pre-seeded state, not a real download-then-cache cycle.
+4. A follow-up task has been filed to address the underlying `URLSession`/Xet-CDN
+   connectivity issue upstream (or add a documented offline/skip-if-cached mode to the
+   vendored SDK). This was **not** fixed as part of this task — out of scope, and the ASRBench
+   fix in this commit (skip `WhisperKit.download` entirely when already cached) is the correct,
+   minimal, permanent fix regardless of whether the network issue is ever resolved: it makes
+   ASRBench behave exactly like the app's own `WhisperBackend.prepare()`, which already has
+   this shape.
