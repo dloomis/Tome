@@ -25,3 +25,24 @@ enum TranscriberModel: String, CaseIterable, Sendable, Codable {
         persisted.flatMap(TranscriberModel.init(rawValue:)) ?? .parakeetTDTv3
     }
 }
+
+extension TranscriberModel {
+    /// Whether the model's files are fully on disk (offline load possible).
+    /// Filesystem checks — cheap (fileExists), but call from UI only.
+    var isInstalled: Bool {
+        switch self {
+        case .parakeetTDTv3: ParakeetBackend.isInstalled()
+        case .whisperLargeV3Turbo: WhisperBackend.isInstalled()
+        }
+    }
+
+    /// Approximate download size for Settings copy. Whisper's depends on the
+    /// device-resolved variant (M1 gets the quantized build).
+    var approxDownloadSize: String {
+        switch self {
+        case .parakeetTDTv3: "~600 MB"
+        case .whisperLargeV3Turbo:
+            WhisperBackend.resolveVariant().hasSuffix("_626MB") ? "~0.6 GB" : "~1.5 GB"
+        }
+    }
+}
