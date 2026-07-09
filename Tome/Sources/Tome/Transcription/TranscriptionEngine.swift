@@ -106,6 +106,11 @@ final class TranscriptionEngine {
         guard await ensureMicrophonePermission() else { return }
 
         isRunning = true
+        // Fresh session — reset the startup-delivery gate's one-shot latch and
+        // clear any stale handle from a prior start().
+        startupGateFired = false
+        startupGateTask?.cancel()
+        startupGateTask = nil
         beginLiveActivity()
 
         // 1. Verify ASR readiness. Model download/load lives in
@@ -193,6 +198,15 @@ final class TranscriptionEngine {
             endLiveActivity()
             return
         }
+
+        // Startup-delivery gate: the mic engine is up, but on AirPods the first
+        // engine open can race the A2DP→HFP profile flip — start() succeeds
+        // against the stale 48 kHz format, the profile then flips, and the tap
+        // delivers nothing with no error and no config-change (the HAL fast path
+        // above is the primary backstop; this is belt-and-suspenders for when the
+        // flip races even that). Force ONE mic restart at 3s if no sample ever
+        // arrives, collapsing the 15s watchdog wait.
+        armStartupDeliveryGate()
 
         // 3. Start system audio capture. Skipped for mic-only sessions (voice memos /
         //    in-person meetings) — there the mic is the sole source and diarization runs
@@ -298,6 +312,70 @@ final class TranscriptionEngine {
 
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
+    }
+
+    /// One-shot handle for the startup-delivery gate armed in `start()`. See
+    /// `armStartupDeliveryGate`. Cancelled in `stop()`.
+    private var startupGateTask: Task<Void, Never>?
+
+    /// Set once the startup-delivery gate has forced its single restart, so it
+    /// never fires twice within one `start()` even across a `restartMic` that
+    /// re-arms nothing. Reset at the top of each `start()`.
+    private var startupGateFired = false
+
+    /// Pure decision for the startup-delivery gate (below). Extracted so the
+    /// never-delivered-vs-delivered distinction and the strict one-shot rule can
+    /// be unit-tested without audio hardware. Force a single mic restart only
+    /// when the engine is still running, the tap has NEVER delivered a sample
+    /// this session (`firstSampleAt == nil` — distinct from delivered-then-quiet,
+    /// which is the watchdog's job), and the gate hasn't already fired.
+    nonisolated static func shouldForceStartupRestart(
+        firstSampleAt: Date?,
+        isRunning: Bool,
+        alreadyFired: Bool
+    ) -> Bool {
+        isRunning && firstSampleAt == nil && !alreadyFired
+    }
+
+    /// Arm the one-shot startup-delivery gate: a silent fast retry for the
+    /// AirPods cold-start silence bug. `bufferStream`'s HAL fast path is the
+    /// primary catch, but if the A2DP→HFP flip races even that (or macOS doesn't
+    /// post the HAL change for this particular mutation), only the 15s stall
+    /// watchdog would rescue it — 15–22s of lost audio every AirPods recording.
+    /// This collapses that to ~3s.
+    ///
+    /// Strictly one-shot per `start()`: if the forced restart doesn't help, the
+    /// watchdog remains the net; we do NOT loop. The never-delivered condition is
+    /// re-checked at FIRE time (not cancelled on delivery) so natural first
+    /// delivery just makes it a no-op — `firstSampleTime` stays nil only when the
+    /// tap truly never fired, distinct from delivered-then-quiet (the watchdog's
+    /// domain). This is a silent retry: NO user-facing stall notification, unlike
+    /// the watchdog's alarm.
+    private func armStartupDeliveryGate() {
+        startupGateTask?.cancel()
+        startupGateTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                // A debounced config/HAL rebuild already in flight will re-open
+                // the mic on its own — don't stack a second restart on top.
+                let rebuildInFlight = self.micRebuildTask != nil
+                guard !rebuildInFlight,
+                      Self.shouldForceStartupRestart(
+                          firstSampleAt: self.micCapture.firstSampleTime,
+                          isRunning: self.isRunning,
+                          alreadyFired: self.startupGateFired
+                      )
+                else { return }
+
+                self.startupGateFired = true
+                diagLog("[MIC-STARTGATE] no first sample within 3s of start — forcing one mic restart")
+                // Same restart path the watchdog uses, WITHOUT the user-facing
+                // stall notification: this is a silent fast retry, not an alarm.
+                self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+            }
+        }
     }
 
     /// Timestamps of recent config-driven rebuilds — loop suppression window.
@@ -501,6 +579,8 @@ final class TranscriptionEngine {
     func stop() async {
         lastError = nil
         removeDefaultDeviceListener()
+        startupGateTask?.cancel()
+        startupGateTask = nil
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil
