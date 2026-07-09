@@ -112,7 +112,7 @@ final class TranscriptionEngine {
         assetStatus = "Loading ASR model (~600MB first run)..."
         diagLog("[ENGINE-1] loading FluidAudio ASR models...")
         do {
-            try await asrCoordinator.initialize()
+            guard await asrCoordinator.isReady else { throw ASRCoordinatorError.notInitialized }
             assetStatus = "Initializing ASR..."
 
             assetStatus = "Loading VAD model..."
