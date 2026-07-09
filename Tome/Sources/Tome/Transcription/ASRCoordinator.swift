@@ -13,6 +13,13 @@ import FluidAudio
 /// in-flight count drains to zero.
 actor ASRCoordinator {
     private var activeBackend: (any ASRBackend)?
+    /// Highest install token applied so far. Installs carry the provisioning
+    /// cycle's monotonic generation; an install whose token is not strictly
+    /// greater is stale (its cycle was superseded — e.g. a flip-back re-asserted
+    /// the serving backend under a higher token while this install was in flight)
+    /// and is refused, its incoming backend unloaded. Prevents a late install
+    /// from a dead cycle silently swapping in the wrong backend (audit F-1).
+    private var lastInstallToken = Int.min
     /// In-flight transcribe calls per backend (keyed by identity).
     private var inFlight: [ObjectIdentifier: Int] = [:]
     /// Replaced backends still owed an unload once their in-flight drains.
@@ -31,7 +38,24 @@ actor ASRCoordinator {
 
     /// Swap the serving backend. The old backend keeps serving its in-flight
     /// calls and is unloaded when the last one returns.
-    func install(backend: any ASRBackend) async {
+    ///
+    /// `token` is the requesting provisioning cycle's generation. Installs are
+    /// token-ordered: a `token` not strictly greater than the last applied one
+    /// is stale — the swap is refused and the incoming backend unloaded (unless
+    /// it IS the active backend, which stays put). Re-asserting the active
+    /// backend under a higher token is a no-op swap (the `old !== backend`
+    /// guard skips the retire), but still records the token so any in-flight
+    /// stale install is outranked.
+    func install(backend: any ASRBackend, token: Int) async {
+        guard token > lastInstallToken else {
+            // Stale cycle. Don't disturb the active backend; release the
+            // orphaned incoming one unless it's already what's serving.
+            if activeBackend !== backend {
+                await backend.unload()
+            }
+            return
+        }
+        lastInstallToken = token
         if let old = activeBackend, old !== backend {
             let id = ObjectIdentifier(old)
             if inFlight[id, default: 0] > 0 {

@@ -267,6 +267,51 @@ final class ProvisionerHarness {
         #expect(await h.coordinator.activeModel == .whisperLargeV3Turbo)
     }
 
+    /// Audit F-1: flip back to the serving model while a swap's install is
+    /// racing to completion. Serving P; select W (completes only when released);
+    /// flip back to P (returns to .none synchronously); then W's cycle finishes.
+    /// The wrong backend must never end up serving — coordinator stays on P,
+    /// servingModel stays P, and W's backend is unloaded (via the pre-install
+    /// stale guard or the coordinator's token refusal).
+    @Test func flipBackDuringRacingInstallKeepsServingModel() async throws {
+        let h = ProvisionerHarness(scripts: [.whisperLargeV3Turbo: [.succeedWhenReleased]])
+        h.provisioner.provision(.parakeetTDTv3)
+        await h.settle()
+        #expect(h.provisioner.servingModel == .parakeetTDTv3)
+
+        h.selectionValue = .whisperLargeV3Turbo
+        h.provisioner.provision(.whisperLargeV3Turbo)     // W cycle in flight (gated)
+        #expect(h.provisioner.activity != .none)
+
+        // Wait until W's prepare has actually parked on its gate before flipping,
+        // so releasePrepare() below can't fire into an unarmed gate.
+        let wBackend = h.lastBackend(for: .whisperLargeV3Turbo)
+        for _ in 0..<100 {
+            if await wBackend?.prepareCalls == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(20))   // let it reach the gate
+
+        // Flip back to the serving model — resolves synchronously to .none.
+        h.selectionValue = .parakeetTDTv3
+        h.provisioner.provision(.parakeetTDTv3)
+        #expect(h.provisioner.activity == .none)
+
+        // Now let W's prepare complete; its install must lose to P.
+        await wBackend?.releasePrepare()
+
+        // Poll: W's backend gets unloaded once (stale guard or token refusal).
+        var wUnloads = 0
+        for _ in 0..<100 {
+            wUnloads = await wBackend?.unloadCalls ?? 0
+            if wUnloads == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(wUnloads == 1)
+        #expect(await h.coordinator.activeModel == .parakeetTDTv3)
+        #expect(h.provisioner.servingModel == .parakeetTDTv3)
+    }
+
     /// awaitSettled must ride through an F2 chain (fail → fall back → last-good
     /// ready), not wake in the momentary activity==.none gap between them.
     @Test func awaitSettledSpansTheF2Chain() async throws {

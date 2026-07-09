@@ -22,8 +22,16 @@ final actor ParakeetBackend: ASRBackend {
 
     func prepare(onEvent: @Sendable @escaping (PrepareEvent) -> Void) async throws {
         guard asrManager == nil else { return }
-        if Self.isInstalled() { onEvent(.loading) }
+        // Capture once: FluidAudio's DownloadUtils.loadModelsOnce emits a spurious
+        // `.downloading(0.5)` even on a pure cache hit (once per loadModels call,
+        // 4× for Parakeet). On an already-installed model that would flicker the
+        // banner "DOWNLOADING… 50%" ↔ "LOADING…" through the CoreML load, so we
+        // coerce every progress phase to `.loading` — nothing is actually being
+        // fetched. When NOT installed we surface real download progress (F-5).
+        let installed = Self.isInstalled()
+        if installed { onEvent(.loading) }
         let models = try await AsrModels.downloadAndLoad(version: .v3, progressHandler: { progress in
+            if installed { onEvent(.loading); return }
             switch progress.phase {
             case .listing: onEvent(.downloading(progress: nil))
             case .downloading: onEvent(.downloading(progress: progress.fractionCompleted))

@@ -211,14 +211,26 @@ private struct TranscriptionTab: View {
             }
         }
         .formStyle(.grouped)
+        // Provision from Settings too, so a model change still takes effect when
+        // the main window is closed (app alive via MenuBarExtra) and ContentView's
+        // onChange isn't live (audit F-4). ContentView.onChange(of:
+        // settings.transcriberModel) mirrors this; provision() is idempotent
+        // (in-flight/serving guards) so a duplicate call from the live window is a
+        // no-op.
+        .onChange(of: settings.transcriberModel) { _, model in
+            services.modelProvisioner.provision(model)
+        }
     }
 
     /// Spec §4a: no swap may land mid-recording, mid-post-processing, or
     /// mid-recovery — a job re-transcribed by two models is a quality bug.
+    /// `isSessionPending` closes the start/stop transition windows that
+    /// `isRecording` misses (audit F-2).
     private var modelChangeLocked: Bool {
         services.isRecording
             || services.postProcessingQueue.isAnyJobRunning
             || services.isRecovering
+            || services.isSessionPending
     }
 
     /// Per-row install state (spec §6): each row describes ITSELF; the

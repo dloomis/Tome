@@ -47,6 +47,15 @@ final class AppServices {
     /// model picker so a swap can't land mid-job.
     var isRecovering = false
 
+    /// True during the session-transition windows that `isRecording` misses:
+    /// press → recording actually running (which spans several awaits AND the
+    /// first-run TCC microphone prompt — that modal can sit open for minutes),
+    /// and stop → job enqueued. `isRecording` only flips once the engine is
+    /// live and the onChange mirror lands, leaving those windows unlocked; a
+    /// model swap starting there could install mid-session/mid-enqueue.
+    /// Settings folds this into the picker lock to close that gap (audit F-2).
+    var isSessionPending = false
+
     init(settings: AppSettings) {
         let asr = ASRCoordinator()
         self.asrCoordinator = asr

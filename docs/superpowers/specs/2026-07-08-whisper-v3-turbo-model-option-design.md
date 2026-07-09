@@ -177,7 +177,11 @@ and `SegmentReTranscriber` need **zero changes**. Internally:
   counts in-flight transcribe calls per backend (increment before the backend
   await, decrement in `defer`) and defers the old backend's `unload()` until
   its count reaches zero. Steady state: **one model resident in memory**
-  (transiently two during a swap: old serving, new loading).
+  (transiently two during a swap: old serving, new loading). Installs are also
+  **token-ordered**: `install` carries the provisioning cycle's monotonic
+  generation token, and an install whose token is not strictly greater than the
+  last applied one is refused (its incoming backend unloaded) — so a late
+  install from a superseded cycle can never silently swap in the wrong backend.
 - `initialize()` is **removed**. The coordinator never downloads or loads
   models; `ModelProvisioner` (§4) is the only component that does. Callers
   that needed it are repointed in §5.
@@ -312,9 +316,11 @@ File ▸ Recover from WAV. A swap landing mid-job would re-transcribe half a
 transcript with a different model.
 
 - The Settings picker is disabled while **any** of: recording is active, a
-  post-processing job is running (`postProcessingQueue` already exposes this;
-  the menu bar observes it today), or a recovery is in flight. Caption:
-  "Model changes are disabled while recording or processing."
+  session is starting or stopping (the press→recording and stop→enqueue
+  transition windows that `isRecording` misses — not the pre-recovery settle
+  wait), a post-processing job is running (`postProcessingQueue` already exposes
+  this; the menu bar observes it today), or a recovery re-transcription is in
+  flight. Caption: "Model changes are disabled while recording or processing."
 - `Recovery.run()` no longer calls `initialize()`; it **awaits the
   provisioner settling**, then proceeds on the installed backend.
   **Settled** is defined as a *resting* state: no cycle in flight **and**

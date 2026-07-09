@@ -140,6 +140,9 @@ struct ContentView: View {
             Task { await services.asrCoordinator.setLanguage(language) }
         }
         .onChange(of: settings.transcriberModel) { _, model in
+            // Mirrored by SettingsView.TranscriptionTab's onChange so a change
+            // still provisions when this window is closed (F-4). provision() is
+            // idempotent, so the duplicate call when both are live is a no-op.
             services.modelProvisioner.provision(model)
         }
         .task {
@@ -544,6 +547,12 @@ struct ContentView: View {
             transcriptionEngine?.lastError = "Transcription model not ready — check Settings ▸ Transcription"
             return
         }
+        // Lock model changes across the whole press → recording-live window —
+        // it spans the awaits below AND `ensureMicrophonePermission()`'s TCC
+        // prompt (minutes on first run), which `isRecording` doesn't cover
+        // until the engine flips live. Cleared on EVERY exit of the Task below
+        // (success, rollback, early return). Audit F-2.
+        services.isSessionPending = true
         transcriptStore.clear()
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
@@ -620,6 +629,7 @@ struct ContentView: View {
                 apiServer.sessionDidStop(id: sid)
                 apiServer.sessionDidComplete(id: sid)
                 transcriptionEngine?.lastError = error.localizedDescription
+                services.isSessionPending = false   // start aborted (F-2)
                 return
             }
 
@@ -669,6 +679,10 @@ struct ContentView: View {
             if transcriptionEngine?.isRunning != true {
                 await rollbackFailedStart(sessionId: sid)
             }
+            // Start flow finished: either the engine is live (isRecording now
+            // holds the lock) or we rolled back to idle. Release the pending
+            // lock either way (F-2).
+            services.isSessionPending = false
         }
     }
 
@@ -723,6 +737,11 @@ struct ContentView: View {
             diagLog("[STOP] stopSession ignored — no active session")
             return
         }
+        // Lock model changes across stop → job enqueued: `engine.stop()` flips
+        // isRunning false several awaits before `enqueue`, and isAnyJobRunning
+        // isn't true until the job actually starts, so this window is otherwise
+        // unlocked. Cleared once the job is enqueued (or on early exit). F-2.
+        services.isSessionPending = true
         let wasCallCapture = activeSessionType == .callCapture
         let sessionId = currentSessionId ?? SessionStore.generateSessionId()
         let sourceApp = currentSourceApp ?? "Call"
@@ -761,6 +780,7 @@ struct ContentView: View {
             guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
                 transcriptionEngine?.assetStatus = "Ready"
                 apiServer.sessionDidComplete(id: sessionId)
+                services.isSessionPending = false   // nothing to enqueue (F-2)
                 return
             }
 
@@ -787,6 +807,9 @@ struct ContentView: View {
 
             services.postProcessingQueue.enqueue(job)
             transcriptionEngine?.assetStatus = "Ready"
+            // Job now running (isAnyJobRunning holds the lock); release the
+            // stop-window pending lock (F-2).
+            services.isSessionPending = false
         }
     }
 
@@ -860,6 +883,12 @@ struct ContentView: View {
 
     @MainActor
     private func recoverOrphans(_ orphans: [OrphanScanner.Orphan]) async {
+        // Wait for provisioning to settle BEFORE taking the recovery lock — the
+        // lock disables the picker AND Retry, the only affordances that could
+        // cancel/redirect the very download we'd otherwise wait on (audit F-3).
+        // No suspension point may sit between this returning and the flag below,
+        // or a cycle could start inside the gap.
+        await services.modelProvisioner.awaitSettled()
         services.isRecovering = true
         defer { services.isRecovering = false }
 
@@ -885,7 +914,6 @@ struct ContentView: View {
                     wavURL: orphan.wavURL,
                     transcriptURL: transcriptURL,
                     asr: services.asrCoordinator,
-                    provisioner: services.modelProvisioner,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                     exportVoiceprints: settings.exportVoiceprints,
@@ -1026,6 +1054,11 @@ struct ContentView: View {
         }
 
         Task { [preserveYou] in
+            // Settle provisioning BEFORE the recovery lock (F-3): the lock
+            // disables the picker + Retry, the only ways to cancel/redirect a
+            // download we'd otherwise be waiting on. No suspension between the
+            // settle returning and taking the flag.
+            await services.modelProvisioner.awaitSettled()
             services.isRecovering = true
             defer { services.isRecovering = false }
 
@@ -1035,7 +1068,6 @@ struct ContentView: View {
                     wavURL: wavURL,
                     transcriptURL: mdURL,
                     asr: services.asrCoordinator,
-                    provisioner: services.modelProvisioner,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                     exportVoiceprints: settings.exportVoiceprints,

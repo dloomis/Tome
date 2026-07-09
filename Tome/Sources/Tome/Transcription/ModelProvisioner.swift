@@ -35,6 +35,10 @@ final class ModelProvisioner {
     /// Model of the backend installed in the coordinator; nil until the first
     /// successful install (fresh install, or relaunch before provisioning lands).
     private(set) var servingModel: TranscriberModel?
+    /// The backend instance behind `servingModel`. Held so a flip-back can
+    /// re-assert it into the coordinator under a fresh token, outranking any
+    /// in-flight stale install from the cancelled swap cycle (audit F-1).
+    private var servingBackend: (any ASRBackend)?
     private(set) var activity: Activity = .none
     /// Most recent provisioning failure. Cleared when a user-initiated cycle
     /// starts and on its success; an F2-chained fallback cycle deliberately
@@ -113,6 +117,16 @@ final class ModelProvisioner {
                 currentTask?.cancel()
                 currentTask = nil
                 activity = .none
+                // The cancelled swap may have an install already in flight
+                // (coordinator.install suspends at old.unload()). Re-assert the
+                // serving backend under the fresh token so that stale install is
+                // outranked and refused. Fire-and-forget: token ordering makes
+                // the ordering race harmless, and re-installing the already-
+                // active backend is a no-op swap in the coordinator.
+                if let sb = servingBackend {
+                    let t = generation
+                    Task { await coordinator.install(backend: sb, token: t) }
+                }
             }
             return
         }
@@ -152,13 +166,15 @@ final class ModelProvisioner {
                 await backend.unload()
                 return
             }
-            await coordinator.install(backend: backend)
+            await coordinator.install(backend: backend, token: gen)
             guard generation == gen else {
-                // Superseded during install: the newer cycle's install will
-                // retire this backend; its state writes own the machine now.
+                // Superseded during install: the newer cycle's install (or a
+                // flip-back's token-ordered re-assert) outranks this one and
+                // retires this backend; its state writes own the machine now.
                 return
             }
             servingModel = model
+            servingBackend = backend
             defaults.set(model.rawValue, forKey: Self.lastGoodKey)
             if clearingFailure { lastFailure = nil }
             activity = .none
