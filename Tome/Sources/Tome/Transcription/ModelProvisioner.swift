@@ -69,6 +69,10 @@ final class ModelProvisioner {
     /// dropped — cancellation is cooperative and SDK calls may not observe it.
     private var generation = 0
     private var currentTask: Task<Void, Never>?
+    /// The fire-and-forget re-assert kicked off by a flip-back (below). Tracked
+    /// so a rapid second flip-back cancels the prior re-assert before starting
+    /// a new one, rather than leaking overlapping untracked tasks.
+    private var reassertTask: Task<Void, Never>?
 
     init(
         coordinator: ASRCoordinator,
@@ -120,12 +124,24 @@ final class ModelProvisioner {
                 // The cancelled swap may have an install already in flight
                 // (coordinator.install suspends at old.unload()). Re-assert the
                 // serving backend under the fresh token so that stale install is
-                // outranked and refused. Fire-and-forget: token ordering makes
-                // the ordering race harmless, and re-installing the already-
-                // active backend is a no-op swap in the coordinator.
+                // outranked and refused. Token ordering makes the ordering race
+                // harmless, and re-installing the already-active backend is a
+                // no-op swap in the coordinator.
                 if let sb = servingBackend {
                     let t = generation
-                    Task { await coordinator.install(backend: sb, token: t) }
+                    reassertTask?.cancel()
+                    reassertTask = Task {
+                        // The serving backend's manager may have been unloaded
+                        // out from under us: if the superseded cycle's install
+                        // completed and then drained before this re-assert ran,
+                        // the coordinator already unloaded it. prepare() is an
+                        // idempotent guard-on-nil, so this reloads from local
+                        // disk with no download; if it throws (e.g. cache
+                        // deleted) install anyway — a not-ready backend surfaces
+                        // as .notInitialized and the next provision fixes it.
+                        try? await sb.prepare { _ in }
+                        await coordinator.install(backend: sb, token: t)
+                    }
                 }
             }
             return

@@ -15,6 +15,8 @@ final actor WhisperBackend: ASRBackend {
 
     /// Full precision where Argmax's device matrix supports it (M2+),
     /// otherwise the quantized build (the only supported variant on M1).
+    /// An unrecognized device class (family absent from `supported`) falls
+    /// through to the `_626MB` build as a best-effort default.
     static func resolveVariant(supported: [String]) -> String {
         supported.contains(variantFamily) ? variantFamily : variantFamily + "_626MB"
     }

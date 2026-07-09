@@ -98,4 +98,50 @@ import Testing
         #expect(await coordinator.activeModel == .parakeetTDTv3)
         #expect(await p.unloadCalls == 0)   // active backend never unloaded
     }
+
+    /// I-1 Trace A, deterministic: `install` suspends inside the old backend's
+    /// `unload()`, and a reentrant higher-token re-assert of the OLD backend
+    /// interleaves at that suspension point. The suspended install must
+    /// re-validate its token after the suspension and, finding it outranked,
+    /// abandon its swap (unloading its own incoming backend) rather than
+    /// clobbering the re-asserted winner.
+    @Test func installRevalidatesTokenAcrossUnloadSuspension() async throws {
+        let coordinator = ASRCoordinator()
+        let p = FakeBackend(model: .parakeetTDTv3)
+        let w = FakeBackend(model: .whisperLargeV3Turbo)
+
+        await coordinator.install(backend: p, token: 1)
+        await p.setHangUnload(true)
+
+        // W-install (token 2) will retire P and suspend inside P.unload().
+        let wInstall = Task { await coordinator.install(backend: w, token: 2) }
+        // Wait until that install is actually parked in P's unload.
+        for _ in 0..<100 {
+            if await p.unloadStarted == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await p.unloadStarted == 1)
+
+        // Reentrant re-assert of P under a higher token. old === backend, so
+        // the retire is skipped and this completes without suspending on P's
+        // (hung) unload; it records token 3, outranking the parked W-install.
+        await coordinator.install(backend: p, token: 3)
+        #expect(await coordinator.activeModel == .parakeetTDTv3)
+
+        // Release P's unload so the W-install resumes past its suspension and
+        // hits the re-validation guard.
+        await p.releaseUnload()
+        await wInstall.value
+
+        // W lost the race: it was never installed, and it unloaded its own
+        // orphaned incoming backend exactly once.
+        #expect(await coordinator.activeModel == .parakeetTDTv3)
+        #expect(await w.unloadCalls == 1)
+        #expect(await w.transcribesStarted == 0)
+
+        // And transcribes still route to P, never to W.
+        let routed = try await coordinator.transcribe(samples: [0.0], source: .microphone)
+        #expect(routed.text == "fake:parakeet-tdt-v3")
+        #expect(await w.transcribesStarted == 0)
+    }
 }

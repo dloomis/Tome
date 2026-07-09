@@ -312,6 +312,40 @@ final class ProvisionerHarness {
         #expect(h.provisioner.servingModel == .parakeetTDTv3)
     }
 
+    /// I-1 part (a): the flip-back re-assert re-prepares the serving backend
+    /// before re-installing it, so a serving backend whose manager was unloaded
+    /// out from under the provisioner (Trace B: the superseded install completed
+    /// then drained) reloads from disk. We can't force the drain deterministically
+    /// at this level, so we assert the observable contract directly: flipping
+    /// back to the serving model calls prepare() on the serving backend a second
+    /// time (idempotent guard-on-nil in the real backends), then re-installs it.
+    @Test func flipBackReassertRepreparesServingBackend() async throws {
+        let h = ProvisionerHarness(scripts: [.whisperLargeV3Turbo: [.hang(cooperative: true)]])
+        h.provisioner.provision(.parakeetTDTv3)
+        await h.settle()
+        let p = h.lastBackend(for: .parakeetTDTv3)
+        #expect(await p?.prepareCalls == 1)   // prepared once by the initial cycle
+
+        // Start a swap to W (hangs mid-download), then flip back to P.
+        h.selectionValue = .whisperLargeV3Turbo
+        h.provisioner.provision(.whisperLargeV3Turbo)
+        #expect(h.provisioner.activity != .none)
+
+        h.selectionValue = .parakeetTDTv3
+        h.provisioner.provision(.parakeetTDTv3)   // flip back → fires re-assert Task
+        #expect(h.provisioner.activity == .none)
+
+        // The re-assert Task re-prepares P, then re-installs it under the fresh token.
+        for _ in 0..<100 {
+            if await p?.prepareCalls == 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await p?.prepareCalls == 2)
+        #expect(h.provisioner.servingModel == .parakeetTDTv3)
+        #expect(await h.coordinator.activeModel == .parakeetTDTv3)
+        #expect(h.provisioner.canStartRecording)
+    }
+
     /// awaitSettled must ride through an F2 chain (fail → fall back → last-good
     /// ready), not wake in the momentary activity==.none gap between them.
     @Test func awaitSettledSpansTheF2Chain() async throws {

@@ -384,9 +384,12 @@ New "Model" section **above** the existing read-only Language section:
   new states would break `GET /health`'s `modelsReady` derivation:
   - `downloading` → **"DOWNLOADING MODEL… 42%"** (display-uppercased)
   - `loading` → **"LOADING MODEL…"**
-  - failure after revert (F1/F2) → transient line via the existing
-    `errorMessage` row: "Whisper download failed — reverted to
-    Parakeet-TDT v3: <reason>"
+  - failure after revert (F1/F2) → line via the existing `errorMessage` row:
+    "Whisper download failed — reverted to Parakeet-TDT v3: <reason>". It
+    persists (driven by `lastFailure`) until the next user-initiated
+    provisioning action clears it — recording is already available again on the
+    reverted-to backend — and sits behind the engine's own `lastError` in
+    precedence, so a live capture/write error still takes the row.
   - failure at rest (F3) → persistent "MODEL DOWNLOAD FAILED — retry in
     Settings ▸ Transcription", buttons disabled.
   - the transient not-yet-provisioning frames (§6) → "LOADING MODEL…".

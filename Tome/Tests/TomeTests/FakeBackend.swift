@@ -34,10 +34,16 @@ final actor FakeBackend: @preconcurrency ASRBackend {
     private(set) var unloadCalls = 0
     private var prepareGate: CheckedContinuation<Void, Never>?
     private var transcribeGate: CheckedContinuation<Void, Never>?
+    private var unloadGate: CheckedContinuation<Void, Never>?
     private(set) var transcribesStarted = 0
     private(set) var transcribesFinished = 0
+    /// Incremented when unload() begins (before any hang), so a test can poll
+    /// for an install being suspended inside this backend's unload().
+    private(set) var unloadStarted = 0
     /// When true, transcribe suspends until releaseTranscribe().
     var hangTranscribe = false
+    /// When true, unload suspends until releaseUnload().
+    var hangUnload = false
 
     init(model: TranscriberModel, script: PrepareScript = .succeed(ticks: 2)) {
         self.model = model
@@ -47,6 +53,7 @@ final actor FakeBackend: @preconcurrency ASRBackend {
     static func isInstalled() -> Bool { false }
 
     func setHangTranscribe(_ hang: Bool) { hangTranscribe = hang }
+    func setHangUnload(_ hang: Bool) { hangUnload = hang }
 
     func releasePrepare() {
         prepareGate?.resume()
@@ -56,6 +63,11 @@ final actor FakeBackend: @preconcurrency ASRBackend {
     func releaseTranscribe() {
         transcribeGate?.resume()
         transcribeGate = nil
+    }
+
+    func releaseUnload() {
+        unloadGate?.resume()
+        unloadGate = nil
     }
 
     func prepare(onEvent: @Sendable @escaping (PrepareEvent) -> Void) async throws {
@@ -107,6 +119,10 @@ final actor FakeBackend: @preconcurrency ASRBackend {
     }
 
     func unload() async {
+        unloadStarted += 1
+        if hangUnload {
+            await withCheckedContinuation { unloadGate = $0 }
+        }
         unloadCalls += 1
     }
 }

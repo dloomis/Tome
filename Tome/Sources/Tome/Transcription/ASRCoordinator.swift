@@ -64,6 +64,19 @@ actor ASRCoordinator {
                 await old.unload()
             }
         }
+        // `await old.unload()` above suspends this actor: a reentrant install
+        // carrying a higher token can interleave here, record its token, and
+        // assign `activeBackend`. If our token is no longer the last applied
+        // one, we lost that race — abandon the swap rather than clobbering the
+        // winner. Release our now-orphaned incoming backend unless it's what's
+        // serving. That trailing `unload()` is itself a suspension, so touch no
+        // state after it.
+        guard lastInstallToken == token else {
+            if activeBackend !== backend {
+                await backend.unload()
+            }
+            return
+        }
         activeBackend = backend
     }
 
