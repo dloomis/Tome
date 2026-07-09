@@ -24,6 +24,13 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(transcriptionLanguage.rawValue, forKey: "transcriptionLanguage") }
     }
 
+    /// Which ASR model transcribes. Selection is lazy — changing it triggers a
+    /// background download/load via ModelProvisioner; recording is gated until
+    /// the selected model is ready. See docs/superpowers/specs/2026-07-08-*.md.
+    var transcriberModel: TranscriberModel {
+        didSet { UserDefaults.standard.set(transcriberModel.rawValue, forKey: "transcriberModel") }
+    }
+
     /// Stored as the AudioDeviceID integer. 0 means "use system default".
     var inputDeviceID: AudioDeviceID {
         didSet { UserDefaults.standard.set(Int(inputDeviceID), forKey: "inputDeviceID") }
@@ -114,6 +121,7 @@ final class AppSettings {
         let defaults = UserDefaults.standard
         self.transcriptionLocale = defaults.string(forKey: "transcriptionLocale") ?? "en-US"
         self.transcriptionLanguage = (defaults.string(forKey: "transcriptionLanguage").flatMap(Language.init(rawValue:))) ?? .english
+        self.transcriberModel = TranscriberModel.from(persisted: defaults.string(forKey: "transcriberModel"))
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
