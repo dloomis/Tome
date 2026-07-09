@@ -24,6 +24,7 @@
 - The engine's `assetStatus` strings are string-matched by `APIServer` (`contains("Transcribing")`, `contains("Loading")`, `== "Ready"`). Provisioning status is **never** routed through `assetStatus`.
 - Whisper model files root (exact): `~/Library/Application Support/Tome/WhisperKit` (via `FileManager.default.urls(for: .applicationSupportDirectory, …)`). Parakeet files stay wherever FluidAudio puts them (`~/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v3/`).
 - DRY: reuse `TestSupport` helpers in tests; follow existing file/comment style (comments explain *why*, not *what*).
+- **Git cwd**: build steps `cd` into `Tome/`, but every commit block's `git add` paths are repo-root-relative — run all git commands from `/Users/nic/programming/tome` (i.e. `cd /Users/nic/programming/tome` before the `git add`, or use `git -C /Users/nic/programming/tome …`).
 
 ---
 
@@ -60,6 +61,24 @@ import Testing
         #expect(TranscriberModel.from(persisted: "some-future-model") == .parakeetTDTv3)
         #expect(TranscriberModel.from(persisted: nil) == .parakeetTDTv3)
         #expect(TranscriberModel.from(persisted: "whisper-large-v3-turbo") == .whisperLargeV3Turbo)
+    }
+
+    /// Spec §9 test 2's persistence clause: selection writes — including the
+    /// provisioner's revert write — go through didSet and land in UserDefaults,
+    /// so a revert survives relaunch. AppSettings hardcodes .standard; save and
+    /// restore the key around the test.
+    @Test @MainActor func appSettingsPersistsSelectionThroughDidSet() {
+        let defaults = UserDefaults.standard
+        let saved = defaults.string(forKey: "transcriberModel")
+        defer {
+            if let saved { defaults.set(saved, forKey: "transcriberModel") }
+            else { defaults.removeObject(forKey: "transcriberModel") }
+        }
+        let settings = AppSettings()
+        settings.transcriberModel = .whisperLargeV3Turbo
+        #expect(defaults.string(forKey: "transcriberModel") == "whisper-large-v3-turbo")
+        settings.transcriberModel = .parakeetTDTv3   // shape of the F1 revert write
+        #expect(defaults.string(forKey: "transcriberModel") == "parakeet-tdt-v3")
     }
 }
 ```
@@ -125,7 +144,7 @@ In `init()` (after the `transcriptionLanguage` line ~116):
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cd /Users/nic/programming/tome/Tome && swift test --filter TranscriberModelTests`
-Expected: 3 tests PASS. Then `swift build` — no errors.
+Expected: 4 tests PASS. Then `swift build` — no errors.
 
 - [ ] **Step 6: Commit**
 
@@ -207,8 +226,17 @@ protocol ASRBackend: AnyObject, Sendable {
 @preconcurrency import AVFoundation
 import FluidAudio
 
-/// Parakeet-TDT v3 via FluidAudio. Fresh TdtDecoderState per call is
-/// deliberate — see the header comment in ASRCoordinator.swift.
+/// Parakeet-TDT v3 via FluidAudio.
+///
+/// Fresh `TdtDecoderState` per call is deliberate: FluidAudio 0.14 removed
+/// AsrManager's internal decoder state and requires the caller to thread
+/// `decoderState: inout TdtDecoderState` through every transcribe call. Each
+/// call gets a fresh state, matching FluidAudio 0.7.9's behavior where
+/// `transcribe()` auto-reset decoder state after every call — Tome's
+/// StreamingTranscriber hands over one VAD-bounded segment at a time, so
+/// cross-call state carry-over would mean the LSTM/lastToken from a previous
+/// utterance primes the decoder for an unrelated next utterance (Parakeet v3
+/// is sensitive enough that this collapses output to "."/blank).
 final actor ParakeetBackend: ASRBackend {
     nonisolated let model: TranscriberModel = .parakeetTDTv3
     private var asrManager: AsrManager?
@@ -491,7 +519,7 @@ Expected: compile FAILURE — `ASRCoordinator` has no `install`/`isReady`/`activ
 
 - [ ] **Step 4: Rewrite ASRCoordinator**
 
-Replace the body of `Tome/Sources/Tome/Transcription/ASRCoordinator.swift`. Keep the existing header comment about fresh decoder state (it now documents ParakeetBackend, so reword its first sentence), and keep `ASRCoordinatorError`:
+Replace `Tome/Sources/Tome/Transcription/ASRCoordinator.swift` with the file below, verbatim — it IS the complete file. (The old header's fresh-decoder-state rationale moved into ParakeetBackend's header in Task 2, where the decoder code now lives.)
 
 ```swift
 @preconcurrency import AVFoundation
@@ -711,6 +739,9 @@ final class ProvisionerHarness {
             setSelection: { [unowned self] model in
                 selectionValue = model
                 setSelectionCalls.append(model)
+                // Mirror AppSettings.didSet: selection writes persist. Lets
+                // tests assert the revert landed in defaults (spec §9 test 2).
+                defaults.set(model.rawValue, forKey: "transcriberModel")
                 // The echo must be ASYNC like SwiftUI's onChange (next
                 // runloop) — a synchronous echo would re-enter provision()
                 // mid-failure-handling, which the real wiring can never do.
@@ -767,6 +798,8 @@ final class ProvisionerHarness {
 
         #expect(h.setSelectionCalls == [.parakeetTDTv3])       // reverted via normal write
         #expect(h.selectionValue == .parakeetTDTv3)
+        // The revert went through the persisting path — survives relaunch.
+        #expect(h.defaults.string(forKey: "transcriberModel") == "parakeet-tdt-v3")
         #expect(h.provisioner.lastFailure == .init(model: .whisperLargeV3Turbo, message: "offline"))
         #expect(h.provisioner.servingModel == .parakeetTDTv3)
         #expect(h.provisioner.canStartRecording)               // recording available again
@@ -791,6 +824,28 @@ final class ProvisionerHarness {
         #expect(h.provisioner.canStartRecording)
         // The chained cycle and its success must NOT clear the failure.
         #expect(h.provisioner.lastFailure == .init(model: .whisperLargeV3Turbo, message: "offline"))
+    }
+
+    // Spec §9 test 3, second clause — the F2 chain TERMINATES when the
+    // fallback also fails (the cell where revert recursion would hide).
+    @Test func f2ChainEndsInF3WhenLastGoodAlsoFails() async throws {
+        let h = ProvisionerHarness(scripts: [
+            .whisperLargeV3Turbo: [.fail(message: "offline")],
+            .parakeetTDTv3: [.fail(message: "also offline")],
+        ])
+        h.defaults.set(TranscriberModel.parakeetTDTv3.rawValue, forKey: "lastGoodTranscriberModel")
+        h.selectionValue = .whisperLargeV3Turbo
+        h.echoSelectionWrites = true
+
+        h.provisioner.provision(.whisperLargeV3Turbo)
+        await h.settle()
+
+        #expect(h.provisioner.servingModel == nil)
+        #expect(h.provisioner.activity == .none)
+        #expect(!h.provisioner.canStartRecording)
+        #expect(h.createdBackends.count == 2)                  // W, then P — no loop
+        #expect(h.provisioner.lastFailure != nil)              // Retry affordance present
+        #expect(h.selectionValue == .parakeetTDTv3)            // rests on the F2 target
     }
 
     // Spec §9 test 4 — F3 both flavors + retry re-enters despite unchanged selection
@@ -1137,7 +1192,7 @@ final class ModelProvisioner {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd /Users/nic/programming/tome/Tome && swift test --filter ModelProvisionerTests`
-Expected: 12 tests PASS. Flakiness note: these tests are timing-sensitive by nature (Task scheduling); if one flakes, prefer widening a poll loop over sleeping longer.
+Expected: 13 tests PASS. Flakiness note: these tests are timing-sensitive by nature (Task scheduling); if one flakes, prefer widening a poll loop over sleeping longer.
 
 - [ ] **Step 5: Full suite**
 
@@ -1613,7 +1668,16 @@ In `recoverOrphans` (~L813), wrap the recovery loop:
         defer { services.isRecovering = false }
 ```
 
-and the same pair in `recoverFromWAV` around its `Recovery.run` section (~L948-992; place `services.isRecovering = true` right before `assetStatus = "Recovering…"` is set and the `defer` at the top of that enclosing `Task`/function scope so every exit path clears it).
+In `recoverFromWAV` the placement is subtler: the function is synchronous, shows dialogs with early returns (the `.mic.wav` fork's cancel path ~L971), and does the actual work in a `Task { [preserveYou] in … }` spawned ~L975. Put BOTH statements as the **first two lines inside that Task closure**:
+
+```swift
+        Task { [preserveYou] in
+            services.isRecovering = true
+            defer { services.isRecovering = false }
+            // ...existing Recovery.run work...
+```
+
+Not at the function top (the defer would fire when the function returns — immediately after spawning the Task, clearing the flag while recovery still runs) and not before the dialogs (a cancelled dialog would leave the flag stuck true, permanently locking the Settings picker). The dialogs themselves need no lock — no recovery is in flight yet.
 
 - [ ] **Step 5: Build + full suite, then commit Tasks 6+7 together**
 
@@ -1973,7 +2037,7 @@ git commit -m "feat: gate API start endpoints and /health modelsReady on model r
 - Test: none (diagnostic CLI, like VoiceprintAudit; its output IS the deliverable, produced in Task 12).
 
 **Interfaces:**
-- Consumes: FluidAudio (`AsrModels`, `AsrManager`, `TdtDecoderState`) and WhisperKit directly. **Deliberate duplication:** SwiftPM forbids executable→executable dependencies, so ASRBench cannot import the app's backends (`TomeTests` gets away with it only because test targets may depend on executables). The variant/paths constants are copied with a pointer comment; VoiceprintAudit set this precedent.
+- Consumes: FluidAudio (`AsrModels`, `AsrManager`, `TdtDecoderState`, and `VadManager.segmentSpeechAudio` — the same VAD the app uses, so chunking matches the live pipeline per spec §8) and WhisperKit directly. **Deliberate duplication:** SwiftPM forbids executable→executable dependencies, so ASRBench cannot import the app's backends (`TomeTests` gets away with it only because test targets may depend on executables). The variant/paths constants are copied with a pointer comment; VoiceprintAudit set this precedent.
 - Produces: `swift run -c release ASRBench <wav/m4a files...> [--json out.json]` printing a comparison table.
 
 - [ ] **Step 1: Package target**
@@ -1996,14 +2060,14 @@ In `Tome/Package.swift`, after the `VoiceprintAudit` target:
 
 - [ ] **Step 2: Write the bench**
 
-`Tome/Sources/ASRBench/main.swift` (top-level-code executable, VoiceprintAudit style):
+`Tome/Sources/ASRBench/main.swift` (top-level-code executable, VoiceprintAudit style). Swift 6 note: top-level *variables* are MainActor-isolated (SE-0343), so the bench functions take everything as parameters and never touch top-level state.
 
 ```swift
 // ASRBench — compares Parakeet-TDT v3 (FluidAudio) and Whisper Large v3
-// Turbo (WhisperKit) on identical audio, per the live pipeline's chunk
-// shapes. Chunking deviation from the app: fixed-size slices instead of VAD
-// boundaries — identical inputs for both backends, deterministic, and the
-// spec's acceptance bar (p95 RTF) doesn't depend on where cuts fall.
+// Turbo (WhisperKit) on identical audio, chunked the way the live pipeline
+// chunks it (spec §8): VAD-bounded speech segments, split at the 480k-sample
+// (~30s) flush ceiling, segments under ~0.5s dropped — the same caps
+// StreamingTranscriber applies.
 //
 // Usage: swift run -c release ASRBench <wav/m4a...> [--json out.json]
 
@@ -2020,10 +2084,11 @@ let whisperVariant = WhisperKit.recommendedModels().supported.contains(whisperFa
 let whisperBase = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("Tome/WhisperKit", isDirectory: true)
 
-// Chunk lengths (seconds) modeled on the live pipeline: VAD utterances are
-// mostly 1–10s; 30s is StreamingTranscriber's flushInterval ceiling.
-let chunkSeconds: [Double] = [2, 5, 10, 30]
+// Live-pipeline caps (see StreamingTranscriber.swift): flush at 480k samples,
+// drop sub-8k segments ("Parakeet emits garbage below this").
 let sampleRate = 16_000.0
+let maxChunkSamples = 480_000
+let minChunkSamples = 8_000
 
 var argv = Array(CommandLine.arguments.dropFirst())
 var jsonOut: String?
@@ -2046,60 +2111,58 @@ struct ChunkTiming: Codable {
 struct BackendReport: Codable {
     let name: String
     let variant: String
+    let downloadSeconds: Double?     // nil when already cached
+    let diskSizeMB: Double
     let loadSecondsCold: Double
+    let loadSecondsWarm: Double
     let firstTranscribeSeconds: Double   // ANE warm-up shows up here
     let timings: [ChunkTiming]
     let peakRSSMB: Double
+}
 
-    func percentileRTF(_ p: Double) -> Double {
-        let sorted = timings.map(\.rtf).sorted()
-        guard !sorted.isEmpty else { return 0 }
-        let idx = min(Int(Double(sorted.count) * p), sorted.count - 1)
-        return sorted[idx]
+func percentile(_ values: [Double], _ p: Double) -> Double {
+    let sorted = values.sorted()
+    guard !sorted.isEmpty else { return 0 }
+    return sorted[min(Int(Double(sorted.count) * p), sorted.count - 1)]
+}
+
+func directorySizeMB(_ url: URL) -> Double {
+    guard let enumerator = FileManager.default.enumerator(
+        at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+    var total = 0
+    for case let file as URL in enumerator {
+        total += (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0
     }
+    return Double(total) / 1_048_576
 }
 
 func peakRSSMB() -> Double {
     var usage = rusage()
     getrusage(RUSAGE_SELF, &usage)
-    return Double(usage.ru_maxrss) / 1_048_576.0   // bytes on macOS
+    return Double(usage.ru_maxrss) / 1_048_576.0   // ru_maxrss is bytes on macOS
 }
 
 func now() -> Double { CFAbsoluteTimeGetCurrent() }
 
-// Load all audio as 16kHz mono float (WhisperKit's loader handles wav/m4a).
-var allSamples: [Float] = []
-for file in files {
-    let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: file)
-    allSamples.append(contentsOf: samples)
-    print("loaded \(file): \(Double(samples.count) / sampleRate)s")
-}
-guard Double(allSamples.count) / sampleRate >= chunkSeconds.max()! else {
-    print("error: need at least \(Int(chunkSeconds.max()!))s of audio total")
-    exit(1)
-}
-
-// Slice fixed-size chunks (repeating over the audio) — identical for both backends.
-func chunks(of seconds: Double, count: Int) -> [[Float]] {
-    let size = Int(seconds * sampleRate)
-    var result: [[Float]] = []
-    var offset = 0
-    for _ in 0..<count {
-        if offset + size > allSamples.count { offset = 0 }
-        result.append(Array(allSamples[offset..<(offset + size)]))
-        offset += size
-    }
-    return result
-}
-let chunksPerSize = 6
-
 // --- Parakeet ---
-func benchParakeet() async throws -> BackendReport {
-    let t0 = now()
-    let models = try await AsrModels.downloadAndLoad(version: .v3)
+func benchParakeet(chunks: [[Float]]) async throws -> BackendReport {
+    let cached = AsrModels.modelsExist(
+        at: AsrModels.defaultCacheDirectory(for: .v3), version: .v3)
+    let tDownload = now()
+    let dir = try await AsrModels.download(version: .v3)
+    let downloadSeconds: Double? = cached ? nil : now() - tDownload
+
+    let tCold = now()
+    let coldModels = try await AsrModels.load(from: dir, version: .v3)
     let asr = AsrManager(config: .default)
-    try await asr.loadModels(models)
-    let loadCold = now() - t0
+    try await asr.loadModels(coldModels)
+    let loadCold = now() - tCold
+
+    await asr.cleanup()
+    let tWarm = now()
+    let warmModels = try await AsrModels.load(from: dir, version: .v3)
+    try await asr.loadModels(warmModels)
+    let loadWarm = now() - tWarm
 
     func transcribe(_ samples: [Float]) async throws -> Double {
         var state = TdtDecoderState.make()
@@ -2108,33 +2171,44 @@ func benchParakeet() async throws -> BackendReport {
         return now() - t
     }
 
-    let tFirst = try await transcribe(chunks(of: 2, count: 1)[0])
+    let tFirst = try await transcribe(chunks[0])
     var timings: [ChunkTiming] = []
-    for seconds in chunkSeconds {
-        for chunk in chunks(of: seconds, count: chunksPerSize) {
-            timings.append(ChunkTiming(seconds: seconds, latency: try await transcribe(chunk)))
-        }
+    for chunk in chunks {
+        timings.append(ChunkTiming(
+            seconds: Double(chunk.count) / sampleRate,
+            latency: try await transcribe(chunk)))
     }
     return BackendReport(
         name: "Parakeet-TDT v3", variant: "parakeet-tdt-0.6b-v3 int8",
-        loadSecondsCold: loadCold, firstTranscribeSeconds: tFirst,
-        timings: timings, peakRSSMB: peakRSSMB())
+        downloadSeconds: downloadSeconds, diskSizeMB: directorySizeMB(dir),
+        loadSecondsCold: loadCold, loadSecondsWarm: loadWarm,
+        firstTranscribeSeconds: tFirst, timings: timings, peakRSSMB: peakRSSMB())
 }
 
 // --- Whisper ---
-func benchWhisper() async throws -> BackendReport {
-    let t0 = now()
+func benchWhisper(chunks: [[Float]], variant: String, base: URL) async throws -> BackendReport {
+    let expectedFolder = base.appendingPathComponent(
+        "models/argmaxinc/whisperkit-coreml/\(variant)", isDirectory: true)
+    let cached = FileManager.default.fileExists(
+        atPath: expectedFolder.appendingPathComponent("TextDecoder.mlmodelc").path)
+    let tDownload = now()
     let folder = try await WhisperKit.download(
-        variant: whisperVariant, downloadBase: whisperBase,
-        progressCallback: { p in
-            let pct = Int(p.fractionCompleted * 100)
+        variant: variant, downloadBase: base,
+        progressCallback: { progress in
+            let pct = Int(progress.fractionCompleted * 100)
             if pct % 10 == 0 { print("whisper download: \(pct)%") }
         })
+    let downloadSeconds: Double? = cached ? nil : now() - tDownload
+
     let config = WhisperKitConfig(
-        model: whisperVariant, downloadBase: whisperBase,
+        model: variant, downloadBase: base,
         modelFolder: folder.path, load: true, download: false)
+    let tCold = now()
+    do { _ = try await WhisperKit(config) }   // cold load; instance released at scope end
+    let loadCold = now() - tCold
+    let tWarm = now()
     let kit = try await WhisperKit(config)
-    let loadCold = now() - t0
+    let loadWarm = now() - tWarm
 
     func transcribe(_ samples: [Float]) async throws -> Double {
         let t = now()
@@ -2144,43 +2218,75 @@ func benchWhisper() async throws -> BackendReport {
         return now() - t
     }
 
-    let tFirst = try await transcribe(chunks(of: 2, count: 1)[0])
+    let tFirst = try await transcribe(chunks[0])
     var timings: [ChunkTiming] = []
-    for seconds in chunkSeconds {
-        for chunk in chunks(of: seconds, count: chunksPerSize) {
-            timings.append(ChunkTiming(seconds: seconds, latency: try await transcribe(chunk)))
-        }
+    for chunk in chunks {
+        timings.append(ChunkTiming(
+            seconds: Double(chunk.count) / sampleRate,
+            latency: try await transcribe(chunk)))
     }
     return BackendReport(
-        name: "Whisper Large v3 Turbo", variant: whisperVariant,
-        loadSecondsCold: loadCold, firstTranscribeSeconds: tFirst,
-        timings: timings, peakRSSMB: peakRSSMB())
+        name: "Whisper Large v3 Turbo", variant: variant,
+        downloadSeconds: downloadSeconds, diskSizeMB: directorySizeMB(folder),
+        loadSecondsCold: loadCold, loadSecondsWarm: loadWarm,
+        firstTranscribeSeconds: tFirst, timings: timings, peakRSSMB: peakRSSMB())
 }
 
 func printReport(_ r: BackendReport) {
+    let latencies = r.timings.map(\.latency)
+    let rtfs = r.timings.map(\.rtf)
     print("""
 
     == \(r.name) (\(r.variant)) ==
-    load (incl. download if any): \(String(format: "%.1f", r.loadSecondsCold))s
-    first transcribe (warm-up):   \(String(format: "%.2f", r.firstTranscribeSeconds))s
-    p50 RTF: \(String(format: "%.3f", r.percentileRTF(0.5)))   p95 RTF: \(String(format: "%.3f", r.percentileRTF(0.95)))
-    peak RSS: \(String(format: "%.0f", r.peakRSSMB)) MB
+    download:        \(r.downloadSeconds.map { String(format: "%.0f", $0) + "s" } ?? "cached")
+    on disk:         \(String(format: "%.0f", r.diskSizeMB)) MB
+    load cold/warm:  \(String(format: "%.1f", r.loadSecondsCold))s / \(String(format: "%.1f", r.loadSecondsWarm))s
+    first transcribe (warm-up): \(String(format: "%.2f", r.firstTranscribeSeconds))s
+    chunk latency:   p50 \(String(format: "%.2f", percentile(latencies, 0.5)))s  p95 \(String(format: "%.2f", percentile(latencies, 0.95)))s
+    RTF:             p50 \(String(format: "%.3f", percentile(rtfs, 0.5)))  p95 \(String(format: "%.3f", percentile(rtfs, 0.95)))
+    peak RSS:        \(String(format: "%.0f", r.peakRSSMB)) MB
+    chunks:          \(r.timings.count) totaling \(String(format: "%.0f", r.timings.map(\.seconds).reduce(0, +)))s
     """)
-    for seconds in chunkSeconds {
-        let subset = r.timings.filter { $0.seconds == seconds }
-        let avg = subset.map(\.latency).reduce(0, +) / Double(subset.count)
-        print("  \(Int(seconds))s chunks: avg \(String(format: "%.2f", avg))s (RTF \(String(format: "%.3f", avg / seconds)))")
-    }
 }
 
+// --- Top-level: load audio, VAD-segment it, run both benches ---
+var allSamples: [Float] = []
+for file in files {
+    let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: file)
+    allSamples.append(contentsOf: samples)
+    print("loaded \(file): \(String(format: "%.0f", Double(samples.count) / sampleRate))s")
+}
+
+// Same VAD the app uses, same caps as StreamingTranscriber: speech segments,
+// split at the ~30s flush ceiling, sub-0.5s dropped.
+let vad = try await VadManager()
+var chunks: [[Float]] = []
+for segment in try await vad.segmentSpeechAudio(allSamples) {
+    var offset = 0
+    while offset < segment.count {
+        let end = min(offset + maxChunkSamples, segment.count)
+        if end - offset >= minChunkSamples {
+            chunks.append(Array(segment[offset..<end]))
+        }
+        offset = end
+    }
+}
+guard !chunks.isEmpty else {
+    print("error: VAD found no speech ≥0.5s in the input — use a fixture with real speech")
+    exit(1)
+}
+let chunkSummary = chunks.map { Double($0.count) / sampleRate }
+print("VAD chunks: \(chunks.count) (\(String(format: "%.1f", chunkSummary.min()!))s–\(String(format: "%.1f", chunkSummary.max()!))s)")
+
 // Parakeet first (already cached on any machine that has run Tome), then Whisper.
-let parakeet = try await benchParakeet()
+let parakeet = try await benchParakeet(chunks: chunks)
 printReport(parakeet)
-let whisper = try await benchWhisper()
+let whisper = try await benchWhisper(chunks: chunks, variant: whisperVariant, base: whisperBase)
 printReport(whisper)
 
+let whisperP95 = percentile(whisper.timings.map(\.rtf), 0.95)
 print("\nAcceptance bar (spec §8): live use wants p95 RTF < 0.5.")
-print("Whisper p95 RTF = \(String(format: "%.3f", whisper.percentileRTF(0.95))) → \(whisper.percentileRTF(0.95) < 0.5 ? "PASS" : "MISS — ship with 'may lag during live transcription' copy")")
+print("Whisper p95 RTF = \(String(format: "%.3f", whisperP95)) → \(whisperP95 < 0.5 ? "PASS" : "MISS — ship with 'may lag during live transcription' copy")")
 
 if let jsonOut {
     let encoder = JSONEncoder()
@@ -2190,7 +2296,11 @@ if let jsonOut {
 }
 ```
 
-Note: peak RSS is process-wide, so Whisper's figure (measured second) includes Parakeet's residue — report it as an upper bound, or rerun each backend alone (`--json` per run) for clean numbers.
+Notes:
+- Peak RSS is process-wide, so Whisper's figure (measured second) includes Parakeet residue — treat it as an upper bound, or run each backend in its own invocation for clean numbers.
+- `.mlmodelc` vs `.mlpackage` in the `cached` check: if the downloaded variant folder uses `.mlpackage`, mirror what `WhisperBackend.isInstalled()` checks.
+- The nested `transcribe` helpers close over actor/class references only (no top-level state), so top-level isolation is not an issue; if the compiler still complains about an SDK signature, the checkout under `Tome/.build/checkouts/` is the authority.
+
 
 - [ ] **Step 3: Build only**
 
@@ -2220,15 +2330,15 @@ Expected: build SUCCESS, all tests PASS, selfcheck exits 0.
 
 - [ ] **Step 2: Synthesize a speech fixture**
 
-Real speech matters: Whisper is autoregressive — silence decodes unrealistically fast, inflating its numbers.
+Real speech matters: Whisper is autoregressive — silence decodes unrealistically fast, inflating its numbers. The `[[slnc 1200]]` pauses make the VAD produce realistic utterance-sized chunks instead of one continuous block:
 
 ```bash
 mkdir -p /tmp/asrbench
-say -o /tmp/asrbench/fixture.aiff "$(python3 -c "print(('The quarterly infrastructure review covered database migration timelines, service level objectives, and the incident retrospective from last Tuesday. ' * 30))")"
+say -o /tmp/asrbench/fixture.aiff "$(python3 -c "print(('The quarterly infrastructure review covered database migration timelines, service level objectives, and the incident retrospective from last Tuesday. [[slnc 1200]] ' * 30))")"
 afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/asrbench/fixture.aiff /tmp/asrbench/fixture.wav
 afinfo /tmp/asrbench/fixture.wav | head -5
 ```
-Expected: a WAV of ≥ 120 seconds (each sentence ≈ 9s spoken × 30). If shorter than 30s, increase the multiplier.
+Expected: a WAV of ≥ 120 seconds (each sentence ≈ 9s spoken + 1.2s pause, × 30). If shorter than 30s, increase the multiplier. ASRBench prints its VAD chunk count/range — expect roughly 30 chunks of ~8–10s each.
 
 - [ ] **Step 3: Run the bench** (downloads ~600 MB Parakeet if not cached + 0.6–1.5 GB Whisper on first run; needs network)
 
@@ -2245,7 +2355,10 @@ Write `docs/superpowers/plans/2026-07-08-benchmark-results.md` containing: the m
 - [ ] **Step 5: Commit**
 
 ```bash
+cd /Users/nic/programming/tome
 git add docs/superpowers/plans/2026-07-08-benchmark-results.md
+# If Step 4's MISS branch changed the picker copy, stage that too:
+# git add Tome/Sources/Tome/Transcription/TranscriberModel.swift Tome/Tests/TomeTests/TranscriberModelTests.swift
 git commit -m "docs: ASRBench results — Parakeet vs Whisper Large v3 Turbo on this machine"
 ```
 
@@ -2278,9 +2391,20 @@ sleep 20
 ls -t ~/Documents/Tome/Voice | head -2   # transcript written
 ```
 
+Then the call-capture path (spec §9 requires both session types per model — call capture exercises system-audio capture and the `POST /start` handler, a different route than `/sessions/start`). Play any audio (e.g. a YouTube video) so the system leg has signal:
+
+```bash
+curl -s -X POST "http://127.0.0.1:$PORT/start"
+say "Call capture smoke pass, speaking on the mic side."
+sleep 15
+curl -s -X POST "http://127.0.0.1:$PORT/stop"
+sleep 20
+ls -t ~/Documents/Tome/Meetings | head -2   # transcript written
+```
+
 - [ ] **Step 2: Switch to Whisper in Settings** (manual, app still running)
 
-Settings ▸ Transcription → select Whisper Large v3 Turbo. Verify in order: status line shows Downloading with %, ControlBar shows DOWNLOADING MODEL… with buttons disabled, `curl -s "http://127.0.0.1:$PORT/health"` says `"modelsReady":false`, then everything flips ready when the download completes. Repeat the Step 1 voice-memo smoke on Whisper; verify live transcript appears and the final transcript is written after stop.
+Settings ▸ Transcription → select Whisper Large v3 Turbo. Verify in order: status line shows Downloading with %, ControlBar shows DOWNLOADING MODEL… with buttons disabled, `curl -s "http://127.0.0.1:$PORT/health"` says `"modelsReady":false`, then everything flips ready when the download completes. Repeat BOTH Step 1 smokes (voice memo AND call capture) on Whisper; verify live transcript appears and the final transcript is written after stop.
 
 - [ ] **Step 3: Failure + revert smoke** (manual)
 
@@ -2289,6 +2413,16 @@ Settings ▸ Transcription → select Whisper Large v3 Turbo. Verify in order: s
 3. Expected: DOWNLOAD fails → selection reverts to Parakeet (Settings shows the Whisper failure + Retry), recording is ENABLED (Parakeet cached), main screen shows the reverted-failure line.
 4. Turn Wi-Fi on → Retry → expect download to proceed and Whisper to activate.
 5. While a post-processing job runs (record + stop a memo, immediately open Settings): picker is disabled with the caption.
+
+- [ ] **Step 3b: Cache-deletion re-download smoke, Parakeet side** (spec §9)
+
+Quit the app, then:
+
+```bash
+rm -rf ~/Library/Application\ Support/FluidAudio/Models
+```
+
+Relaunch with Parakeet selected (network on). Expected: DOWNLOADING MODEL… appears (recording gated), Parakeet re-downloads and activates, recording re-enables — the deleted cache is rediscovered at provision time, not crashed on.
 
 - [ ] **Step 4: Existing-suite + CI parity re-run**
 
