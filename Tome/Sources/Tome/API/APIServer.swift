@@ -27,6 +27,11 @@ final class APIServer {
     private weak var transcriptionEngine: TranscriptionEngine?
     private var sessionStore: SessionStore?
 
+    /// Model readiness — sourced from ModelProvisioner via register().
+    /// Replaces /health's assetStatus string-matching: semantics preserved
+    /// ("a recording can start now"), response shape untouched (API freeze).
+    private var canStartRecording: (() -> Bool)?
+
     // Session control callbacks (4th param is suggestedFilename from WhisperCal)
     private var onStartSession: ((SessionType, String, MeetingContext?, String?) -> Void)?
     private var onStopSession: (() -> Void)?
@@ -61,12 +66,14 @@ final class APIServer {
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
+        canStartRecording: @escaping () -> Bool,
         onStart: @escaping (SessionType, String, MeetingContext?, String?) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.transcriptStore = transcriptStore
         self.transcriptionEngine = transcriptionEngine
         self.sessionStore = sessionStore
+        self.canStartRecording = canStartRecording
         self.onStartSession = onStart
         self.onStopSession = onStop
     }
@@ -325,10 +332,7 @@ final class APIServer {
 
     private func handleHealth() -> (Int, String) {
         let isRecording = transcriptionEngine?.isRunning ?? false
-        let statusStr = transcriptionEngine?.assetStatus ?? "Unknown"
-        let modelsReady = statusStr == "Ready"
-            || statusStr.contains("Transcribing")
-            || statusStr.contains("Identifying")
+        let modelsReady = canStartRecording?() ?? false
 
         return (200, encode(HealthResponse(
             status: "ok",
@@ -346,6 +350,10 @@ final class APIServer {
         guard transcriptionEngine?.isRunning != true,
               lifecycleState != .recording else {
             return (409, #"{"error":"Already recording"}"#)
+        }
+
+        guard canStartRecording?() ?? false else {
+            return (503, #"{"error":"Transcription model not ready"}"#)
         }
 
         let req: WhisperCalStartRequest?
@@ -412,6 +420,10 @@ final class APIServer {
         guard transcriptionEngine?.isRunning != true,
               lifecycleState != .recording else {
             return (409, #"{"error":"A session is already in progress"}"#)
+        }
+
+        guard canStartRecording?() ?? false else {
+            return (503, #"{"error":"Transcription model not ready"}"#)
         }
 
         let type: SessionType
@@ -897,7 +909,8 @@ final class APIServer {
             },
             "responses": {
               "200": { "description": "Recording started", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
-              "409": { "description": "Already recording" }
+              "409": { "description": "Already recording" },
+              "503": { "description": "Transcription model not ready" }
             }
           }
         },
@@ -946,7 +959,8 @@ final class APIServer {
             "responses": {
               "200": { "description": "Session started", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionStartResponse" } } } },
               "400": { "description": "Invalid request body or session type" },
-              "409": { "description": "A session is already in progress" }
+              "409": { "description": "A session is already in progress" },
+              "503": { "description": "Transcription model not ready" }
             }
           }
         },

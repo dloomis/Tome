@@ -191,6 +191,7 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
+                canStartRecording: { services.modelProvisioner.canStartRecording },
                 onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
