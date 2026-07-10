@@ -43,6 +43,14 @@ final class TranscriptionEngine {
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
 
+    /// Monotonic session token, bumped at the top of every `start()` and `stop()`.
+    /// Async rebuilds (`restartSystemAudioLeg`) capture it on entry and re-check
+    /// after each suspension: `isRunning` alone can't tell "still this session"
+    /// from "stopped and immediately restarted", and during `stop()`'s long drain
+    /// `isRunning` is still true — a rebuild racing that window would otherwise
+    /// spin up a fresh SCStream + sysTask that nothing tears down.
+    private var sessionGeneration = 0
+
     /// Polls `SystemAudioCapture.lastSampleTime` and surfaces a warning if SCStream
     /// silently stops delivering samples (display sleep without our activity assertion,
     /// permission revoked mid-session, captured app quit, etc.).
@@ -100,6 +108,7 @@ final class TranscriptionEngine {
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
+        sessionGeneration += 1
         lastError = nil
 
         guard await ensureMicrophonePermission() else { return }
@@ -397,18 +406,29 @@ final class TranscriptionEngine {
     @MainActor
     private func restartSystemAudioLeg() async {
         guard isRunning, let vadManager else { return }
+        // Staleness token: `isRunning` is NOT sufficient across the awaits below —
+        // stop() keeps it true until after its (up to 15s) transcriber drain, and a
+        // stop-then-quick-restart flips it back to true for a DIFFERENT session.
+        // Re-check the generation after every suspension.
+        let generation = sessionGeneration
         sysTask?.cancel()
         sysTask = nil
         await systemCapture.stop()
-        // stop()/bufferStream both suspend; a session stop could have raced in.
-        guard isRunning else { return }
+        guard generation == sessionGeneration, isRunning else { return }
         do {
             let streams = try await systemCapture.bufferStream(recordingContext: activeRecordingContext)
-            guard isRunning else { await systemCapture.stop(); return }
+            guard generation == sessionGeneration, isRunning else {
+                // Stale: a stop (or a new session's start) raced the bring-up.
+                // Unwind the capture we just started so it can't leak an SCStream
+                // and an orphaned $TMPDIR WAV into whatever session runs next.
+                await systemCapture.stop()
+                return
+            }
             currentBufferURL = streams.bufferURL
             spinUpSystemTranscription(stream: streams.systemAudio, vadManager: vadManager)
             diagLog("[SYS-STARTGATE] system leg rebuilt")
         } catch {
+            guard generation == sessionGeneration, isRunning else { return }
             let msg = "System audio isn't being captured — recording mic only."
             diagLog("[SYS-STARTGATE] rebuild failed: \(error.localizedDescription)")
             lastError = msg
@@ -707,6 +727,11 @@ final class TranscriptionEngine {
     }
 
     func stop() async {
+        // Invalidate any in-flight system-leg rebuild BEFORE the first await:
+        // `isRunning` stays true until the end of this method, so the generation
+        // token is what actually stops a racing `restartSystemAudioLeg` from
+        // resurrecting capture mid-teardown.
+        sessionGeneration += 1
         lastError = nil
         removeDefaultDeviceListener()
         startupGateTask?.cancel()
@@ -733,6 +758,10 @@ final class TranscriptionEngine {
         micCapture.stop()
         await drainTranscriberTasks()
         micTask = nil
+        // A startup-gate rebuild racing this stop could have swapped in a NEW
+        // sysTask after drainTranscriberTasks snapshotted the old one — that
+        // task was never drained, so cancel (not just drop) the reference.
+        sysTask?.cancel()
         sysTask = nil
         currentMicDeviceID = 0
         isRunning = false
