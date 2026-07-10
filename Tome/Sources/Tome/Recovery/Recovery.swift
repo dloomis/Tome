@@ -68,6 +68,10 @@ enum Recovery {
     /// Run the recovery pipeline. Returns the transcript URL on success.
     /// Routes ASR through the shared coordinator so it serializes safely with any
     /// other ASR work in flight (caller is expected to gate against a live session).
+    /// - Parameter preserveYou: true for call captures (the WAV is the system
+    ///   stream; live "You" mic lines are kept and interleaved). False for
+    ///   mic-only sessions (voice memos / in-person meetings) — there the WAV IS
+    ///   the mic, so preserving "You" would duplicate every word the user said.
     @MainActor
     static func run(
         wavURL: URL,
@@ -75,7 +79,8 @@ enum Recovery {
         asr: ASRCoordinator,
         clusterThreshold: Float,
         numberOfSpeakers: Int,
-        exportVoiceprints: Bool = false
+        exportVoiceprints: Bool = false,
+        preserveYou: Bool = true
     ) async throws -> URL {
         let wav = try inspectWAV(wavURL)
 
@@ -113,17 +118,22 @@ enum Recovery {
         let segments = diar.segments
 
         diagLog("[RECOVERY] re-transcribing \(segments.count) segments")
+        // Mic-only sessions number speakers from 1 (the diarizer owns every
+        // speaker, including the recording user); call captures reserve 1 for
+        // the implicit "You" — mirrors PostProcessingJob's speakerBase.
         let results = await TranscriptionEngine.reTranscribe(
             asrCoordinator: asr,
             bufferURL: wavURL,
-            segments: segments
+            segments: segments,
+            speakerNumberBase: preserveYou ? 2 : 1
         )
 
         do {
             if let results, !results.isEmpty {
                 try TranscriptFinalizer.rebuildFromDiarizedSegments(
                     snapshot: &snapshot,
-                    diarizedSegments: results
+                    diarizedSegments: results,
+                    preserveYou: preserveYou
                 )
             } else {
                 try TranscriptFinalizer.rewriteWithDiarization(

@@ -42,6 +42,40 @@ struct SessionSidecar: Codable, Sendable {
         sidecarURL.deletingPathExtension().deletingPathExtension().appendingPathExtension("wav")
     }
 
+    /// Best-effort sidecar write for `wavURL` from a recording context — the
+    /// single emission path shared by `SystemAudioCapture` (call captures) and
+    /// `TranscriptionEngine` (mic-only sessions, which previously never got a
+    /// sidecar and were invisible to crash recovery). Failure is logged, never
+    /// thrown: a missing sidecar degrades to manual recovery, and sidecar
+    /// trouble must not block the capture itself.
+    static func emit(
+        forWAV wavURL: URL,
+        context: SessionRecordingContext,
+        sampleRate: Double,
+        channels: Int = 1,
+        bitsPerSample: Int = 32
+    ) {
+        let sidecar = SessionSidecar(
+            schema: currentSchema,
+            sessionId: context.sessionId,
+            transcriptPath: context.transcriptURL.path,
+            startedAt: context.startedAt,
+            sourceApp: context.sourceApp,
+            sessionType: context.sessionType,
+            sampleRate: sampleRate,
+            channels: channels,
+            bitsPerSample: bitsPerSample,
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        )
+        let url = sidecarURL(forWAV: wavURL)
+        do {
+            try write(sidecar, to: url)
+            diagLog("[SIDECAR] wrote \(url.lastPathComponent)")
+        } catch {
+            diagLog("[SIDECAR] write failed: \(error) — orphan recovery for this session won't auto-pair")
+        }
+    }
+
     static func write(_ sidecar: SessionSidecar, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -53,11 +87,23 @@ struct SessionSidecar: Codable, Sendable {
         try data.write(to: url, options: .atomic)
     }
 
+    struct SchemaTooNew: Error {
+        let found: Int
+    }
+
     static func read(from url: URL) throws -> SessionSidecar {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(SessionSidecar.self, from: data)
+        let decoded = try decoder.decode(SessionSidecar.self, from: data)
+        // A NEWER app's sidecar may be field-compatible but semantically
+        // different. Refuse it — callers `try?` this into "no sidecar", which
+        // degrades to manual recovery instead of acting on fields this build
+        // doesn't understand.
+        guard decoded.schema <= currentSchema else {
+            throw SchemaTooNew(found: decoded.schema)
+        }
+        return decoded
     }
 
     /// Best-effort cleanup. Used by `cleanupBufferFile` and friends so callers

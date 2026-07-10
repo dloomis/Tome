@@ -1,8 +1,17 @@
+import AVFoundation
+import CoreGraphics
 import SwiftUI
 
 struct OnboardingView: View {
     @Binding var isPresented: Bool
     @State private var currentStep = 0
+
+    // Permission state for the final step. Requested HERE, not mid-meeting:
+    // the screen-recording grant only takes effect after a relaunch, so a
+    // first-ever Call Capture that triggers the prompt has already lost the
+    // meeting's "Them" side by the time the user can react.
+    @State private var micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    @State private var screenGranted = CGPreflightScreenCaptureAccess()
 
     private let steps: [(icon: String, title: String, body: String)] = [
         (
@@ -15,7 +24,14 @@ struct OnboardingView: View {
             "Live Transcript",
             "Your conversation is transcribed in real time. \"You\" captures your mic, \"Them\" captures system audio from the other side. The transcript is the primary view — clean and full-window."
         ),
+        (
+            "lock.shield",
+            "Permissions",
+            "Tome needs the Microphone for your side of a call and Screen Recording for the other side. Grant both now so your first meeting isn't half-captured."
+        ),
     ]
+
+    private var isPermissionsStep: Bool { currentStep == steps.count - 1 }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -44,6 +60,11 @@ struct OnboardingView: View {
                 .multilineTextAlignment(.center)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if isPermissionsStep {
+                Spacer().frame(height: 16)
+                permissionRows
+            }
 
             Spacer()
 
@@ -90,6 +111,53 @@ struct OnboardingView: View {
         .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.bg0)
+    }
+
+    // MARK: - Permissions step
+
+    private var permissionRows: some View {
+        VStack(spacing: 10) {
+            permissionRow(granted: micGranted, label: "Microphone") {
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    Task { @MainActor in micGranted = granted }
+                }
+            }
+            permissionRow(granted: screenGranted, label: "Screen Recording") {
+                if !CGPreflightScreenCaptureAccess() {
+                    CGRequestScreenCaptureAccess()
+                }
+                screenGranted = CGPreflightScreenCaptureAccess()
+            }
+            if !screenGranted {
+                Text("macOS applies Screen Recording after Tome is relaunched — grant it here, not mid-meeting.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func permissionRow(granted: Bool, label: String, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 13))
+                .foregroundStyle(granted ? Color.accent1 : Color.secondary.opacity(0.5))
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+            if !granted {
+                Button("Grant") {
+                    action()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.accent1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color.bg1.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func finish() {

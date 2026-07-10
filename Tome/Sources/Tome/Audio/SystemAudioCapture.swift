@@ -83,24 +83,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             bufferURL = dir.appendingPathComponent("\(ctx.sessionId).wav")
             // Sidecar emitted before the first audio byte so a crash within the
             // first second still leaves an identifiable pair on disk.
-            let sidecar = SessionSidecar(
-                schema: SessionSidecar.currentSchema,
-                sessionId: ctx.sessionId,
-                transcriptPath: ctx.transcriptURL.path,
-                startedAt: ctx.startedAt,
-                sourceApp: ctx.sourceApp,
-                sessionType: ctx.sessionType,
-                sampleRate: 48000,
-                channels: 1,
-                bitsPerSample: 32,
-                appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-            )
-            do {
-                try SessionSidecar.write(sidecar, to: SessionSidecar.sidecarURL(forWAV: bufferURL))
-                diagLog("[SIDECAR] wrote \(SessionSidecar.sidecarURL(forWAV: bufferURL).lastPathComponent)")
-            } catch {
-                diagLog("[SIDECAR] write failed: \(error) — orphan recovery for this session won't auto-pair")
-            }
+            SessionSidecar.emit(forWAV: bufferURL, context: ctx, sampleRate: 48000)
         } else {
             bufferURL = FileManager.default.temporaryDirectory.appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
         }

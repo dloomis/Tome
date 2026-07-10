@@ -190,7 +190,9 @@ final class PostProcessingJob: Identifiable {
         // Finalization may have renamed the note; the crash-recovery sidecar still
         // points at the old path. Refresh it so a crash/quit between here and
         // cleanup leaves an orphan that auto-recovery can actually pair up.
-        if savedPath != handle.transcript.filePath, let wavPath = handle.wavBufferPath {
+        // Mic-only sessions carry their sidecar on the mic WAV.
+        if savedPath != handle.transcript.filePath,
+           let wavPath = handle.wavBufferPath ?? handle.micWavPath {
             SessionSidecar.updateTranscriptPath(forWAV: wavPath, to: savedPath)
         }
 
@@ -304,15 +306,43 @@ final class PostProcessingJob: Identifiable {
         }
         if let micURL = handle.micWavPath {
             try? FileManager.default.removeItem(at: micURL)
+            // Mic-only sessions carry their crash-recovery sidecar on the mic WAV.
+            SessionSidecar.deleteIfExists(forWAV: micURL)
         }
         // Rotated segments share the session-id stem: `<sid>.pre-<ts>.wav` /
-        // `<sid>.pre-<ts>.mic.wav`, always next to the capture WAVs.
+        // `<sid>.pre-<ts>.mic.wav`, always next to the capture WAVs. Two
+        // protections apply:
+        //  • A rotation stamped BEFORE this session started belongs to a PRIOR
+        //    session that failed to finalize (rotation preserved its audio when
+        //    this session claimed the path) — this session's success says
+        //    nothing about it. Never delete it here.
+        //  • With retention ON, this session's own rotations hold pre-swap audio
+        //    the mixer did NOT fold into the exported .m4a — deleting them would
+        //    silently drop audio the user asked to keep. (With retention off the
+        //    session's audio is discarded by design, rotations included.)
         if let dir = (handle.wavBufferPath ?? handle.micWavPath)?.deletingLastPathComponent(),
            let siblings = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for url in siblings where url.lastPathComponent.hasPrefix("\(id).pre-") {
-                try? FileManager.default.removeItem(at: url)
+            let sessionStartMs = UInt64(max(0, handle.transcript.sessionStartTime.timeIntervalSince1970) * 1000)
+            for url in siblings {
+                guard let ts = Self.rotationTimestampMs(fromName: url.lastPathComponent, sessionId: id) else { continue }
+                if ts < sessionStartMs {
+                    diagLog("[JOB \(id)] keeping prior session's rotated segment \(url.lastPathComponent)")
+                } else if retention != nil {
+                    diagLog("[JOB \(id)] keeping unmixed same-session rotation \(url.lastPathComponent) (retention is on; not in the exported audio)")
+                } else {
+                    try? FileManager.default.removeItem(at: url)
+                }
             }
         }
+    }
+
+    /// Parse the epoch-millisecond stamp out of `<sessionId>.pre-<ts>[.mic].wav`.
+    /// Nil for names that aren't this session's rotations.
+    private static func rotationTimestampMs(fromName name: String, sessionId: String) -> UInt64? {
+        let prefix = "\(sessionId).pre-"
+        guard name.hasPrefix(prefix) else { return nil }
+        let digits = name.dropFirst(prefix.count).prefix(while: \.isNumber)
+        return digits.isEmpty ? nil : UInt64(digits)
     }
 
     private func pair(_ url: URL?, _ date: Date?) -> (url: URL, firstSample: Date)? {

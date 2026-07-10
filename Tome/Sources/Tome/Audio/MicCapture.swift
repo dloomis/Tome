@@ -48,8 +48,72 @@ final class MicCapture: @unchecked Sendable {
     private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
 
+    /// Wall-clock time of the most recent buffer delivered by the TAP while
+    /// capture is active; `nil` when not capturing or before the first buffer.
+    /// The engine's watchdog reads this to detect a mic that silently stopped
+    /// delivering (device pulled, HAL wedge) — AVAudioEngine reports no error in
+    /// those cases, mirroring `SystemAudioCapture.lastSampleTime`. Written ONLY
+    /// by the tap callback: the watchdog treats it as authoritative evidence of
+    /// real audio (a stall may only clear on this, never on the start seed below).
+    private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
+
+    /// Wall-clock time capture was (re)started, seeded on successful engine
+    /// start. The watchdog uses it as the stall baseline while the tap hasn't
+    /// delivered yet — so a device that never sends a single buffer still alarms
+    /// ~threshold seconds after start — but it can never CLEAR a stall.
+    private let _captureStartTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
+    var captureStartTime: Date? { _captureStartTime.withLock { $0 } }
+
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
+
+    /// Hold a retiring engine for 15s before release. See the retire call site in
+    /// `bufferStream` — AVFAudio's async device-change callbacks reference the
+    /// engine that registered them, and deallocating it while they're queued is a
+    /// use-after-free inside the framework. The task's capture of `old` IS the
+    /// mechanism: release happens when the closure completes, long after any
+    /// in-flight AVAudioIOUnit-queue blocks have drained.
+    private static func retire(_ old: AVAudioEngine) {
+        Task.detached(priority: .background) {
+            try? await Task.sleep(for: .seconds(15))
+            _ = old
+            diagLog("[MIC-RETIRE] released a retired engine")
+        }
+    }
+
+    /// Fired when the running engine posts `AVAudioEngineConfigurationChange` —
+    /// Apple's contract is that the engine STOPS on audio-route/graph changes
+    /// (Bluetooth connect, HFP↔A2DP renegotiation, device unplug) and the app
+    /// must bring it back up. Without this, the tap dies silently and only the
+    /// 15s watchdog notices (observed 2026-07-06: AirPods connecting killed a
+    /// running Brio tap with zero errors). The engine layer debounces and
+    /// rebuilds on the CURRENT device.
+    var onConfigurationChange: (@Sendable () -> Void)?
+
+    /// Observer token for the current engine's configuration-change notification.
+    private let _configObserver = OSAllocatedUnfairLock<NSObjectProtocol?>(uncheckedState: nil)
+
+    private func removeConfigObserver() {
+        _configObserver.withLock { token in
+            if let token { NotificationCenter.default.removeObserver(token) }
+            token = nil
+        }
+    }
+
+    private func installConfigObserver(for engine: AVAudioEngine) {
+        removeConfigObserver()
+        let callback = { [weak self] in self?.onConfigurationChange?() }
+        let token = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { _ in
+            diagLog("[MIC-CONFIG] AVAudioEngineConfigurationChange — engine stopped by a route/graph change")
+            callback()
+        }
+        _configObserver.withLock { $0 = token }
+    }
 
     /// - Parameter recordOutputURL: when non-nil, the mic track is also written to a
     ///   WAV at this path (float32 mono) for post-session retention. Multi-channel
@@ -64,10 +128,36 @@ final class MicCapture: @unchecked Sendable {
 
             diagLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
+            // Detach the config-change observer BEFORE touching the old engine:
+            // teardown can itself fire AVAudioEngineConfigurationChange on that
+            // engine, and an observer still attached would schedule a rebuild of
+            // the capture we are deliberately replacing — a self-sustaining
+            // restart loop that hammers the HAL (which then starts refusing
+            // device binds with 'nope').
+            self.removeConfigObserver()
+
             // Fresh engine per capture — see the `engine` property comment. Tear the
             // old one down first so its HAL unit releases the previous device.
-            self.engine.inputNode.removeTap(onBus: 0)
-            self.engine.stop()
+            // Teardown of a wedged engine (mid Bluetooth-graph transition) can raise
+            // an NSException just like tap installation — guard it the same way.
+            let teardownException = TomeCatchObjCException {
+                self.engine.inputNode.removeTap(onBus: 0)
+                self.engine.stop()
+            }
+            if let teardownException {
+                diagLog("[MIC-1-WARN] old engine teardown raised \(teardownException) — abandoning old engine instance")
+            }
+            // Do NOT let the old engine deallocate here. AVFAudio queues
+            // IOUnitPropertyListener / IOBindingChanged blocks asynchronously on
+            // its AVAudioIOUnit queue when a device changes (AirPods connecting),
+            // and those blocks capture pointers into the engine that registered
+            // them. Releasing the engine while blocks are still queued is a
+            // use-after-free inside AVFAudio — field crash 2026-07-06 (macOS
+            // 26.2): SIGSEGV in objc_msgSend(sampleRate) from
+            // AVAudioIOUnit::IOUnitPropertyListener, PAC failure on a freed
+            // pointer. Park the retiring engine long enough for any queued
+            // callbacks to drain against a live (stopped, harmless) object.
+            Self.retire(self.engine)
             self.engine = AVAudioEngine()
 
             // Set input device before accessing inputNode format
@@ -207,6 +297,7 @@ final class MicCapture: @unchecked Sendable {
 
             let retentionWriter = self._retentionWriter
             let firstSampleTime = self._firstSampleTime
+            let lastSampleTime = self._lastSampleTime
 
             var tapCallCount = 0
             let installException = TomeCatchObjCException {
@@ -220,6 +311,7 @@ final class MicCapture: @unchecked Sendable {
                 }
 
                 firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
+                lastSampleTime.withLock { $0 = Date() }
 
                 // Normalize to mono before writing/yielding: the WAV writer and the
                 // transcriber's fallback path both read channel 0 only, so a
@@ -263,6 +355,13 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-7] engine prepared, starting...")
                     try self.engine.start()
                     diagLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
+                    // Seed the watchdog baseline — grace period starts at engine
+                    // start, not at the first buffer (which a wedged device never
+                    // sends). Deliberately NOT _lastSampleTime: only real tap
+                    // buffers may clear a stall.
+                    self._captureStartTime.withLock { $0 = Date() }
+                    // Route/graph changes stop this engine silently; watch for them.
+                    self.installConfigObserver(for: self.engine)
                 } catch {
                     startError = error
                 }
@@ -282,9 +381,17 @@ final class MicCapture: @unchecked Sendable {
     }
 
     func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        removeConfigObserver()
+        let teardownException = TomeCatchObjCException {
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.engine.stop()
+        }
+        if let teardownException {
+            diagLog("[MIC-STOP-WARN] engine teardown raised \(teardownException)")
+        }
         _audioLevel.value = 0
+        _lastSampleTime.withLock { $0 = nil }
+        _captureStartTime.withLock { $0 = nil }
         // Flush + finalize the retention WAV. firstSampleTime is intentionally
         // preserved so the engine can snapshot it after stop.
         _retentionWriter.withLock { state in

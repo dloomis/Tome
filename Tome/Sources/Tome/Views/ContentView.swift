@@ -150,6 +150,17 @@ struct ContentView: View {
             guard let engine = transcriptionEngine else { return }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
 
+            // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
+            // so a device chosen last session (AirPods) may be absent — or worse,
+            // its numeric id reassigned — at this launch. An absent selection left
+            // the Settings picker EMPTY and sessions targeting a dead id. Fall
+            // back to System Default, which is always valid.
+            if settings.inputDeviceID != 0,
+               !MicCapture.availableInputDevices().contains(where: { $0.id == settings.inputDeviceID }) {
+                diagLog("[BOOT] persisted mic device \(settings.inputDeviceID) not present — resetting to System Default")
+                settings.inputDeviceID = 0
+            }
+
             // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
             if utteranceWriterTask == nil {
                 let (stream, cont) = AsyncStream.makeStream(of: UtteranceWrite.self)
@@ -280,6 +291,20 @@ struct ContentView: View {
         .onChange(of: services.postProcessingQueue.lastCompletion) { _, new in
             guard let new else { return }
             handleJobCompleted(jobId: new.jobId, savedURL: new.savedURL, sessionType: new.sessionType)
+        }
+        .onChange(of: services.postProcessingQueue.lastFailure) { _, failure in
+            guard let failure else { return }
+            // Walk the API lifecycle out of `.transcribing` — without this a failed
+            // job left /status reporting a transcription that would never finish.
+            apiServer.sessionDidComplete(id: failure.jobId)
+            // The WAVs were preserved; tell the user now, not at next launch.
+            Task {
+                await NotificationPresenter.shared.postJobFailure(
+                    message: failure.message,
+                    sessionType: failure.sessionType
+                )
+            }
+            transcriptionEngine?.lastError = failure.message
         }
     }
 
@@ -604,11 +629,13 @@ struct ContentView: View {
     /// discard and state to return to idle.
     @MainActor
     private func rollbackFailedStart(sessionId: String) async {
-        // The engine sets `lastError` on its hard-fail paths; keep a fallback in case
-        // a future path forgets, so the control bar always explains the no-op.
-        if transcriptionEngine?.lastError == nil {
-            transcriptionEngine?.lastError = "Couldn't start recording."
-        }
+        // Belt-and-braces: if a stop raced the start's awaits, capture may have
+        // been brought up for a session already considered dead. stop() is
+        // idempotent and cheap on an already-stopped engine — but it clears
+        // lastError, so snapshot the engine's explanation first and restore it.
+        let startFailureReason = transcriptionEngine?.lastError
+        await transcriptionEngine?.stop()
+        transcriptionEngine?.lastError = startFailureReason ?? "Couldn't start recording."
 
         // Close the half-open transcript session and delete the empty note created
         // before the failed start. Guarded: only remove the note when no utterances
@@ -808,7 +835,10 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
-                    exportVoiceprints: settings.exportVoiceprints
+                    exportVoiceprints: settings.exportVoiceprints,
+                    // Mic-only orphans (voice memos): the WAV IS the mic, so keeping
+                    // the live "You" lines would duplicate every word.
+                    preserveYou: orphan.sidecar?.sessionType != .voiceMemo
                 )
                 OrphanScanner.discard(orphan)
                 recovered += 1
@@ -918,7 +948,31 @@ struct ContentView: View {
         transcriptionEngine?.assetStatus = "Recovering…"
         transcriptionEngine?.lastError = nil
 
-        Task {
+        // A `.mic.wav` is ambiguous on the manual path (no sidecar): a voice
+        // memo's primary track (rebuild replaces the body) or a call capture's
+        // mic side (replacing the body would DESTROY every live "Them" line in
+        // the note). Never guess on a destructive fork — ask.
+        var preserveYou = true
+        if wavURL.lastPathComponent.lowercased().hasSuffix(".mic.wav") {
+            let kind = NSAlert()
+            kind.messageText = "What kind of recording is this mic track?"
+            kind.informativeText = """
+                Voice memo / in-person: the transcript body is rebuilt entirely from this WAV.
+
+                Call capture mic side: your "You" lines are rebuilt from this WAV and the note's existing "Them" lines are kept.
+                """
+            kind.alertStyle = .informational
+            kind.addButton(withTitle: "Voice Memo / In-Person")
+            kind.addButton(withTitle: "Call Capture (keep \"Them\")")
+            kind.addButton(withTitle: "Cancel")
+            switch kind.runModal() {
+            case .alertFirstButtonReturn: preserveYou = false
+            case .alertSecondButtonReturn: preserveYou = true
+            default: return
+            }
+        }
+
+        Task { [preserveYou] in
             let result: Result<URL, Error>
             do {
                 let saved = try await Recovery.run(
@@ -927,7 +981,8 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
-                    exportVoiceprints: settings.exportVoiceprints
+                    exportVoiceprints: settings.exportVoiceprints,
+                    preserveYou: preserveYou
                 )
                 result = .success(saved)
             } catch {
