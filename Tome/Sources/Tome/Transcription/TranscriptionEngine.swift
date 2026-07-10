@@ -412,6 +412,11 @@ final class TranscriptionEngine {
         await restartSystemAudioLeg()
     }
 
+    /// True between `restartSystemAudioLeg` entry and exit. With both the startup
+    /// gate and the watchdog able to trigger rebuilds, this stops a second rebuild
+    /// from tearing down the one still coming up.
+    private var sysRebuildInFlight = false
+
     /// Tear down and re-establish the system-audio leg on the current session.
     /// Reuses the retained recording context so the rebuilt WAV keeps the same
     /// session identity/path. If the rebuild itself fails to come up, surface it —
@@ -419,11 +424,6 @@ final class TranscriptionEngine {
     /// won't fix. A rebuild that SUCCEEDS but stays silent is caught by the +5s
     /// grace check armed below (the watchdog's re-seeded clock is too slow — see
     /// `sysRebuildGraceTask`).
-    /// True between `restartSystemAudioLeg` entry and exit. With both the startup
-    /// gate and the watchdog able to trigger rebuilds, this stops a second rebuild
-    /// from tearing down the one still coming up.
-    private var sysRebuildInFlight = false
-
     @MainActor
     private func restartSystemAudioLeg() async {
         guard isRunning, let vadManager, !sysRebuildInFlight else { return }
