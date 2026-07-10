@@ -88,8 +88,10 @@ final class PostProcessingJob: Identifiable {
 
         // Short-recording discard: a session at/under the user's threshold is almost
         // certainly a canceled or mis-started meeting. Drop it here — before any
-        // expensive diarization — so nothing lands in the output folders.
-        if let limit = discardIfShorterThanOrEqual {
+        // expensive diarization — so nothing lands in the output folders. The
+        // sessionType check backstops the caller's call-captures-only policy: a
+        // voice memo is deliberate however short, and must never be discarded.
+        if let limit = discardIfShorterThanOrEqual, handle.sessionType == .callCapture {
             let duration = handle.transcript.sessionEndTime.timeIntervalSince(handle.transcript.sessionStartTime)
             if duration <= limit {
                 return discardShortSession(durationSeconds: Int(duration.rounded()))

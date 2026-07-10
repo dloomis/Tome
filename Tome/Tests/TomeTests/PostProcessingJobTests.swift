@@ -28,21 +28,37 @@ import Testing
         return Fixture(dir: dir, vault: vault, micWAV: micWAV, snapshot: snapshot)
     }
 
-    private func makeHandle(id: String, fixture: Fixture, systemWAV: URL? = nil) -> SessionHandle {
+    private func makeHandle(id: String, fixture: Fixture, systemWAV: URL? = nil, sessionType: SessionType = .callCapture, snapshot: TranscriptSessionSnapshot? = nil) -> SessionHandle {
         SessionHandle(
             id: id,
-            sessionType: .callCapture,
+            sessionType: sessionType,
             sourceApp: "Test",
             wavBufferPath: systemWAV,
             micWavPath: fixture.micWAV,
             micFirstSampleTime: fixture.snapshot.sessionStartTime,
             systemFirstSampleTime: nil,
-            transcript: fixture.snapshot
+            transcript: snapshot ?? fixture.snapshot
         )
     }
 
-    private func makeJob(_ handle: SessionHandle, retention: RecordingRetentionConfig? = nil) -> PostProcessingJob {
-        PostProcessingJob(handle: handle, clusterThreshold: 0.7, numberOfSpeakers: 0, retention: retention, exportVoiceprints: false)
+    private func makeJob(_ handle: SessionHandle, retention: RecordingRetentionConfig? = nil, discardIfShorterThanOrEqual: TimeInterval? = nil) -> PostProcessingJob {
+        PostProcessingJob(handle: handle, clusterThreshold: 0.7, numberOfSpeakers: 0, retention: retention, exportVoiceprints: false, discardIfShorterThanOrEqual: discardIfShorterThanOrEqual)
+    }
+
+    /// Unwrap the saved-transcript URL out of a `JobOutcome`; a discard here is a
+    /// test failure, not an alternate success.
+    private func requireSaved(_ outcome: PostProcessingJob.JobOutcome) throws -> URL {
+        guard case .saved(let url) = outcome else {
+            throw NSError(domain: "PostProcessingJobTests", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "expected .saved, got \(outcome)"])
+        }
+        return url
+    }
+
+    /// A snapshot on the fixture's note whose start/end pin the session duration.
+    private func snapshot(_ fx: Fixture, durationSeconds: TimeInterval) -> TranscriptSessionSnapshot {
+        let end = Date()
+        return TestSupport.snapshot(filePath: fx.snapshot.filePath, start: end.addingTimeInterval(-durationSeconds), end: end)
     }
 
     /// A folder path that `createDirectory` cannot create: nested under a file.
@@ -59,7 +75,7 @@ import Testing
         let retention = RecordingRetentionConfig(folder: try unwritableFolder(in: fx.dir))
         let job = makeJob(makeHandle(id: "j1", fixture: fx), retention: retention)
 
-        let saved = try await job.run(using: ASRCoordinator())
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
 
         #expect(FileManager.default.fileExists(atPath: saved.path), "transcript still finalizes")
         #expect(FileManager.default.fileExists(atPath: fx.micWAV.path),
@@ -91,7 +107,7 @@ import Testing
         let keepFolder = fx.dir.appendingPathComponent("keep", isDirectory: true)
         let job = makeJob(makeHandle(id: "j2", fixture: fx), retention: RecordingRetentionConfig(folder: keepFolder))
 
-        let saved = try await job.run(using: ASRCoordinator())
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
 
         let kept = try FileManager.default.contentsOfDirectory(atPath: keepFolder.path).filter { $0.hasSuffix(".m4a") }
         #expect(kept.count == 1, "combined recording must exist, got \(kept)")
@@ -167,7 +183,7 @@ import Testing
         let retention = RecordingRetentionConfig(folder: try unwritableFolder(in: fx.dir))
         let job = makeJob(makeHandle(id: "j4", fixture: fx, systemWAV: systemWAV), retention: retention)
 
-        let saved = try await job.run(using: ASRCoordinator())
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
 
         #expect(saved.lastPathComponent == "Renamed Meeting.md")
         let updated = try SessionSidecar.read(from: SessionSidecar.sidecarURL(forWAV: systemWAV))
@@ -195,5 +211,66 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: fx.micWAV.path),
                 "cancellation must leave the capture files for the orphan scan")
         #expect(FileManager.default.fileExists(atPath: fx.snapshot.filePath.path))
+    }
+
+    // MARK: - Short-session discard (AppSettings.discardShortMeetings)
+
+    @Test func shortCallCaptureIsDiscardedWithAllItsFiles() async throws {
+        let fx = try await makeFixture(id: "j8")
+        defer { TestSupport.remove(fx.dir) }
+
+        let systemWAV = try TestSupport.writeWAV(at: fx.dir.appendingPathComponent("j8.wav"), seconds: 1)
+        let handle = makeHandle(id: "j8", fixture: fx, systemWAV: systemWAV,
+                                snapshot: snapshot(fx, durationSeconds: 18))
+        let job = makeJob(handle, discardIfShorterThanOrEqual: 30)
+
+        let outcome = try await job.run(using: ASRCoordinator())
+
+        guard case .discarded(let path, let durationSeconds) = outcome else {
+            Issue.record("expected .discarded, got \(outcome)")
+            return
+        }
+        #expect(path == fx.snapshot.filePath)
+        #expect(durationSeconds == 18)
+        #expect(!FileManager.default.fileExists(atPath: fx.snapshot.filePath.path),
+                "the live transcript must not reach the vault")
+        #expect(!FileManager.default.fileExists(atPath: systemWAV.path),
+                "a discarded session keeps no capture audio")
+        #expect(!FileManager.default.fileExists(atPath: fx.micWAV.path))
+    }
+
+    @Test func discardThresholdIsInclusiveAtTheBoundary() async throws {
+        // Exactly at the threshold → discarded; one second over → saved.
+        let atFx = try await makeFixture(id: "j9")
+        defer { TestSupport.remove(atFx.dir) }
+        let atJob = makeJob(makeHandle(id: "j9", fixture: atFx, snapshot: snapshot(atFx, durationSeconds: 30)),
+                            discardIfShorterThanOrEqual: 30)
+        guard case .discarded = try await atJob.run(using: ASRCoordinator()) else {
+            Issue.record("a session of exactly the threshold length must be discarded")
+            return
+        }
+
+        let overFx = try await makeFixture(id: "j10")
+        defer { TestSupport.remove(overFx.dir) }
+        let overJob = makeJob(makeHandle(id: "j10", fixture: overFx, snapshot: snapshot(overFx, durationSeconds: 31)),
+                              discardIfShorterThanOrEqual: 30)
+        let saved = try requireSaved(try await overJob.run(using: ASRCoordinator()))
+        #expect(FileManager.default.fileExists(atPath: saved.path),
+                "a session over the threshold is saved normally")
+    }
+
+    @Test func voiceMemoIsNeverDiscarded() async throws {
+        // The caller only passes a threshold for call captures; the job backstops
+        // that policy — a short voice memo is deliberate and must survive even if
+        // a threshold slips through.
+        let fx = try await makeFixture(id: "j11")
+        defer { TestSupport.remove(fx.dir) }
+        let handle = makeHandle(id: "j11", fixture: fx, sessionType: .voiceMemo,
+                                snapshot: snapshot(fx, durationSeconds: 5))
+        let job = makeJob(handle, discardIfShorterThanOrEqual: 30)
+
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
+        #expect(FileManager.default.fileExists(atPath: saved.path),
+                "a 5s voice memo must be saved, never discarded")
     }
 }
