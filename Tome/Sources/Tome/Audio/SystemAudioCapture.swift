@@ -48,29 +48,52 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         let bufferURL: URL
     }
 
-    /// Start capturing system audio (every process on the display, mixed).
-    /// `recordingContext` is required for the crash-recovery sidecar; when nil
-    /// (legacy / test paths), falls back to the old `$TMPDIR`-based unnamed WAV.
+    /// Bundle IDs whose audio is never call audio — dedicated media players that
+    /// render their own output in-process. Excluded from the display-wide capture
+    /// so background music/video doesn't flow through VAD+ASR as "Them" lines.
+    /// Keep this list small and unambiguous: excluding an app that could ever
+    /// carry conferencing audio would recreate the silent-"Them" bug below.
+    private static let noiseAppBundleIDs: Set<String> = [
+        "com.apple.Music",
+        "com.apple.TV",
+        "com.apple.podcasts",
+        "com.spotify.client",
+    ]
+
+    /// Start capturing system audio (every process on the display, mixed, minus
+    /// the known media players above). `recordingContext` is required for the
+    /// crash-recovery sidecar; when nil (legacy / test paths), falls back to the
+    /// old `$TMPDIR`-based unnamed WAV.
     ///
-    /// We deliberately do NOT scope the filter to the conferencing app. A per-app
-    /// `SCContentFilter(including: [app])` only captures audio the OS attributes to
-    /// that exact process — but modern conferencing apps (new Teams, browser-based
-    /// Meet, dial-in bridges) render call audio through a *separate* helper process,
-    /// so the per-app filter recorded pure silence while the mic kept working. That
-    /// left "Them" empty with no error and no fallback (the fallback only fired when
-    /// the bundle ID wasn't found at all — a matched-but-silent app never hit it).
-    /// Field-observed on a KSPIL6 standup, 2026-07-10. Capturing the whole display's
-    /// audio is what the reliable sessions were already doing (`source_app: Call`).
+    /// We deliberately do NOT scope the filter to the conferencing app — inclusion
+    /// filtering must never come back. A per-app `SCContentFilter(including: [app])`
+    /// only captures audio the OS attributes to that exact process — but modern
+    /// conferencing apps (new Teams, browser-based Meet, dial-in bridges) render
+    /// call audio through a *separate* helper process, so the per-app filter
+    /// recorded pure silence while the mic kept working. That left "Them" empty
+    /// with no error and no fallback (the fallback only fired when the bundle ID
+    /// wasn't found at all — a matched-but-silent app never hit it).
+    /// Field-observed on a KSPIL6 standup, 2026-07-10. EXCLUSION by app is safe
+    /// where inclusion wasn't: a media player renders its own audio, so excluding
+    /// it can't drop audio a conferencing helper produces.
     func bufferStream(
         recordingContext: SessionRecordingContext? = nil
     ) async throws -> CaptureStreams {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        // Desktop/off-screen windows are irrelevant: only `displays` and
+        // `applications` are read below, and both are populated independently of
+        // the window filtering — enumerating every window was pure WindowServer
+        // IPC cost on each session start and gate rebuild.
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
 
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let excludedApps = content.applications.filter { Self.noiseAppBundleIDs.contains($0.bundleIdentifier) }
+        if !excludedApps.isEmpty {
+            diagLog("[SYS-CAPTURE] excluding \(excludedApps.count) media app(s) from capture: \(excludedApps.map(\.bundleIdentifier).joined(separator: ", "))")
+        }
+        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
 
         // Set up audio buffer file. With a recordingContext we write to a stable
         // location in Application Support so the WAV survives temp-dir purges and
