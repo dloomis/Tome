@@ -303,6 +303,29 @@ private struct OutputTab: View {
                 ) { settings.vaultVoicePath = $0 }
             }
 
+            Section("Discard Short Meetings") {
+                Toggle("Discard canceled or mis-started meetings", isOn: $settings.discardShortMeetings)
+                    .font(.system(size: 12))
+                if settings.discardShortMeetings {
+                    HStack {
+                        Text("Threshold")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Text("\(settings.discardShortMeetingSeconds)s")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 48, alignment: .trailing)
+                    }
+                    Slider(value: Binding(
+                        get: { Double(settings.discardShortMeetingSeconds) },
+                        set: { settings.discardShortMeetingSeconds = Int($0) }
+                    ), in: 5...300, step: 5)
+                }
+                Text("Call captures that stop at or under this length are treated as canceled meetings: the transcript and any recording are deleted instead of saved. Voice memos are never discarded. Off by default.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Recordings") {
                 Toggle("Retain recordings", isOn: $settings.retainRecordings)
                     .font(.system(size: 12))

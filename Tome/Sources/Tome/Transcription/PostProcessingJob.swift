@@ -15,8 +15,19 @@ final class PostProcessingJob: Identifiable {
         case reTranscribing
         case finalizing
         case complete(URL)
+        case discarded(URL)
         case failed(PostProcessingError)
         case cancelled
+    }
+
+    /// The two terminal results of a successful `run()`. Failures are thrown, not
+    /// returned. A discard is neither success nor failure: nothing was written, so
+    /// the queue publishes it on its own channel (`lastDiscard`) and the UI must not
+    /// show a "Saved" banner or an open-file action.
+    enum JobOutcome: Sendable {
+        case saved(URL)
+        /// The transcript path that was removed, plus the measured session length.
+        case discarded(path: URL, durationSeconds: Int)
     }
 
     nonisolated let id: String
@@ -38,20 +49,28 @@ final class PostProcessingJob: Identifiable {
     /// the finalized transcript. Call captures only — needs a diarized system stream.
     let exportVoiceprints: Bool
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false) {
+    /// When set, a session that ran for ≤ this many seconds is discarded — its live
+    /// transcript and every capture file are deleted and nothing reaches the output
+    /// folders. Nil = feature off (or the session isn't eligible). The caller
+    /// (`ContentView.stopSession`) applies the "call captures only" policy by passing
+    /// this only for call captures with `AppSettings.discardShortMeetings` enabled.
+    let discardIfShorterThanOrEqual: TimeInterval?
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, discardIfShorterThanOrEqual: TimeInterval? = nil) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
+        self.discardIfShorterThanOrEqual = discardIfShorterThanOrEqual
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
     /// observers (UI) see phase transitions. Each `await` hops off main for the
     /// underlying compute.
     @discardableResult
-    func run(using asr: ASRCoordinator) async throws(PostProcessingError) -> URL {
+    func run(using asr: ASRCoordinator) async throws(PostProcessingError) -> JobOutcome {
         if Task.isCancelled {
             phase = .cancelled
             throw .cancelled
@@ -65,6 +84,16 @@ final class PostProcessingJob: Identifiable {
         diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), micWavPath=\(handle.micWavPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
         if handle.wavWriteErrorCount > 0 {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
+        }
+
+        // Short-recording discard: a session at/under the user's threshold is almost
+        // certainly a canceled or mis-started meeting. Drop it here — before any
+        // expensive diarization — so nothing lands in the output folders.
+        if let limit = discardIfShorterThanOrEqual {
+            let duration = handle.transcript.sessionEndTime.timeIntervalSince(handle.transcript.sessionStartTime)
+            if duration <= limit {
+                return discardShortSession(durationSeconds: Int(duration.rounded()))
+            }
         }
 
         // Per-session-type diarization plan.
@@ -245,7 +274,22 @@ final class PostProcessingJob: Identifiable {
 
         phase = .complete(savedPath)
         diagLog("[JOB \(id)] complete → \(savedPath.lastPathComponent)")
-        return savedPath
+        return .saved(savedPath)
+    }
+
+    /// Discard a session that ran at or under the configured short-recording threshold.
+    /// Removes the live transcript from the vault and every capture file, so nothing
+    /// reaches the output folders — no transcript, no retained `.m4a`, no voiceprints
+    /// (the latter two never ran; this returns before diarization). Cheap by design.
+    private func discardShortSession(durationSeconds: Int) -> JobOutcome {
+        let path = handle.transcript.filePath
+        diagLog("[JOB \(id)] discarding short session (\(durationSeconds)s ≤ threshold) — removing \(path.lastPathComponent) + capture files")
+        try? FileManager.default.removeItem(at: path)
+        // A discarded session keeps nothing: delete every capture file including this
+        // session's own rotations (retention is moot when the whole session is dropped).
+        cleanupCaptureFiles(discarding: true)
+        phase = .discarded(path)
+        return .discarded(path: path, durationSeconds: durationSeconds)
     }
 
     /// Whether the source capture WAVs may be deleted at the end of the job.
@@ -300,7 +344,7 @@ final class PostProcessingJob: Identifiable {
     /// session (e.g. a mid-session mic device swap). Runs ONLY on the verified
     /// success path: every failure/cancellation path leaves the files in place for
     /// the launch-time orphan scan — they are the only recovery source.
-    private func cleanupCaptureFiles() {
+    private func cleanupCaptureFiles(discarding: Bool = false) {
         if let bufferURL = handle.wavBufferPath {
             SystemAudioCapture.cleanupBufferFile(bufferURL)
         }
@@ -327,7 +371,7 @@ final class PostProcessingJob: Identifiable {
                 guard let ts = Self.rotationTimestampMs(fromName: url.lastPathComponent, sessionId: id) else { continue }
                 if ts < sessionStartMs {
                     diagLog("[JOB \(id)] keeping prior session's rotated segment \(url.lastPathComponent)")
-                } else if retention != nil {
+                } else if retention != nil && !discarding {
                     diagLog("[JOB \(id)] keeping unmixed same-session rotation \(url.lastPathComponent) (retention is on; not in the exported audio)")
                 } else {
                     try? FileManager.default.removeItem(at: url)

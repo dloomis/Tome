@@ -314,6 +314,19 @@ struct ContentView: View {
             }
             transcriptionEngine?.lastError = failure.message
         }
+        .onChange(of: services.postProcessingQueue.lastDiscard) { _, discard in
+            guard let discard else { return }
+            // A discarded session still "finished" — walk the API lifecycle out of
+            // `.transcribing` just like completion/failure, or /status would report a
+            // transcription that never ends. There's no file to open, so no banner.
+            apiServer.sessionDidComplete(id: discard.jobId)
+            Task {
+                await NotificationPresenter.shared.postDiscard(
+                    durationSeconds: discard.durationSeconds,
+                    sessionType: discard.sessionType
+                )
+            }
+        }
     }
 
     private func saveTranscriptToFile() {
@@ -763,6 +776,13 @@ struct ContentView: View {
             ? settings.recordingsFolderURL.map(RecordingRetentionConfig.init(folder:))
             : nil
 
+        // Short-recording discard applies to call captures only (voice memos are
+        // never dropped). Passing nil for voice memos / when the setting is off
+        // leaves the job's normal save path untouched.
+        let discardLimit: TimeInterval? = (wasCallCapture && settings.discardShortMeetings)
+            ? TimeInterval(settings.discardShortMeetingSeconds)
+            : nil
+
         Task {
             // Snapshot capture state BEFORE tearing down the engine, since the engine
             // may begin a new session (which reuses the capture objects) immediately.
@@ -813,7 +833,8 @@ struct ContentView: View {
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                 retention: retention,
-                exportVoiceprints: settings.exportVoiceprints
+                exportVoiceprints: settings.exportVoiceprints,
+                discardIfShorterThanOrEqual: discardLimit
             )
 
             services.postProcessingQueue.enqueue(job)
