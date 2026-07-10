@@ -976,10 +976,17 @@ struct ContentView: View {
                 failed.append("\(orphan.wavURL.lastPathComponent): no sidecar — use Cmd+Opt+R")
                 continue
             }
-            let transcriptURL = sidecar.transcriptURL
+            var transcriptURL = sidecar.transcriptURL
             if !FileManager.default.fileExists(atPath: transcriptURL.path) {
-                failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
-                continue
+                // The sidecar path can go stale when the vault pipeline renames a
+                // note before its session finalizes — the note is still findable
+                // by its preserved `source_file:` frontmatter key.
+                if let renamed = TranscriptFinalizer.relocateRenamedNote(from: transcriptURL) {
+                    transcriptURL = renamed
+                } else {
+                    failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
+                    continue
+                }
             }
 
             do {

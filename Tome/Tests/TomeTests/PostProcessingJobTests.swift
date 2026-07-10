@@ -213,6 +213,36 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: fx.snapshot.filePath.path))
     }
 
+    @Test func externallyRenamedNoteIsRelocatedAndNotRenamedBack() async throws {
+        // The vault pipeline (WhisperCal) can retitle the live note before the
+        // job runs — the snapshot path goes stale and every rewrite step would
+        // fail markdownReadFailed. The job must follow the rename via the
+        // preserved source_file: key (quotes stripped, as the external YAML
+        // round-trip does), finalize in place, and KEEP the curated name.
+        let fx = try await makeFixture(id: "j12", suggestedFilename: "Should Not Apply")
+        defer { TestSupport.remove(fx.dir) }
+
+        let originalName = fx.snapshot.filePath.lastPathComponent
+        let renamed = fx.vault.appendingPathComponent("2026-07-10 1500 - Curated Title - Transcript.md")
+        var content = try String(contentsOf: fx.snapshot.filePath, encoding: .utf8)
+        content = content.replacingOccurrences(
+            of: "source_file: \"\(originalName)\"",
+            with: "source_file: \(originalName)"
+        )
+        try content.write(to: renamed, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: fx.snapshot.filePath)
+
+        let job = makeJob(makeHandle(id: "j12", fixture: fx))
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
+
+        // Symlink-tolerant compare: the tempdir round-trips as /private/var vs /var.
+        #expect(saved.resolvingSymlinksInPath().path == renamed.resolvingSymlinksInPath().path,
+                "job must finalize the renamed note in place, got \(saved.path)")
+        let finalized = try String(contentsOf: renamed, encoding: .utf8)
+        #expect(!finalized.contains("duration: \"00:00\""),
+                "frontmatter finalization must land on the relocated note")
+    }
+
     // MARK: - Short-session discard (AppSettings.discardShortMeetings)
 
     @Test func shortCallCaptureIsDiscardedWithAllItsFiles() async throws {

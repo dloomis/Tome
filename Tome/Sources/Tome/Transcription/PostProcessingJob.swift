@@ -88,6 +88,21 @@ final class PostProcessingJob: Identifiable {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
         }
 
+        // External-rename fallback: the user's vault pipeline (WhisperCal) can
+        // retitle the live note before this job runs — every rewrite step below
+        // would then fail markdownReadFailed and the diarized rebuild would be
+        // lost (field-observed 2026-07-10). Follow the rename via the preserved
+        // `source_file:` key; `relocated(to:)` keeps the curated name by clearing
+        // the rename inputs, and the sidecar is re-pointed so a crash after this
+        // still leaves a recoverable pairing.
+        if let renamed = TranscriptFinalizer.relocateRenamedNote(from: handle.transcript.filePath) {
+            diagLog("[JOB \(id)] transcript renamed externally — following to \(renamed.lastPathComponent)")
+            handle.transcript = handle.transcript.relocated(to: renamed)
+            if let wavPath = handle.wavBufferPath ?? handle.micWavPath {
+                SessionSidecar.updateTranscriptPath(forWAV: wavPath, to: renamed)
+            }
+        }
+
         // Short-recording discard: a session at/under the user's threshold is almost
         // certainly a canceled or mis-started meeting. Drop it here — before any
         // expensive diarization — so nothing lands in the output folders. The

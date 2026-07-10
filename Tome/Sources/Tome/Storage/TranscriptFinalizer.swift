@@ -251,6 +251,54 @@ enum TranscriptFinalizer {
         }
     }
 
+    /// Re-locate a transcript note that an external tool renamed out from under a
+    /// pending job. The user's vault pipeline (WhisperCal) retitles inbox notes —
+    /// field-observed 2026-07-10, where it renamed a note MID-SESSION and the
+    /// finalize job then failed `markdownReadFailed`, losing the diarized rebuild.
+    /// The rename preserves Tome's frontmatter, so the note is findable by its
+    /// `source_file:` key, which still holds the filename Tome created (quoted or
+    /// not — the external YAML round-trip strips quotes). Returns the renamed
+    /// note's URL only when the original path is gone AND exactly one sibling
+    /// note claims it; nil (no relocation) otherwise.
+    static func relocateRenamedNote(from filePath: URL) -> URL? {
+        guard !FileManager.default.fileExists(atPath: filePath.path) else { return nil }
+        let originalName = filePath.lastPathComponent
+        let dir = filePath.deletingLastPathComponent()
+        guard let siblings = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        let escaped = NSRegularExpression.escapedPattern(for: originalName)
+        guard let regex = try? NSRegularExpression(pattern: #"(?m)^source_file:\s*"?"# + escaped + #""?\s*$"#) else {
+            return nil
+        }
+
+        var matches: [URL] = []
+        for url in siblings where url.pathExtension.lowercased() == "md" && !url.lastPathComponent.hasPrefix(".") {
+            // Frontmatter sits at the top of the note — 4 KB is plenty, and keeps
+            // the fallback scan cheap across a large vault folder. Lossy decoding
+            // is fine: a truncated trailing multi-byte char can't affect the match.
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            let data = (try? handle.read(upToCount: 4096)) ?? nil
+            try? handle.close()
+            guard let data else { continue }
+            let head = String(decoding: data, as: UTF8.self)
+            if regex.firstMatch(in: head, range: NSRange(head.startIndex..., in: head)) != nil {
+                matches.append(url)
+            }
+        }
+
+        switch matches.count {
+        case 1:
+            diagLog("[FINALIZER] relocated externally-renamed note: \(originalName) → \(matches[0].lastPathComponent)")
+            return matches[0]
+        case 0:
+            return nil
+        default:
+            diagLog("[FINALIZER] relocate: \(matches.count) notes claim source_file \(originalName) — ambiguous, not relocating")
+            return nil
+        }
+    }
+
     /// Matches a single-line YAML frontmatter scalar field by key, regardless of
     /// whether the value is quoted. External tools (e.g. WhisperCal) round-trip Tome's
     /// frontmatter through a real YAML serializer, which drops the quotes Tome writes
