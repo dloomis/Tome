@@ -338,10 +338,7 @@ struct ContentView: View {
                 if !Task.isCancelled { discardNotice = nil }
             }
             Task {
-                await NotificationPresenter.shared.postDiscard(
-                    durationSeconds: discard.durationSeconds,
-                    sessionType: discard.sessionType
-                )
+                await NotificationPresenter.shared.postDiscard(durationSeconds: discard.durationSeconds)
             }
         }
     }

@@ -393,14 +393,20 @@ final class TranscriptionEngine {
         }
     }
 
-    /// Fire-time decision + action for the system-audio startup gate. Rebuild only
-    /// when the engine is still running, the leg has NEVER delivered a sample this
-    /// session (`firstSampleTime == nil` — distinct from delivered-then-paused,
-    /// which is the watchdog's job), and the gate hasn't already fired.
+    /// Fire-time decision + action for the system-audio startup gate. Same pure
+    /// predicate as the mic gate: rebuild only when the engine is still running,
+    /// the leg has NEVER delivered a sample this session (`firstSampleTime == nil`
+    /// — distinct from delivered-then-paused, which is the watchdog's job), the
+    /// gate hasn't already fired, and no rebuild is already in flight.
     @MainActor
     private func handleSystemStartupGate() async {
-        guard isRunning, !sysStartupGateFired else { return }
-        guard systemCapture.firstSampleTime == nil else { return }  // delivered — no-op
+        guard Self.shouldForceStartupRestart(
+                  firstSampleAt: systemCapture.firstSampleTime,
+                  isRunning: isRunning,
+                  alreadyFired: sysStartupGateFired,
+                  rebuildInFlight: sysRebuildInFlight
+              )
+        else { return }
         sysStartupGateFired = true
         diagLog("[SYS-STARTGATE] no system-audio sample within 8s — rebuilding the system leg once")
         await restartSystemAudioLeg()
@@ -474,14 +480,15 @@ final class TranscriptionEngine {
         }
     }
 
-    /// Pure decision for the startup-delivery gate (below). Extracted so the
-    /// never-delivered-vs-delivered distinction and the strict one-shot rule can
-    /// be unit-tested without audio hardware. Force a single mic restart only
-    /// when the engine is still running, the tap has NEVER delivered a sample
-    /// this session (`firstSampleAt == nil` — distinct from delivered-then-quiet,
-    /// which is the watchdog's job), the gate hasn't already fired, and no
-    /// debounced config/HAL rebuild is already in flight (that rebuild re-opens
-    /// the mic on its own — don't stack a second restart on top).
+    /// Pure decision shared by BOTH startup-delivery gates (mic below, system in
+    /// `handleSystemStartupGate`). Extracted so the never-delivered-vs-delivered
+    /// distinction and the strict one-shot rule can be unit-tested without audio
+    /// hardware. Force a single restart only when the engine is still running,
+    /// the leg has NEVER delivered a sample this session (`firstSampleAt == nil`
+    /// — distinct from delivered-then-quiet, which is the watchdog's job), the
+    /// gate hasn't already fired, and no rebuild is already in flight (mic: the
+    /// debounced config/HAL rebuild; system: `sysRebuildInFlight`) — that rebuild
+    /// re-opens the leg on its own, don't stack a second restart on top.
     nonisolated static func shouldForceStartupRestart(
         firstSampleAt: Date?,
         isRunning: Bool,

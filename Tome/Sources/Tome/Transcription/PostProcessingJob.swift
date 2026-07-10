@@ -15,7 +15,9 @@ final class PostProcessingJob: Identifiable {
         case reTranscribing
         case finalizing
         case complete(URL)
-        case discarded(URL)
+        // Payload-less: the discarded transcript path points at a just-deleted
+        // file; the outcome (which callers do read) carries it for logging.
+        case discarded
         case failed(PostProcessingError)
         case cancelled
     }
@@ -290,7 +292,7 @@ final class PostProcessingJob: Identifiable {
         // A discarded session keeps nothing: delete every capture file including this
         // session's own rotations (retention is moot when the whole session is dropped).
         cleanupCaptureFiles(discarding: true)
-        phase = .discarded(path)
+        phase = .discarded
         return .discarded(path: path, durationSeconds: durationSeconds)
     }
 

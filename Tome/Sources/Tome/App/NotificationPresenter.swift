@@ -179,7 +179,8 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     /// A session stopped at/under the user's discard threshold and was removed instead
     /// of saved (see `AppSettings.discardShortMeetings`). Without this, the transcript
     /// silently vanishing from the vault reads as a bug — this confirms it was intended.
-    func postDiscard(durationSeconds: Int, sessionType: SessionType) async {
+    /// No sessionType parameter: only call captures are ever discarded.
+    func postDiscard(durationSeconds: Int) async {
         await requestAuthorizationIfNeeded()
         guard authorized else { return }
 

@@ -51,7 +51,6 @@ final class PostProcessingQueue {
 
     struct JobDiscard: Equatable, Sendable {
         let jobId: String
-        let sessionType: SessionType
         let durationSeconds: Int
         /// Occurrence stamp — same rationale as `JobFailure.failedAt`: a reused
         /// session id discarded twice must still read as a new event.
@@ -116,7 +115,6 @@ final class PostProcessingQueue {
                     diagLog("[QUEUE] Job \(job.id) discarded (short session, \(durationSeconds)s)")
                     lastDiscard = JobDiscard(
                         jobId: job.id,
-                        sessionType: job.handle.sessionType,
                         durationSeconds: durationSeconds,
                         discardedAt: Date()
                     )
