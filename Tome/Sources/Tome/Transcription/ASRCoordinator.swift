@@ -86,7 +86,7 @@ actor ASRCoordinator {
         do {
             let result = try await backend.transcribe(samples: samples, language: currentLanguage)
             await end(backend)
-            return result
+            return ASRTextSanitizer.sanitized(result)
         } catch {
             await end(backend)
             throw error
@@ -99,7 +99,7 @@ actor ASRCoordinator {
         do {
             let result = try await backend.transcribe(buffer: buffer, language: currentLanguage)
             await end(backend)
-            return result
+            return ASRTextSanitizer.sanitized(result)
         } catch {
             await end(backend)
             throw error
