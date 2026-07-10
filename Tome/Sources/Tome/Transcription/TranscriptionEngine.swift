@@ -413,9 +413,16 @@ final class TranscriptionEngine {
     /// won't fix. A rebuild that SUCCEEDS but stays silent is caught by the +5s
     /// grace check armed below (the watchdog's re-seeded clock is too slow — see
     /// `sysRebuildGraceTask`).
+    /// True between `restartSystemAudioLeg` entry and exit. With both the startup
+    /// gate and the watchdog able to trigger rebuilds, this stops a second rebuild
+    /// from tearing down the one still coming up.
+    private var sysRebuildInFlight = false
+
     @MainActor
     private func restartSystemAudioLeg() async {
-        guard isRunning, let vadManager else { return }
+        guard isRunning, let vadManager, !sysRebuildInFlight else { return }
+        sysRebuildInFlight = true
+        defer { sysRebuildInFlight = false }
         // Staleness token: `isRunning` is NOT sufficient across the awaits below —
         // stop() keeps it true until after its (up to 15s) transcriber drain, and a
         // stop-then-quick-restart flips it back to true for a DIFFERENT session.
@@ -854,6 +861,7 @@ final class TranscriptionEngine {
             var sysDetector = CaptureStallDetector(threshold: 15)
             var micDetector = CaptureStallDetector(threshold: 15)
             var stalledTicksSinceRestart = 0
+            var sysStalledTicksSinceRestart = 0
             var failedRecoveryAttempts = 0
             var lastTick = Date()
             while !Task.isCancelled {
@@ -879,14 +887,45 @@ final class TranscriptionEngine {
                 // alarms. A seeded clock must never CLEAR a stall (see
                 // CaptureStallDetector.evaluate(canResume:)).
                 let micTapSample = mic.lastSampleTime
+                // canResume mirrors the mic rule: `lastSampleTime` is SEEDED at
+                // bufferStream start, and a system-leg rebuild re-seeds it — only
+                // a real delivered buffer (firstSampleTime set) may clear the
+                // stall latch, or every rebuild would phantom-resume the alarm.
                 let sysEvent = systemLegActive
-                    ? sysDetector.evaluate(lastSample: sysCapture.lastSampleTime, now: now)
+                    ? sysDetector.evaluate(
+                        lastSample: sysCapture.lastSampleTime,
+                        now: now,
+                        canResume: sysCapture.firstSampleTime != nil
+                    )
                     : nil
                 let micEvent = micDetector.evaluate(
                     lastSample: micTapSample ?? mic.captureStartTime,
                     now: now,
                     canResume: micTapSample != nil
                 )
+
+                // System-leg auto-rebuild, same discipline as the mic side: one
+                // attempt when the stall first latches, then re-attempt every 3
+                // stalled ticks. The latch (not fresh events) drives the cadence —
+                // each rebuild re-seeds the sample clock, so fresh stall events
+                // only fire ~15s apart while the latch counts every tick.
+                var attemptSysRestart = false
+                if let sysEvent {
+                    switch sysEvent {
+                    case .stalled:
+                        attemptSysRestart = true
+                        sysStalledTicksSinceRestart = 0
+                    case .resumed:
+                        sysStalledTicksSinceRestart = 0
+                    }
+                } else if sysDetector.isStalled {
+                    sysStalledTicksSinceRestart += 1
+                    if sysStalledTicksSinceRestart >= 3 {
+                        sysStalledTicksSinceRestart = 0
+                        attemptSysRestart = true
+                        diagLog("[WATCHDOG] system audio still stalled — re-attempting rebuild")
+                    }
+                }
 
                 var attemptMicRestart = false
                 if let micEvent {
@@ -938,12 +977,19 @@ final class TranscriptionEngine {
                 // THIS session; Settings keeps the user's pin for next time.
                 let surrenderPin = attemptMicRestart && failedRecoveryAttempts >= 3
 
-                guard sysEvent != nil || micEvent != nil || attemptMicRestart else { continue }
+                guard sysEvent != nil || micEvent != nil || attemptMicRestart || attemptSysRestart else { continue }
                 let restart = attemptMicRestart
+                let sysRestart = attemptSysRestart
                 await MainActor.run {
                     guard let self, self.isRunning else { return }
                     if let sysEvent { self.handleStallEvent(sysEvent, leg: "System audio") }
                     if let micEvent { self.handleStallEvent(micEvent, leg: "Microphone") }
+                    if sysRestart {
+                        diagLog("[WATCHDOG] attempting automatic system-audio rebuild")
+                        // Async and generation-guarded; the stall banner from
+                        // handleStallEvent stays up until real samples resume.
+                        Task { await self.restartSystemAudioLeg() }
+                    }
                     if surrenderPin && self.userSelectedDeviceID != 0 {
                         diagLog("[WATCHDOG] pinned mic failed \(failedRecoveryAttempts) recovery cycles — following System Default for this session")
                         let msg = "The selected microphone kept failing — following the system default for this session. Your Settings choice is unchanged."
