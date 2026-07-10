@@ -48,11 +48,20 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         let bufferURL: URL
     }
 
-    /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
+    /// Start capturing system audio (every process on the display, mixed).
     /// `recordingContext` is required for the crash-recovery sidecar; when nil
     /// (legacy / test paths), falls back to the old `$TMPDIR`-based unnamed WAV.
+    ///
+    /// We deliberately do NOT scope the filter to the conferencing app. A per-app
+    /// `SCContentFilter(including: [app])` only captures audio the OS attributes to
+    /// that exact process — but modern conferencing apps (new Teams, browser-based
+    /// Meet, dial-in bridges) render call audio through a *separate* helper process,
+    /// so the per-app filter recorded pure silence while the mic kept working. That
+    /// left "Them" empty with no error and no fallback (the fallback only fired when
+    /// the bundle ID wasn't found at all — a matched-but-silent app never hit it).
+    /// Field-observed on a KSPIL6 standup, 2026-07-10. Capturing the whole display's
+    /// audio is what the reliable sessions were already doing (`source_app: Call`).
     func bufferStream(
-        appBundleID: String? = nil,
         recordingContext: SessionRecordingContext? = nil
     ) async throws -> CaptureStreams {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -61,18 +70,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             throw CaptureError.noDisplay
         }
 
-        // Build content filter — per-app if possible, otherwise all system audio
-        let filter: SCContentFilter
-        if let bundleID = appBundleID,
-           let matchedApp = content.applications.first(where: { $0.bundleIdentifier == bundleID }) {
-            diagLog("[SYS-FILTER] Per-app filter: \(bundleID)")
-            filter = SCContentFilter(display: display, including: [matchedApp], exceptingWindows: [])
-        } else {
-            if let bundleID = appBundleID {
-                diagLog("[SYS-FILTER] App \(bundleID) not found in shareable content, falling back to all system audio")
-            }
-            filter = SCContentFilter(display: display, excludingWindows: [])
-        }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
 
         // Set up audio buffer file. With a recordingContext we write to a stable
         // location in Application Support so the WAV survives temp-dir purges and

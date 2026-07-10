@@ -557,10 +557,12 @@ struct ContentView: View {
 
         let sid = sessionId ?? SessionStore.generateSessionId()
 
-        // Determine output folder and app bundle ID based on session type
+        // Determine output folder and source-app label based on session type. The
+        // resolved conferencing app only labels the note (`source_app`) — system
+        // audio is captured display-wide, not scoped to that app's process (see
+        // SystemAudioCapture.bufferStream), so no bundle ID flows to the engine.
         let outputPath: String
         let sourceApp: String
-        var appBundleID: String?
         var resolvedAppName: String?
 
         switch type {
@@ -570,7 +572,6 @@ struct ContentView: View {
                let bundleID = frontApp.bundleIdentifier,
                let appName = conferencingAppName(bundleID) {
                 sourceApp = appName
-                appBundleID = bundleID
                 resolvedAppName = appName
             } else {
                 sourceApp = "Call"
@@ -650,7 +651,6 @@ struct ContentView: View {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    appBundleID: appBundleID,
                     recordingContext: recordingContext
                 )
             } else {
