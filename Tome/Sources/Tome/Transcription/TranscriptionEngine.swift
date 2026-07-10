@@ -332,6 +332,13 @@ final class TranscriptionEngine {
     private var sysStartupGateTask: Task<Void, Never>?
     private var sysStartupGateFired = false
 
+    /// One-shot grace check armed after each successful system-leg rebuild. A
+    /// rebuild re-seeds the stall watchdog's clock (`bufferStream` seeds
+    /// `_lastSampleTime` at start), so a rebuilt-but-still-silent leg wouldn't
+    /// trip the 15s watchdog until ~15s AFTER the rebuild — this alarms directly
+    /// at +5s instead. Cancelled in `stop()`.
+    private var sysRebuildGraceTask: Task<Void, Never>?
+
     /// The current session's recording context, retained so the system-audio
     /// startup gate can rebuild the leg (it needs the same sidecar/WAV identity)
     /// without ContentView re-plumbing it. Set at `start()`, cleared at `stop()`.
@@ -373,8 +380,10 @@ final class TranscriptionEngine {
     /// `armStartupDeliveryGate` (the mic side) but for the SCStream leg: if no
     /// sample arrives within the window, rebuild the leg ONCE. The window is longer
     /// than the mic's 3s because ScreenCaptureKit's first-sample latency is higher
-    /// (shareable-content query + stream negotiation), and still well inside the
-    /// 15s stall watchdog that owns the persistent-failure alarm.
+    /// (shareable-content query + stream negotiation). Timeline note: the rebuild
+    /// re-seeds the stall watchdog's clock, so the watchdog alone wouldn't alarm on
+    /// a rebuilt-but-still-silent leg until ~15s post-rebuild — the +5s grace check
+    /// armed by `restartSystemAudioLeg` owns that alarm instead.
     private func armSystemStartupDeliveryGate() {
         sysStartupGateTask?.cancel()
         sysStartupGateTask = Task { [weak self] in
@@ -398,11 +407,12 @@ final class TranscriptionEngine {
     }
 
     /// Tear down and re-establish the system-audio leg on the current session.
-    /// Used only by the startup gate. Reuses the retained recording context so the
-    /// rebuilt WAV keeps the same session identity/path. If the rebuild itself
-    /// fails to come up, surface it — a persistent zero-delivery is a
-    /// permission/routing problem a further retry won't fix, and the 15s stall
-    /// watchdog remains the backstop for a rebuilt-but-still-silent leg.
+    /// Reuses the retained recording context so the rebuilt WAV keeps the same
+    /// session identity/path. If the rebuild itself fails to come up, surface it —
+    /// a persistent zero-delivery is a permission/routing problem a further retry
+    /// won't fix. A rebuild that SUCCEEDS but stays silent is caught by the +5s
+    /// grace check armed below (the watchdog's re-seeded clock is too slow — see
+    /// `sysRebuildGraceTask`).
     @MainActor
     private func restartSystemAudioLeg() async {
         guard isRunning, let vadManager else { return }
@@ -427,11 +437,32 @@ final class TranscriptionEngine {
             currentBufferURL = streams.bufferURL
             spinUpSystemTranscription(stream: streams.systemAudio, vadManager: vadManager)
             diagLog("[SYS-STARTGATE] system leg rebuilt")
+            armSystemRebuildGraceCheck(generation: generation)
         } catch {
             guard generation == sessionGeneration, isRunning else { return }
             let msg = "System audio isn't being captured — recording mic only."
             diagLog("[SYS-STARTGATE] rebuild failed: \(error.localizedDescription)")
             lastError = msg
+            Task { await NotificationPresenter.shared.postCaptureStall(leg: "System audio", detail: msg) }
+        }
+    }
+
+    /// Arm the +5s post-rebuild grace check: if the just-rebuilt system leg never
+    /// delivers a first sample, alarm directly with the same message/notification
+    /// as a failed rebuild. `firstSampleTime` was reset by the rebuild's
+    /// `systemCapture.stop()`, so nil here means the NEW stream stayed silent —
+    /// distinct from delivered-then-paused (still the watchdog's job). Respects the
+    /// session-generation guard so a stop or stop-then-restart makes it a no-op.
+    private func armSystemRebuildGraceCheck(generation: Int) {
+        sysRebuildGraceTask?.cancel()
+        sysRebuildGraceTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration, self.isRunning else { return }
+            guard self.systemCapture.firstSampleTime == nil else { return }  // delivered — healthy
+            let msg = "System audio isn't being captured — recording mic only."
+            diagLog("[SYS-STARTGATE] rebuilt system leg still silent after 5s — alerting")
+            self.lastError = msg
             Task { await NotificationPresenter.shared.postCaptureStall(leg: "System audio", detail: msg) }
         }
     }
@@ -738,6 +769,8 @@ final class TranscriptionEngine {
         startupGateTask = nil
         sysStartupGateTask?.cancel()
         sysStartupGateTask = nil
+        sysRebuildGraceTask?.cancel()
+        sysRebuildGraceTask = nil
         activeRecordingContext = nil
         micRebuildTask?.cancel()
         micRebuildTask = nil
