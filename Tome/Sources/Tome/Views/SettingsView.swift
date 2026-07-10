@@ -5,6 +5,7 @@ import Sparkle
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     var updater: SPUUpdater
+    let services: AppServices
 
     var body: some View {
         TabView {
@@ -12,7 +13,7 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
             AudioTab(settings: settings)
                 .tabItem { Label("Audio", systemImage: "mic.fill") }
-            TranscriptionTab(settings: settings)
+            TranscriptionTab(settings: settings, services: services)
                 .tabItem { Label("Transcription", systemImage: "waveform") }
             OutputTab(settings: settings)
                 .tabItem { Label("Output", systemImage: "folder.fill") }
@@ -142,9 +143,37 @@ private struct AudioTab: View {
 
 private struct TranscriptionTab: View {
     @Bindable var settings: AppSettings
+    let services: AppServices
 
     var body: some View {
         Form {
+            Section("Model") {
+                Picker(selection: $settings.transcriberModel) {
+                    ForEach(TranscriberModel.allCases, id: \.self) { model in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.displayName)
+                                .font(.system(size: 12, weight: .medium))
+                            Text(rowSubtitle(for: model))
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(model)
+                    }
+                } label: {
+                    Text("Model").font(.system(size: 12, weight: .medium))
+                }
+                .pickerStyle(.radioGroup)
+                .disabled(modelChangeLocked)
+
+                if modelChangeLocked {
+                    Text("Model changes are disabled while recording or processing.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
+                modelStatusLine
+            }
+
             Section("Language") {
                 // Read-only for now — locale switching isn't wired up yet, so show
                 // the active value rather than letting it be edited into a no-op.
@@ -182,6 +211,74 @@ private struct TranscriptionTab: View {
             }
         }
         .formStyle(.grouped)
+        // Provision from Settings too, so a model change still takes effect when
+        // the main window is closed (app alive via MenuBarExtra) and ContentView's
+        // onChange isn't live (audit F-4). ContentView.onChange(of:
+        // settings.transcriberModel) mirrors this; provision() is idempotent
+        // (in-flight/serving guards) so a duplicate call from the live window is a
+        // no-op.
+        .onChange(of: settings.transcriberModel) { _, model in
+            services.modelProvisioner.provision(model)
+        }
+    }
+
+    /// Spec §4a: no swap may land mid-recording, mid-post-processing, or
+    /// mid-recovery — a job re-transcribed by two models is a quality bug.
+    /// `isSessionPending` closes the start/stop transition windows that
+    /// `isRecording` misses (audit F-2).
+    private var modelChangeLocked: Bool {
+        services.isRecording
+            || services.postProcessingQueue.isAnyJobRunning
+            || services.isRecovering
+            || services.isSessionPending
+    }
+
+    /// Per-row install state (spec §6): each row describes ITSELF; the
+    /// status line below describes the selected model's provisioning.
+    private func rowSubtitle(for model: TranscriberModel) -> String {
+        let installState = model.isInstalled
+            ? "Downloaded ✓"
+            : "Not downloaded (\(model.approxDownloadSize))"
+        return "\(model.pickerSubtitle) · \(installState)"
+    }
+
+    @ViewBuilder private var modelStatusLine: some View {
+        let provisioner = services.modelProvisioner
+        switch provisioner.activity {
+        case .downloading(_, let progress):
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(progress.map { "Downloading… \(Int($0 * 100))%" } ?? "Downloading…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        case .loading:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Loading model…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        case .none:
+            if let failure = provisioner.lastFailure {
+                HStack(spacing: 8) {
+                    Text("\(failure.model.displayName): \(failure.message)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.recordRed)
+                    Button("Retry") { provisioner.retry() }
+                        .font(.system(size: 11))
+                        .disabled(modelChangeLocked)
+                }
+            } else if provisioner.servingModel == settings.transcriberModel {
+                Text("Active ✓")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Loading model…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

@@ -101,6 +101,73 @@ final class MicCapture: @unchecked Sendable {
         }
     }
 
+    /// HAL property listener registered directly on the RESOLVED capture device
+    /// (not the system object) so we synthesize the missing notification in the
+    /// AirPods cold-start bug: `engine.start()` succeeds against the pre-switch
+    /// A2DP 48 kHz format, the profile then flips to HFP 24 kHz, and the tap
+    /// delivers nothing — with NO error and (field-observed) NO
+    /// AVAudioEngineConfigurationChange. Listening for the device's own
+    /// `NominalSampleRate` / `StreamConfiguration` changes catches that flip and
+    /// feeds the SAME debounced rebuild path the engine notification would.
+    /// Stored so we can remove it in `stop()` and before re-registering on a
+    /// rebuild (bufferStream is re-entered on rebuild). Mirrors the
+    /// default-device-listener add/remove pattern in TranscriptionEngine. Held as
+    /// a plain property (not a lock) because — like the rest of this class's
+    /// mutable state — it is only touched from the main actor (register in
+    /// `bufferStream`, remove in `stop()`), and `AudioObjectPropertyListenerBlock`
+    /// is non-Sendable so it can't cross a lock's `@Sendable` closure boundary.
+    private var _halListener: (block: AudioObjectPropertyListenerBlock, deviceID: AudioDeviceID)?
+
+    /// The property selectors we watch on the resolved device. NominalSampleRate
+    /// is the A2DP↔HFP rate flip itself (48 k↔24 k); StreamConfiguration covers a
+    /// channel-count change on the same flip (stereo A2DP → multi-ch HFP).
+    private static let halWatchedAddresses: [AudioObjectPropertyAddress] = [
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        ),
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        ),
+    ]
+
+    private func removeHALListener() {
+        guard let (block, deviceID) = _halListener else { return }
+        for var address in Self.halWatchedAddresses {
+            AudioObjectRemovePropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
+        }
+        _halListener = nil
+    }
+
+    /// Register the HAL fast-path listener on `deviceID`. Idempotent: removes any
+    /// prior registration first (bufferStream re-enters on rebuild). The handler
+    /// deliberately routes through `onConfigurationChange` — the SAME debounced
+    /// `scheduleMicRebuild` path — so its ground-truth gate (skip if a tap
+    /// delivered within 2s), 1.2s debounce, and rebuild-storm cap all apply
+    /// unchanged. NOTE: our own rebuild changes the rate (48 k→24 k) and WILL
+    /// re-fire this listener; that echo is absorbed by the ground-truth gate (the
+    /// tap is now delivering) plus the debounce — no extra suppression needed here.
+    private func installHALListener(for deviceID: AudioDeviceID) {
+        removeHALListener()
+        let block: AudioObjectPropertyListenerBlock = { [weak self] count, addresses in
+            let selector = count > 0 ? addresses.pointee.mSelector : nil
+            diagLog("[MIC-HAL] device \(deviceID) property change (selector \(selector.map { String(fourCC: $0) } ?? "?")) — synthesizing config-change")
+            // Read the callback live (like the engine-config observer) so it
+            // tracks any reassignment; invoke the SAME debounced rebuild path.
+            self?.onConfigurationChange?()
+        }
+        for var address in Self.halWatchedAddresses {
+            let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
+            if status != noErr {
+                diagLog("[MIC-HAL] add listener (selector \(String(fourCC: address.mSelector))) failed: OSStatus \(status)")
+            }
+        }
+        _halListener = (block: block, deviceID: deviceID)
+    }
+
     private func installConfigObserver(for engine: AVAudioEngine) {
         removeConfigObserver()
         let callback = { [weak self] in self?.onConfigurationChange?() }
@@ -109,7 +176,14 @@ final class MicCapture: @unchecked Sendable {
             object: engine,
             queue: nil
         ) { _ in
-            diagLog("[MIC-CONFIG] AVAudioEngineConfigurationChange — engine stopped by a route/graph change")
+            // UNCONDITIONAL, first line, before any debounce/gating downstream:
+            // future logs must settle whether macOS actually posts this in the
+            // AirPods cold-start scenario (the diagnosed bug: it appears never to
+            // fire, or fires before this observer is attached — installed AFTER
+            // engine.start() below). If [MIC-CONFIG] is absent from a silent
+            // cold-start log, the HAL fast path is the only notification we get.
+            diagLog("[MIC-CONFIG] AVAudioEngineConfigurationChange received")
+            diagLog("[MIC-CONFIG] engine stopped by a route/graph change")
             callback()
         }
         _configObserver.withLock { $0 = token }
@@ -135,6 +209,10 @@ final class MicCapture: @unchecked Sendable {
             // restart loop that hammers the HAL (which then starts refusing
             // device binds with 'nope').
             self.removeConfigObserver()
+            // Same idempotency for the HAL fast-path listener: bufferStream is
+            // re-entered on every rebuild, so drop any prior device's listener
+            // before we (re)register below.
+            self.removeHALListener()
 
             // Fresh engine per capture — see the `engine` property comment. Tear the
             // old one down first so its HAL unit releases the previous device.
@@ -181,7 +259,8 @@ final class MicCapture: @unchecked Sendable {
                     &devID,
                     UInt32(MemoryLayout<AudioDeviceID>.size)
                 )
-                diagLog("[MIC-2] setInputDevice status=\(status) (0=ok)")
+                let name = Self.deviceName(for: id) ?? "?"
+                diagLog("[MIC-2] setInputDevice device \(id) \"\(name)\" status=\(status) (0=ok)")
                 // Surface a real failure to the UI — historically the silent fallback
                 // to "system default" hid disconnected-USB-mic cases entirely.
                 guard status == noErr else {
@@ -192,7 +271,9 @@ final class MicCapture: @unchecked Sendable {
                     return
                 }
             } else {
-                diagLog("[MIC-2] no deviceID, using system default")
+                let defID = Self.defaultInputDeviceID()
+                let name = defID.flatMap { Self.deviceName(for: $0) } ?? "?"
+                diagLog("[MIC-2] no deviceID, using system default device \(String(describing: defID)) \"\(name)\"")
             }
 
             let inputNode = self.engine.inputNode
@@ -348,6 +429,19 @@ final class MicCapture: @unchecked Sendable {
 
             diagLog("[MIC-5] tap installed, preparing engine...")
 
+            // HAL fast path: register the device-property listener BEFORE
+            // engine.start() so the A2DP→HFP rate flip is caught the moment it
+            // happens — including if it lands DURING or immediately after start,
+            // the exact race the engine notification misses. Resolve the device
+            // the same way the audio unit did: an explicit deviceID, else the
+            // system default.
+            let resolvedDeviceID = deviceID ?? Self.defaultInputDeviceID()
+            if let resolvedDeviceID {
+                self.installHALListener(for: resolvedDeviceID)
+            } else {
+                diagLog("[MIC-HAL] no resolvable device — skipping HAL fast-path listener")
+            }
+
             var startError: Error?
             let startException = TomeCatchObjCException {
                 do {
@@ -370,6 +464,7 @@ final class MicCapture: @unchecked Sendable {
                 let msg = "Mic failed: \(startException ?? startError!.localizedDescription)"
                 diagLog("[MIC-8-FAIL] \(msg)")
                 errorHolder.value = msg
+                self.removeHALListener()
                 inputNode.removeTap(onBus: 0)
                 self._retentionWriter.withLock { state in
                     state?.writer.close()
@@ -382,6 +477,7 @@ final class MicCapture: @unchecked Sendable {
 
     func stop() {
         removeConfigObserver()
+        removeHALListener()
         let teardownException = TomeCatchObjCException {
             self.engine.inputNode.removeTap(onBus: 0)
             self.engine.stop()
@@ -653,6 +749,22 @@ final class MicCapture: @unchecked Sendable {
         return result
     }
 
+    /// Human-readable name for a resolved capture device, via CoreAudio's
+    /// `kAudioObjectPropertyName` (CFString). Used only for diagnostics — it lets
+    /// a silent cold-start log say `device 157 "Nic's AirPods Pro"` so the failing
+    /// device is identifiable after the fact. Mirrors `deviceUID`'s call style.
+    static func deviceName(for deviceID: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name)
+        return status == noErr ? name as String : nil
+    }
+
     static func deviceUID(for deviceID: AudioDeviceID) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,
@@ -681,6 +793,24 @@ final class MicCapture: @unchecked Sendable {
             &deviceID
         )
         return status == noErr ? deviceID : nil
+    }
+}
+
+private extension String {
+    /// Render a CoreAudio four-char-code selector as its ASCII mnemonic (e.g.
+    /// `nsrt`, `slay`) for diagnostic logs; falls back to the raw number.
+    init(fourCC: FourCharCode) {
+        let bytes = [
+            UInt8((fourCC >> 24) & 0xFF),
+            UInt8((fourCC >> 16) & 0xFF),
+            UInt8((fourCC >> 8) & 0xFF),
+            UInt8(fourCC & 0xFF),
+        ]
+        if bytes.allSatisfy({ (0x20...0x7E).contains($0) }) {
+            self = String(bytes: bytes, encoding: .ascii) ?? "\(fourCC)"
+        } else {
+            self = "\(fourCC)"
+        }
     }
 }
 

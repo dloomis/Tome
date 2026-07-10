@@ -43,6 +43,17 @@ let package = Package(
             ],
             path: "Sources/VoiceprintAudit"
         ),
+        // ASR load-test harness comparing Parakeet vs Whisper latency (see
+        // docs/superpowers/specs/2026-07-08-*.md §8). Not part of the app;
+        // never run in CI (downloads GBs of models, needs ANE).
+        .executableTarget(
+            name: "ASRBench",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
+            ],
+            path: "Sources/ASRBench"
+        ),
         // Regression tests. SwiftPM tests the executable target directly (no
         // library split needed): everything file-based — storage, finalization,
         // recovery sidecars, WAV writing — is exercised against temp directories.

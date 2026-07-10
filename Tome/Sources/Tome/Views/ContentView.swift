@@ -100,7 +100,9 @@ struct ContentView: View {
                 silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
                 silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
-                errorMessage: transcriptionEngine?.lastError,
+                errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
+                modelStatus: modelStatusText,
+                canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession,
@@ -137,6 +139,12 @@ struct ContentView: View {
             let language = settings.transcriptionLanguage
             Task { await services.asrCoordinator.setLanguage(language) }
         }
+        .onChange(of: settings.transcriberModel) { _, model in
+            // Mirrored by SettingsView.TranscriptionTab's onChange so a change
+            // still provisions when this window is closed (F-4). provision() is
+            // idempotent, so the duplicate call when both are live is a no-op.
+            services.modelProvisioner.provision(model)
+        }
         .task {
             if !hasCompletedOnboarding {
                 showOnboarding = true
@@ -149,6 +157,11 @@ struct ContentView: View {
             }
             guard let engine = transcriptionEngine else { return }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
+
+            // Kick provisioning of the selected model before anything that
+            // needs ASR (notably the orphan scan at the end of this task,
+            // which awaits the provisioner settling).
+            services.modelProvisioner.provision(settings.transcriberModel)
 
             // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
             // so a device chosen last session (AirPods) may be absent — or worse,
@@ -181,6 +194,7 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
+                canStartRecording: { services.modelProvisioner.canStartRecording },
                 onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
@@ -461,6 +475,38 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// Main-screen provisioning banner (spec §7). Display-uppercased here;
+    /// Settings shows the sentence-case versions.
+    private var modelStatusText: String? {
+        let provisioner = services.modelProvisioner
+        switch provisioner.activity {
+        case .downloading(_, let progress):
+            if let progress { return "DOWNLOADING MODEL… \(Int(progress * 100))%" }
+            return "DOWNLOADING MODEL…"
+        case .loading:
+            return "LOADING MODEL…"
+        case .none:
+            if provisioner.servingModel == nil, provisioner.lastFailure != nil {
+                return "MODEL DOWNLOAD FAILED — retry in Settings ▸ Transcription"
+            }
+            if provisioner.servingModel != settings.transcriberModel {
+                // Transient pre-kick / selection-write→onChange frames.
+                return "LOADING MODEL…"
+            }
+            return nil
+        }
+    }
+
+    /// Post-revert failure line (spec §7): shown while a failure is recorded
+    /// AND something is serving (the F3 no-fallback case renders through
+    /// modelStatusText instead).
+    private var modelFailureText: String? {
+        let provisioner = services.modelProvisioner
+        guard let failure = provisioner.lastFailure,
+              let serving = provisioner.servingModel else { return nil }
+        return "\(failure.model.displayName) failed — reverted to \(serving.displayName): \(failure.message)"
+    }
+
     /// The detected meeting to actually offer, after the global toggle, the per-meeting
     /// dismissal, and the not-recording gate. Nil → Call Capture uses the default label.
     private var suggestedMeeting: DetectedMeeting? {
@@ -495,6 +541,18 @@ struct ContentView: View {
     }
 
     private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
+        // UI gating makes this unreachable from the buttons; API starts and
+        // races land here. Surfaced via the same error row the UI already has.
+        guard services.modelProvisioner.canStartRecording else {
+            transcriptionEngine?.lastError = "Transcription model not ready — check Settings ▸ Transcription"
+            return
+        }
+        // Lock model changes across the whole press → recording-live window —
+        // it spans the awaits below AND `ensureMicrophonePermission()`'s TCC
+        // prompt (minutes on first run), which `isRecording` doesn't cover
+        // until the engine flips live. Cleared on EVERY exit of the Task below
+        // (success, rollback, early return). Audit F-2.
+        services.isSessionPending = true
         transcriptStore.clear()
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
@@ -571,6 +629,7 @@ struct ContentView: View {
                 apiServer.sessionDidStop(id: sid)
                 apiServer.sessionDidComplete(id: sid)
                 transcriptionEngine?.lastError = error.localizedDescription
+                services.isSessionPending = false   // start aborted (F-2)
                 return
             }
 
@@ -620,6 +679,10 @@ struct ContentView: View {
             if transcriptionEngine?.isRunning != true {
                 await rollbackFailedStart(sessionId: sid)
             }
+            // Start flow finished: either the engine is live (isRecording now
+            // holds the lock) or we rolled back to idle. Release the pending
+            // lock either way (F-2).
+            services.isSessionPending = false
         }
     }
 
@@ -674,6 +737,11 @@ struct ContentView: View {
             diagLog("[STOP] stopSession ignored — no active session")
             return
         }
+        // Lock model changes across stop → job enqueued: `engine.stop()` flips
+        // isRunning false several awaits before `enqueue`, and isAnyJobRunning
+        // isn't true until the job actually starts, so this window is otherwise
+        // unlocked. Cleared once the job is enqueued (or on early exit). F-2.
+        services.isSessionPending = true
         let wasCallCapture = activeSessionType == .callCapture
         let sessionId = currentSessionId ?? SessionStore.generateSessionId()
         let sourceApp = currentSourceApp ?? "Call"
@@ -712,6 +780,7 @@ struct ContentView: View {
             guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
                 transcriptionEngine?.assetStatus = "Ready"
                 apiServer.sessionDidComplete(id: sessionId)
+                services.isSessionPending = false   // nothing to enqueue (F-2)
                 return
             }
 
@@ -738,6 +807,9 @@ struct ContentView: View {
 
             services.postProcessingQueue.enqueue(job)
             transcriptionEngine?.assetStatus = "Ready"
+            // Job now running (isAnyJobRunning holds the lock); release the
+            // stop-window pending lock (F-2).
+            services.isSessionPending = false
         }
     }
 
@@ -811,6 +883,15 @@ struct ContentView: View {
 
     @MainActor
     private func recoverOrphans(_ orphans: [OrphanScanner.Orphan]) async {
+        // Wait for provisioning to settle BEFORE taking the recovery lock — the
+        // lock disables the picker AND Retry, the only affordances that could
+        // cancel/redirect the very download we'd otherwise wait on (audit F-3).
+        // No suspension point may sit between this returning and the flag below,
+        // or a cycle could start inside the gap.
+        await services.modelProvisioner.awaitSettled()
+        services.isRecovering = true
+        defer { services.isRecovering = false }
+
         let total = orphans.count
         var recovered = 0
         var failed: [String] = []
@@ -973,6 +1054,14 @@ struct ContentView: View {
         }
 
         Task { [preserveYou] in
+            // Settle provisioning BEFORE the recovery lock (F-3): the lock
+            // disables the picker + Retry, the only ways to cancel/redirect a
+            // download we'd otherwise be waiting on. No suspension between the
+            // settle returning and taking the flag.
+            await services.modelProvisioner.awaitSettled()
+            services.isRecovering = true
+            defer { services.isRecovering = false }
+
             let result: Result<URL, Error>
             do {
                 let saved = try await Recovery.run(

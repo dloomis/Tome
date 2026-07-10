@@ -106,22 +106,27 @@ final class TranscriptionEngine {
         guard await ensureMicrophonePermission() else { return }
 
         isRunning = true
+        // Fresh session — reset the startup-delivery gate's one-shot latch and
+        // clear any stale handle from a prior start().
+        startupGateFired = false
+        startupGateTask?.cancel()
+        startupGateTask = nil
         beginLiveActivity()
 
-        // 1. Load FluidAudio models
-        assetStatus = "Loading ASR model (~600MB first run)..."
-        diagLog("[ENGINE-1] loading FluidAudio ASR models...")
+        // 1. Verify ASR readiness. Model download/load lives in
+        //    ModelProvisioner; the UI gates recording on readiness, so this
+        //    is a formality — but API starts and races land here too.
         do {
-            try await asrCoordinator.initialize()
-            assetStatus = "Initializing ASR..."
-
+            guard await asrCoordinator.isReady else {
+                throw ASRCoordinatorError.notInitialized
+            }
             assetStatus = "Loading VAD model..."
             diagLog("[ENGINE-1b] loading VAD model...")
             let vad = try await VadManager()
             self.vadManager = vad
 
             assetStatus = "Models ready"
-            diagLog("[ENGINE-2] FluidAudio models loaded")
+            diagLog("[ENGINE-2] models ready")
         } catch {
             let msg = "Failed to load models: \(error.localizedDescription)"
             diagLog("[ENGINE-2-FAIL] \(msg)")
@@ -193,6 +198,15 @@ final class TranscriptionEngine {
             endLiveActivity()
             return
         }
+
+        // Startup-delivery gate: the mic engine is up, but on AirPods the first
+        // engine open can race the A2DP→HFP profile flip — start() succeeds
+        // against the stale 48 kHz format, the profile then flips, and the tap
+        // delivers nothing with no error and no config-change (the HAL fast path
+        // above is the primary backstop; this is belt-and-suspenders for when the
+        // flip races even that). Force ONE mic restart at 3s if no sample ever
+        // arrives, collapsing the 15s watchdog wait.
+        armStartupDeliveryGate()
 
         // 3. Start system audio capture. Skipped for mic-only sessions (voice memos /
         //    in-person meetings) — there the mic is the sole source and diarization runs
@@ -292,11 +306,82 @@ final class TranscriptionEngine {
         // detection entirely.
         startCaptureWatchdog(systemLegActive: sysStreams != nil)
 
-        assetStatus = "Transcribing (Parakeet-TDT v3)"
+        let modelName = await asrCoordinator.activeModel?.displayName ?? "ASR"
+        assetStatus = "Transcribing (\(modelName))"
         diagLog("[ENGINE-6] all transcription tasks started")
 
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
+    }
+
+    /// One-shot handle for the startup-delivery gate armed in `start()`. See
+    /// `armStartupDeliveryGate`. Cancelled in `stop()`.
+    private var startupGateTask: Task<Void, Never>?
+
+    /// Set once the startup-delivery gate has forced its single restart, so it
+    /// never fires twice within one `start()` even across a `restartMic` that
+    /// re-arms nothing. Reset at the top of each `start()`.
+    private var startupGateFired = false
+
+    /// Pure decision for the startup-delivery gate (below). Extracted so the
+    /// never-delivered-vs-delivered distinction and the strict one-shot rule can
+    /// be unit-tested without audio hardware. Force a single mic restart only
+    /// when the engine is still running, the tap has NEVER delivered a sample
+    /// this session (`firstSampleAt == nil` — distinct from delivered-then-quiet,
+    /// which is the watchdog's job), the gate hasn't already fired, and no
+    /// debounced config/HAL rebuild is already in flight (that rebuild re-opens
+    /// the mic on its own — don't stack a second restart on top).
+    nonisolated static func shouldForceStartupRestart(
+        firstSampleAt: Date?,
+        isRunning: Bool,
+        alreadyFired: Bool,
+        rebuildInFlight: Bool
+    ) -> Bool {
+        isRunning && firstSampleAt == nil && !alreadyFired && !rebuildInFlight
+    }
+
+    /// Arm the one-shot startup-delivery gate: a silent fast retry for the
+    /// AirPods cold-start silence bug. `bufferStream`'s HAL fast path is the
+    /// primary catch, but if the A2DP→HFP flip races even that (or macOS doesn't
+    /// post the HAL change for this particular mutation), only the 15s stall
+    /// watchdog would rescue it — 15–22s of lost audio every AirPods recording.
+    /// This collapses that to ~3s.
+    ///
+    /// Strictly one-shot per `start()`: if the forced restart doesn't help, the
+    /// watchdog remains the net; we do NOT loop. The never-delivered condition is
+    /// re-checked at FIRE time (not cancelled on delivery) so natural first
+    /// delivery just makes it a no-op — `firstSampleTime` stays nil only when the
+    /// tap truly never fired, distinct from delivered-then-quiet (the watchdog's
+    /// domain). This is a silent retry: NO user-facing stall notification, unlike
+    /// the watchdog's alarm.
+    private func armStartupDeliveryGate() {
+        startupGateTask?.cancel()
+        startupGateTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                // The rebuild-in-flight check is folded into the pure gate: a
+                // debounced config/HAL rebuild already pending will re-open the
+                // mic on its own — don't stack a second restart on top.
+                guard Self.shouldForceStartupRestart(
+                          firstSampleAt: self.micCapture.firstSampleTime,
+                          isRunning: self.isRunning,
+                          alreadyFired: self.startupGateFired,
+                          rebuildInFlight: self.micRebuildTask != nil
+                      )
+                else { return }
+
+                self.startupGateFired = true
+                diagLog("[MIC-STARTGATE] no first sample within 3s of start — forcing one mic restart")
+                // Same restart path the watchdog uses, WITHOUT the user-facing
+                // stall notification: this is a silent fast retry, not an alarm.
+                // `silent: true` also suppresses the bind-failure fallback's
+                // postCaptureStall/lastError — a failed silent retry leaves the
+                // rescue to the stall watchdog rather than alarming the user.
+                self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true, silent: true)
+            }
+        }
     }
 
     /// Timestamps of recent config-driven rebuilds — loop suppression window.
@@ -329,6 +414,27 @@ final class TranscriptionEngine {
                 return
             }
 
+            // Gate 1b — first-delivery grace: a tap we JUST (re)started that
+            // hasn't delivered yet reads as dead by the check above, so our own
+            // rebuild's HAL echo (the rate flip) can trigger a second rebuild —
+            // a bounded-but-janky 4-flip storm. Give any fresh bring-up 2s to
+            // first-deliver before we tear it down. This forecloses the echo
+            // oscillation structurally: a rebuild at T reseeds captureStartTime;
+            // the echo's config-change debounce expires ~T+1.3s < T+2.0s, so it
+            // lands here and is skipped; if the tap then delivers, done. The true
+            // never-delivers wedge is still rescued by the 3s startup gate (one-
+            // shot, silent) and ultimately the 15s watchdog, so suppressing
+            // rebuilds in the first 2s of a bring-up costs at most ~1-2s on the
+            // HAL fast path while making the oscillation impossible.
+            if self.micCapture.firstSampleTime == nil,
+               let started = self.micCapture.captureStartTime {
+                let age = Date().timeIntervalSince(started)
+                if age < 2.0 {
+                    diagLog("[ENGINE-MIC-REBUILD] skipped — capture just (re)started \(age)s ago, giving the tap time to first-deliver")
+                    return
+                }
+            }
+
             // Gate 2 — loop breaker: a rebuild whose replacement also dies re-fires
             // the notification; without a cap that storm hammers the HAL. After 4
             // rebuilds in 60s, stand down — the watchdog retries on its own cadence.
@@ -352,7 +458,11 @@ final class TranscriptionEngine {
     /// `updateSelection: false` marks an EMERGENCY rebind (fallback to default after
     /// a failed device bind): capture moves, but the user's intent is preserved so
     /// watchdog retries keep aiming at the chosen device until it's bindable again.
-    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false, updateSelection: Bool = true) {
+    /// `silent: true` marks a startup-gate fast retry: on bind failure it does NOT
+    /// post the user-facing stall notification or set `lastError` for this attempt
+    /// — the true never-delivers wedge is still owned by the stall watchdog. Any
+    /// recursive fallback restart inside a silent attempt stays silent.
+    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false, updateSelection: Bool = true, silent: Bool = false) {
         guard isRunning, let vadManager else { return }
 
         // Only update user selection when explicitly changed (not from OS listener,
@@ -391,13 +501,19 @@ final class TranscriptionEngine {
         // monitoring either way.
         if let micError = micCapture.captureError {
             let msg = "Mic restart failed: \(micError)"
-            lastError = msg
-            diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
-            Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
+            if silent {
+                // Startup-gate fast retry: no user-facing alarm for this attempt.
+                // If the mic truly never binds, the stall watchdog owns the rescue.
+                diagLog("[MIC-STARTGATE] silent restart failed to bind — leaving rescue to the stall watchdog")
+            } else {
+                lastError = msg
+                diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
+                Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
+            }
             if targetMicID != 0,
                let fallback = MicCapture.defaultInputDeviceID(), fallback != targetMicID {
                 diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback)) — user selection preserved")
-                restartMic(inputDeviceID: 0, force: true, updateSelection: false)
+                restartMic(inputDeviceID: 0, force: true, updateSelection: false, silent: silent)
             }
             return
         }
@@ -500,6 +616,8 @@ final class TranscriptionEngine {
     func stop() async {
         lastError = nil
         removeDefaultDeviceListener()
+        startupGateTask?.cancel()
+        startupGateTask = nil
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil

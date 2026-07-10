@@ -15,7 +15,7 @@
 
 ---
 
-Tome is a macOS app that captures meetings and voice memos, transcribes them locally with Parakeet-TDT v3 (via FluidAudio), and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home. Pair it with [WhisperCal](https://github.com/dloomis/WhisperCal), an Obsidian plugin that drives Tome straight from your calendar — one-click meeting notes, recording via Tome's local API, and an LLM pipeline for speaker tagging and summaries ([details below](#the-obsidian-side-whispercal)).
+Tome is a macOS app that captures meetings and voice memos, transcribes them locally with your choice of on-device model — Parakeet-TDT v3 (via FluidAudio, the default) or Whisper Large v3 Turbo (via WhisperKit) — and drops structured `.md` files straight into your Obsidian vault. Everything runs on-device. Nothing phones home. Pair it with [WhisperCal](https://github.com/dloomis/WhisperCal), an Obsidian plugin that drives Tome straight from your calendar — one-click meeting notes, recording via Tome's local API, and an LLM pipeline for speaker tagging and summaries ([details below](#the-obsidian-side-whispercal)).
 
 > **Origins:** Tome began as a fork of an open-source app by [Jason Craik](https://github.com/Gremble-io) (itself built on [OpenGranola](https://github.com/yazinsai/OpenGranola)). That project has since moved in a different direction under a new name ([Detto](https://github.com/Gremble-io/Tome)), so Tome is now an independent project — designed, built, and maintained here — and stays MIT-licensed. Full [credits](#credits) below.
 
@@ -50,7 +50,7 @@ That's the workflow Tome is built for. It started from an open-source foundation
 
 - **Plain markdown out.** YAML frontmatter, tags, timestamps. Your vault already knows what to do with it. No proprietary export, no copy-paste, no middleman.
 - **Built for the agent pipeline.** Tome is just the capture layer. You talk, it transcribes, your agent picks up the `.md` and does whatever you've wired it to do.
-- **Runs on your machine.** Parakeet-TDT v3 on Apple Silicon. No API keys, no accounts, no subscriptions, no data leaving the building.
+- **Runs on your machine.** Parakeet-TDT v3 or Whisper Large v3 Turbo on Apple Silicon. No API keys, no accounts, no subscriptions, no data leaving the building.
 
 ```
 speak → capture → vault → agent → knowledge base
@@ -60,7 +60,7 @@ Tome does the first three. Your agent does the rest — or install [WhisperCal](
 
 ## Features
 
-- **Local transcription** via Parakeet-TDT v3 ([FluidAudio](https://github.com/FluidInference/FluidAudio)) on Apple Silicon. Nothing hits the network.
+- **Local transcription** on Apple Silicon, nothing hits the network. Pick your model in Settings ▸ Transcription: **Parakeet-TDT v3** ([FluidAudio](https://github.com/FluidInference/FluidAudio), default, fastest) or **Whisper Large v3 Turbo** ([WhisperKit](https://github.com/argmaxinc/WhisperKit), higher accuracy, larger download, fetched lazily the first time you select it).
 - **Call Capture** grabs mic + system audio. Detects which conferencing app you're in (Teams, Zoom, Slack, etc.) and filters audio to just that app. Your Spotify and notification sounds stay out of the transcript.
 - **Meeting autodetection.** Before you record, Tome spots an active Teams or Google Meet meeting by reading on-screen window titles — over the Screen Recording permission it already holds, with no new prompt and no network — and offers the meeting's name as a one-tap title for the recording. It's a dismissible suggestion, on by default, with a global off-switch in Settings. See [`docs/meeting-detection.md`](docs/meeting-detection.md).
 - **Voice Memo** is mic only — for quick thoughts and verbal notes, but also **in-person meetings**: when more than one person is talking, post-session diarization splits the single mic stream into Speaker 1, Speaker 2, … just like a call. A solo memo stays one "You" block. Saves to a separate folder so it doesn't clutter your meeting transcripts.
@@ -82,8 +82,8 @@ Tome does the first three. Your agent does the rest — or install [WhisperCal](
 │  Microphone  │────▶│                  │     │               │
 └─────────────┘     │  Tome            │     │  Obsidian     │
                     │  ┌────────────┐  │────▶│  Vault        │
-┌─────────────┐     │  │ Parakeet   │  │     │  (.md files)  │
-│  System      │────▶│  │ TDT v3    │  │     │               │
+┌─────────────┐     │  │ On-device  │  │     │  (.md files)  │
+│  System      │────▶│  │ ASR model  │  │     │               │
 │  Audio       │     │  └────────────┘  │     └───────┬───────┘
 └─────────────┘     └──────────────────┘             │
                                                      ▼
@@ -97,7 +97,7 @@ Tome does the first three. Your agent does the rest — or install [WhisperCal](
 ```
 
 1. **Capture** picks up mic audio + system audio from a specific conferencing app via ScreenCaptureKit.
-2. **Transcribe** runs VAD to detect speech segments, then Parakeet transcribes locally.
+2. **Transcribe** runs VAD to detect speech segments, then your selected on-device model (Parakeet-TDT v3 or Whisper Large v3 Turbo) transcribes locally.
 3. **Diarize** splits the system audio into individual speakers after the session ends.
 4. **Write** drops structured `.md` with YAML frontmatter into your vault folder.
 5. **Agent picks up** whatever you've got downstream processes the transcript — [WhisperCal](https://github.com/dloomis/WhisperCal) is the purpose-built option (see [The Obsidian Side](#the-obsidian-side-whispercal)).

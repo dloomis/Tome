@@ -24,6 +24,7 @@ enum Recovery {
         case noStartTime
         case diarizationProducedNothing
         case bodyRewriteFailed(PostProcessingError)
+        case modelNotReady
 
         var errorDescription: String? {
             switch self {
@@ -39,6 +40,8 @@ enum Recovery {
                 return "Diarization returned no segments — WAV may be silent or too short"
             case .bodyRewriteFailed(let err):
                 return "Body rewrite failed: \(err)"
+            case .modelNotReady:
+                return "Transcription model not ready — check Settings ▸ Transcription"
             }
         }
     }
@@ -102,10 +105,13 @@ enum Recovery {
             filenameDateFormat: "yyyy-MM-dd HH-mm-ss"
         )
 
-        // Make sure FluidAudio's AsrManager is loaded before the re-transcribe step
-        // calls into it. If the app just launched and no recording has run, the
-        // models aren't loaded yet.
-        try await asr.initialize()
+        // Caller is responsible for waiting on the provisioner to settle
+        // BEFORE entering the recovery lock (`isRecovering`) — settling here
+        // would block on a download whose only cancel affordances the lock has
+        // already disabled (audit F-3). Defensive: if nothing is installed
+        // (fresh install, download failed), recovery can't run; orphans stay on
+        // disk for a later launch or File ▸ Recover.
+        guard await asr.isReady else { throw RecoveryError.modelNotReady }
 
         diagLog("[RECOVERY] diarizing \(wavURL.lastPathComponent), duration=\(Int(wav.durationSeconds))s, sessionStart=\(sessionStartTime)")
         guard let diar = await TranscriptionEngine.runDiarization(

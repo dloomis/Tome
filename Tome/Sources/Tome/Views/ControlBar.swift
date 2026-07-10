@@ -28,6 +28,13 @@ struct ControlBar: View {
     let silencePromptActive: Bool
     let statusMessage: String?
     let errorMessage: String?
+    /// Provisioning status ("DOWNLOADING MODEL… 42%") — rendered like
+    /// statusMessage but sourced from ModelProvisioner, NOT assetStatus
+    /// (the API string-matches assetStatus; provisioning must not leak in).
+    let modelStatus: String?
+    /// False while the selected model is downloading/loading/failed —
+    /// disables both record buttons (and thereby their ⌘R/⌘⇧R shortcuts).
+    let canStartRecording: Bool
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
     let onStop: () -> Void
@@ -52,6 +59,20 @@ struct ControlBar: View {
                         .tint(Color.accent1)
                     Text(status)
                         .font(.system(size: 11))
+                        .foregroundStyle(Color.fg2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 4)
+            }
+
+            if let modelStatus {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(Color.accent1)
+                    Text(modelStatus)
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Color.fg2)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -125,6 +146,8 @@ struct ControlBar: View {
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!canStartRecording)
+                    .opacity(canStartRecording ? 1 : 0.45)
 
                     Button(action: onStartVoiceMemo) {
                         HStack(spacing: 6) {
@@ -148,6 +171,8 @@ struct ControlBar: View {
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!canStartRecording)
+                    .opacity(canStartRecording ? 1 : 0.45)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
