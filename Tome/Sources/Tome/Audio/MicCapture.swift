@@ -94,6 +94,13 @@ final class MicCapture: @unchecked Sendable {
     /// Observer token for the current engine's configuration-change notification.
     private let _configObserver = OSAllocatedUnfairLock<NSObjectProtocol?>(uncheckedState: nil)
 
+    /// Continuation of the currently-live buffer stream. `stop()` FINISHES it so
+    /// the consuming `StreamingTranscriber` drains buffered audio and flushes the
+    /// in-progress utterance — before this existed the stream simply went quiet
+    /// and the engine had to cancel the consumer task, which poisoned the
+    /// stop-time ASR flush (cancelled tasks make FluidAudio/WhisperKit throw).
+    private let _streamContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
+
     private func removeConfigObserver() {
         _configObserver.withLock { token in
             if let token { NotificationCenter.default.removeObserver(token) }
@@ -199,6 +206,15 @@ final class MicCapture: @unchecked Sendable {
 
         return AsyncStream { continuation in
             errorHolder.value = nil
+
+            // Track the live continuation so `stop()` can finish the stream.
+            // Any predecessor was already finished by the `stop()` that precedes
+            // every re-entry here (finish is defensive — a second finish on an
+            // already-finished continuation is a no-op).
+            self._streamContinuation.withLock { existing in
+                existing?.finish()
+                existing = continuation
+            }
 
             diagLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
@@ -485,6 +501,11 @@ final class MicCapture: @unchecked Sendable {
         if let teardownException {
             diagLog("[MIC-STOP-WARN] engine teardown raised \(teardownException)")
         }
+        // The tap is gone (no more yields) — finish the stream so the consumer
+        // drains what's buffered and runs its end-of-stream flush. The engine's
+        // stop path awaits that drain; without the finish it would have to
+        // cancel, which drops the tail utterance.
+        _streamContinuation.withLock { $0?.finish(); $0 = nil }
         _audioLevel.value = 0
         _lastSampleTime.withLock { $0 = nil }
         _captureStartTime.withLock { $0 = nil }

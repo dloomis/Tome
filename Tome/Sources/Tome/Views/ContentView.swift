@@ -44,9 +44,9 @@ struct ContentView: View {
     /// Single-consumer channel that serializes utterance writes to the markdown
     /// transcript and the JSONL crash-recovery file. Prevents the two stores from
     /// drifting out of order when `handleNewUtterance` fires faster than the
-    /// individual Task closures can run.
-    @State private var utteranceContinuation: AsyncStream<UtteranceWrite>.Continuation?
-    @State private var utteranceWriterTask: Task<Void, Never>?
+    /// individual Task closures can run. `stopSession` awaits its `flush()`
+    /// barrier before closing the session files.
+    @State private var utteranceChannel: UtteranceWriteChannel?
 
     /// How many of `transcriptStore.utterances` have already been handed to the
     /// writer channel. `handleNewUtterance` drains everything past this cursor so a
@@ -55,12 +55,6 @@ struct ContentView: View {
     /// persists all of them — the old `.last`-only yield silently dropped the
     /// earlier line(s). Reset to 0 whenever the store is cleared for a new session.
     @State private var persistedUtteranceCount = 0
-
-    private struct UtteranceWrite: Sendable {
-        let speaker: Speaker
-        let text: String
-        let timestamp: Date
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -175,19 +169,11 @@ struct ContentView: View {
             }
 
             // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
-            if utteranceWriterTask == nil {
-                let (stream, cont) = AsyncStream.makeStream(of: UtteranceWrite.self)
-                utteranceContinuation = cont
-                let logger = services.transcriptLogger
-                let store = services.sessionStore
-                utteranceWriterTask = Task {
-                    defer { diagLog("[CHANNEL] utterance writer exited") }
-                    for await u in stream {
-                        let speakerName = u.speaker == .you ? "You" : "Them"
-                        await logger.append(speaker: speakerName, text: u.text, timestamp: u.timestamp)
-                        await store.appendRecord(SessionRecord(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
-                    }
-                }
+            if utteranceChannel == nil {
+                utteranceChannel = UtteranceWriteChannel(
+                    logger: services.transcriptLogger,
+                    store: services.sessionStore
+                )
             }
 
             apiServer.register(
@@ -700,6 +686,12 @@ struct ContentView: View {
         await transcriptionEngine?.stop()
         transcriptionEngine?.lastError = startFailureReason ?? "Couldn't start recording."
 
+        // Same drain-then-barrier as stopSession: if capture partially came up,
+        // whatever was transcribed must reach the files before they close (and
+        // the speakersDetected guard below relies on the logger having seen it).
+        handleNewUtterance()
+        await utteranceChannel?.flush()
+
         // Close the half-open transcript session and delete the empty note created
         // before the failed start. Guarded: only remove the note when no utterances
         // ever landed in it (speakersDetected is populated per-append) — if capture
@@ -776,6 +768,17 @@ struct ContentView: View {
             let wavWriteErrors = transcriptionEngine?.systemAudioWriteErrorCount ?? 0
 
             await transcriptionEngine?.stop()
+
+            // The engine drained the transcribers before returning, so every
+            // final utterance — including the one flushed at stop — is now in
+            // transcriptStore. But the write path to disk is still async:
+            // SwiftUI's .onChange may not have ticked, and the writer channel
+            // consumes in the background. Drain the cursor explicitly, then
+            // barrier the channel so the markdown + JSONL appends land BEFORE
+            // endSession() closes those files — an append after close is lost.
+            handleNewUtterance()
+            await utteranceChannel?.flush()
+
             await services.sessionStore.endSession()
             guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
                 transcriptionEngine?.assetStatus = "Ready"
@@ -1134,7 +1137,7 @@ struct ContentView: View {
         // `.last` lost the earlier line from both the markdown and JSONL files.
         for index in persistedUtteranceCount..<count {
             let u = transcriptStore.utterances[index]
-            utteranceContinuation?.yield(UtteranceWrite(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
+            utteranceChannel?.write(speaker: u.speaker, text: u.text, timestamp: u.timestamp)
         }
         persistedUtteranceCount = count
     }
