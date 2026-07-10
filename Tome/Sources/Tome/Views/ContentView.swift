@@ -31,6 +31,12 @@ struct ContentView: View {
     @State private var silencePromptActive = false
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
+    /// Set when a short session was discarded (`AppSettings.discardShortMeetings`).
+    /// In-app analogue of the save banner: the discard notification is skipped when
+    /// permission is denied, and a transcript silently vanishing from the vault is
+    /// exactly what this feature's messaging exists to prevent.
+    @State private var discardNotice: String?
+    @State private var discardDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
     /// Identity of the session currently being captured, carried through to the
     /// `PostProcessingJob` at stop time so the job can be tracked by session id.
@@ -74,9 +80,11 @@ struct ContentView: View {
                 )
             }
 
-            // Save banner
+            // Save banner (or the discard notice — never both; a discard writes nothing)
             if let url = savedFileURL, activeSessionType == nil {
                 saveBanner(url: url)
+            } else if let notice = discardNotice, activeSessionType == nil {
+                discardBanner(notice)
             }
 
             // Waveform ribbon
@@ -314,6 +322,25 @@ struct ContentView: View {
             }
             transcriptionEngine?.lastError = failure.message
         }
+        .onChange(of: services.postProcessingQueue.lastDiscard) { _, discard in
+            guard let discard else { return }
+            // A discarded session still "finished" — walk the API lifecycle out of
+            // `.transcribing` just like completion/failure, or /status would report a
+            // transcription that never ends.
+            apiServer.sessionDidComplete(id: discard.jobId)
+            // In-app signal FIRST, independent of notification permission — with
+            // notifications denied the postDiscard below is silent, and the user
+            // must still learn why the transcript isn't in the vault.
+            discardNotice = "Short recording discarded (\(discard.durationSeconds)s) — at or under your discard threshold"
+            discardDismissTask?.cancel()
+            discardDismissTask = Task {
+                try? await Task.sleep(for: .seconds(8))
+                if !Task.isCancelled { discardNotice = nil }
+            }
+            Task {
+                await NotificationPresenter.shared.postDiscard(durationSeconds: discard.durationSeconds)
+            }
+        }
     }
 
     private func saveTranscriptToFile() {
@@ -463,6 +490,31 @@ struct ContentView: View {
         .overlay(Divider(), alignment: .bottom)
     }
 
+    /// Save-banner variant for a discarded short session: same slot and styling,
+    /// but nothing was written, so no open-file affordance.
+    private func discardBanner(_ notice: String) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.fg2.opacity(0.15))
+                .frame(width: 16, height: 16)
+                .overlay(
+                    Image(systemName: "trash")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color.fg2)
+                )
+            Text(notice)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(Color.fg1)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.bg1.opacity(0.7))
+        .overlay(Divider(), alignment: .top)
+        .overlay(Divider(), alignment: .bottom)
+    }
+
     // MARK: - Helpers
 
     private var isRunning: Bool {
@@ -554,13 +606,17 @@ struct ContentView: View {
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
+        discardNotice = nil
+        discardDismissTask?.cancel()
 
         let sid = sessionId ?? SessionStore.generateSessionId()
 
-        // Determine output folder and app bundle ID based on session type
+        // Determine output folder and source-app label based on session type. The
+        // resolved conferencing app only labels the note (`source_app`) — system
+        // audio is captured display-wide, not scoped to that app's process (see
+        // SystemAudioCapture.bufferStream), so no bundle ID flows to the engine.
         let outputPath: String
         let sourceApp: String
-        var appBundleID: String?
         var resolvedAppName: String?
 
         switch type {
@@ -570,7 +626,6 @@ struct ContentView: View {
                let bundleID = frontApp.bundleIdentifier,
                let appName = conferencingAppName(bundleID) {
                 sourceApp = appName
-                appBundleID = bundleID
                 resolvedAppName = appName
             } else {
                 sourceApp = "Call"
@@ -650,7 +705,6 @@ struct ContentView: View {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    appBundleID: appBundleID,
                     recordingContext: recordingContext
                 )
             } else {
@@ -763,6 +817,13 @@ struct ContentView: View {
             ? settings.recordingsFolderURL.map(RecordingRetentionConfig.init(folder:))
             : nil
 
+        // Short-recording discard applies to call captures only (voice memos are
+        // never dropped). Passing nil for voice memos / when the setting is off
+        // leaves the job's normal save path untouched.
+        let discardLimit: TimeInterval? = (wasCallCapture && settings.discardShortMeetings)
+            ? TimeInterval(settings.discardShortMeetingSeconds)
+            : nil
+
         Task {
             // Snapshot capture state BEFORE tearing down the engine, since the engine
             // may begin a new session (which reuses the capture objects) immediately.
@@ -813,7 +874,8 @@ struct ContentView: View {
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                 retention: retention,
-                exportVoiceprints: settings.exportVoiceprints
+                exportVoiceprints: settings.exportVoiceprints,
+                discardIfShorterThanOrEqual: discardLimit
             )
 
             services.postProcessingQueue.enqueue(job)
@@ -914,10 +976,17 @@ struct ContentView: View {
                 failed.append("\(orphan.wavURL.lastPathComponent): no sidecar — use Cmd+Opt+R")
                 continue
             }
-            let transcriptURL = sidecar.transcriptURL
+            var transcriptURL = sidecar.transcriptURL
             if !FileManager.default.fileExists(atPath: transcriptURL.path) {
-                failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
-                continue
+                // The sidecar path can go stale when the vault pipeline renames a
+                // note before its session finalizes — the note is still findable
+                // by its preserved `source_file:` frontmatter key.
+                if let renamed = TranscriptFinalizer.relocateRenamedNote(from: transcriptURL) {
+                    transcriptURL = renamed
+                } else {
+                    failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
+                    continue
+                }
             }
 
             do {

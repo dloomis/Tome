@@ -64,6 +64,24 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(exportVoiceprints, forKey: "exportVoiceprints") }
     }
 
+    // MARK: - Discard Short Meetings
+
+    /// When true, a call capture that stops at or under `discardShortMeetingSeconds`
+    /// is treated as a canceled / mis-started meeting: its live transcript and capture
+    /// files are deleted instead of written to any output folder (no transcript, no
+    /// retained recording, no voiceprints). Voice memos are never discarded. Off by
+    /// default. The gate lives in `PostProcessingJob.run()`, which measures the session
+    /// length and short-circuits before any diarization.
+    var discardShortMeetings: Bool {
+        didSet { UserDefaults.standard.set(discardShortMeetings, forKey: "discardShortMeetings") }
+    }
+
+    /// Call captures at or under this many seconds are discarded when
+    /// `discardShortMeetings` is on. Default 30.
+    var discardShortMeetingSeconds: Int {
+        didSet { UserDefaults.standard.set(discardShortMeetingSeconds, forKey: "discardShortMeetingSeconds") }
+    }
+
     // MARK: - Diarization (SpeakerKit / pyannote v4)
 
     var diarizationClusterThreshold: Double {
@@ -128,6 +146,10 @@ final class AppSettings {
         self.retainRecordings = defaults.bool(forKey: "retainRecordings")
         self.recordingsFolderPath = defaults.string(forKey: "recordingsFolderPath") ?? NSString("~/Documents/Tome/Recordings").expandingTildeInPath
         self.exportVoiceprints = defaults.bool(forKey: "exportVoiceprints")
+        self.discardShortMeetings = defaults.bool(forKey: "discardShortMeetings")
+        self.discardShortMeetingSeconds = defaults.object(forKey: "discardShortMeetingSeconds") == nil
+            ? 30
+            : defaults.integer(forKey: "discardShortMeetingSeconds")
         self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
         self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil

@@ -2,11 +2,11 @@ import Foundation
 import Testing
 @testable import Tome
 
-/// Pure decision for the mic startup-delivery gate: the one-shot backstop that
-/// forces a single mic restart when AirPods' A2DP→HFP renegotiation races the
-/// first engine open and the tap never delivers (no error, no config-change
-/// notification). The 15s stall watchdog already covers this eventually — the
-/// gate collapses that wait to ~3s. Because the wrong call either loops mic
+/// Pure decision shared by BOTH startup-delivery gates: the one-shot backstop
+/// that forces a single restart when a capture leg comes up but never delivers —
+/// the mic when AirPods' A2DP→HFP renegotiation races the first engine open, and
+/// the system leg when SCStream's cold start succeeds but the tap stays silent
+/// (no error, no callback either way). Because the wrong call either loops
 /// restarts or wipes a healthy tap, the branch logic is unit-tested in isolation.
 @Suite struct StartupDeliveryGateTests {
 
@@ -41,11 +41,24 @@ import Testing
     }
 
     @Test func skipsWhenRebuildInFlight() {
-        // A debounced config/HAL rebuild is already pending — it will re-open the
-        // mic on its own. Don't stack a second forced restart on top, even though
-        // every other condition matches the cold-start case.
+        // A rebuild is already pending (mic: the debounced config/HAL rebuild;
+        // system leg: restartSystemAudioLeg mid-flight) — it will re-open the
+        // leg on its own. Don't stack a second forced restart on top, even
+        // though every other condition matches the cold-start case.
         #expect(!TranscriptionEngine.shouldForceStartupRestart(
             firstSampleAt: nil, isRunning: true, alreadyFired: false, rebuildInFlight: true
+        ))
+    }
+
+    @Test func systemGateCallPattern() {
+        // The system gate's exact fire-time call: SCStream came up, the 8s window
+        // elapsed, firstSampleTime never set, gate unfired, no rebuild in flight →
+        // rebuild once. And the healthy variant — one delivered sample — is a no-op.
+        #expect(TranscriptionEngine.shouldForceStartupRestart(
+            firstSampleAt: nil, isRunning: true, alreadyFired: false, rebuildInFlight: false
+        ))
+        #expect(!TranscriptionEngine.shouldForceStartupRestart(
+            firstSampleAt: Date(timeIntervalSinceNow: -6), isRunning: true, alreadyFired: false, rebuildInFlight: false
         ))
     }
 }

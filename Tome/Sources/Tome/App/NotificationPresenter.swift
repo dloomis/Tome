@@ -174,6 +174,29 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         try? await UNUserNotificationCenter.current().add(request)
     }
 
+    // MARK: - Short-session discard
+
+    /// A session stopped at/under the user's discard threshold and was removed instead
+    /// of saved (see `AppSettings.discardShortMeetings`). Without this, the transcript
+    /// silently vanishing from the vault reads as a bug — this confirms it was intended.
+    /// No sessionType parameter: only call captures are ever discarded.
+    func postDiscard(durationSeconds: Int) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Short recording discarded"
+        content.body = "A \(durationSeconds)s recording was at or under your discard threshold and wasn't saved."
+        content.sound = nil
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(

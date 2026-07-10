@@ -44,6 +44,19 @@ final class PostProcessingQueue {
         let failedAt: Date
     }
 
+    /// Published when a job discards a short session (see `AppSettings.discardShortMeetings`).
+    /// Distinct from completion: nothing was written, so observers must not show a
+    /// "Saved" banner or an open-file action — the transcript is gone by design.
+    private(set) var lastDiscard: JobDiscard?
+
+    struct JobDiscard: Equatable, Sendable {
+        let jobId: String
+        let durationSeconds: Int
+        /// Occurrence stamp — same rationale as `JobFailure.failedAt`: a reused
+        /// session id discarded twice must still read as a new event.
+        let discardedAt: Date
+    }
+
     /// Bindable summary for UI: true while any job is queued or running.
     var isAnyJobRunning: Bool { activeJob != nil || !pendingJobs.isEmpty }
 
@@ -89,14 +102,23 @@ final class PostProcessingQueue {
             )
 
             do {
-                let savedURL = try await job.run(using: asr)
-                lastCompletion = JobCompletion(
-                    jobId: job.id,
-                    savedURL: savedURL,
-                    sourceApp: job.handle.sourceApp,
-                    sessionType: job.handle.sessionType,
-                    completedAt: Date()
-                )
+                switch try await job.run(using: asr) {
+                case .saved(let savedURL):
+                    lastCompletion = JobCompletion(
+                        jobId: job.id,
+                        savedURL: savedURL,
+                        sourceApp: job.handle.sourceApp,
+                        sessionType: job.handle.sessionType,
+                        completedAt: Date()
+                    )
+                case .discarded(_, let durationSeconds):
+                    diagLog("[QUEUE] Job \(job.id) discarded (short session, \(durationSeconds)s)")
+                    lastDiscard = JobDiscard(
+                        jobId: job.id,
+                        durationSeconds: durationSeconds,
+                        discardedAt: Date()
+                    )
+                }
             } catch {
                 diagLog("[QUEUE] Job \(job.id) failed: \(error)")
                 lastFailure = JobFailure(
