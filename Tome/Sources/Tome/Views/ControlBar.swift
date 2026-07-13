@@ -37,6 +37,11 @@ struct ControlBar: View {
     let canStartRecording: Bool
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
+    /// Main Stop button — requests the "Are you sure?" confirmation
+    /// (StopConfirmationModel) instead of stopping directly.
+    let onStopRequested: () -> Void
+    /// Direct stop, no second confirmation — used only by the silence
+    /// prompt's "Stop & Save", which is already a confirmation.
     let onStop: () -> Void
     let onKeepRecording: () -> Void
     let onDismissMeeting: () -> Void
@@ -81,7 +86,7 @@ struct ControlBar: View {
             }
 
             if isRecording {
-                Button(action: onStop) {
+                Button(action: onStopRequested) {
                     HStack(spacing: 10) {
                         PulsingDot(size: 6)
 

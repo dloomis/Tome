@@ -29,6 +29,10 @@ struct ContentView: View {
     /// up. Recording continues until the user answers; cleared when audio resumes
     /// or the session ends. Replaces the old behavior of silently auto-stopping.
     @State private var silencePromptActive = false
+    /// Confirmation gate for the main Stop button. `onConfirm` is wired to
+    /// `stopSession()` in the boot task; the silence prompt, notification
+    /// action, and HTTP API bypass it (see StopConfirmationModel).
+    @State private var stopConfirmation = StopConfirmationModel()
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
@@ -105,6 +109,7 @@ struct ContentView: View {
                 canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
+                onStopRequested: { stopConfirmation.requestStop() },
                 onStop: stopSession,
                 onKeepRecording: dismissSilencePrompt,
                 onDismissMeeting: { dismissedMeetingTitle = detectedMeeting?.title }
@@ -113,6 +118,20 @@ struct ContentView: View {
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
         .background(Color.bg0)
         .preferredColorScheme(.dark)
+        .alert(
+            "Are you sure you want to stop recording?",
+            isPresented: Binding(
+                get: { stopConfirmation.isPresented },
+                set: { stopConfirmation.isPresented = $0 }
+            )
+        ) {
+            // Cancel is the default (Return): the premise of this dialog is
+            // that the stop was probably accidental, so the low-effort keys
+            // must be the safe ones. Esc also cancels via the .cancel role.
+            Button("Cancel", role: .cancel) { stopConfirmation.cancelStop() }
+                .keyboardShortcut(.defaultAction)
+            Button("Stop Recording", role: .destructive) { stopConfirmation.confirmStop() }
+        }
         .overlay {
             if showOnboarding {
                 OnboardingView(isPresented: $showOnboarding)
@@ -131,6 +150,9 @@ struct ContentView: View {
             // Mirror live recording state into AppServices so the MenuBarExtra
             // scene (which can't see the engine) can show a recording indicator.
             services.isRecording = running
+            // Session ended through another path (capture error, API stop,
+            // notification stop) — withdraw a pending stop confirmation.
+            if !running { stopConfirmation.recordingDidEnd() }
         }
         .onChange(of: settings.transcriptionLanguage) {
             // Push setting changes to the ASR actor so subsequent transcribe calls
@@ -213,6 +235,10 @@ struct ContentView: View {
             NotificationPresenter.shared.silenceKeepAction = {
                 if silencePromptActive { dismissSilencePrompt() }
             }
+            // Dialog "Stop Recording" → the real teardown. stopSession()'s
+            // re-entrance guard makes a stale confirm (session already ended
+            // by the API/notification in the same instant) a harmless no-op.
+            stopConfirmation.onConfirm = { stopSession() }
 
             // Returning users: onboarding never shows, so we surface the orphan
             // prompt at the end of boot. First-launch users hit the onChange
