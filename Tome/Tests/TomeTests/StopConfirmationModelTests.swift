@@ -54,4 +54,17 @@ import Testing
         model.confirmStop()
         #expect(stops == 1)
     }
+
+    @Test func confirmStillFiresAfterSwiftUIClearsTheBindingFirst() {
+        let model = StopConfirmationModel()
+        var stops = 0
+        model.onConfirm = { stops += 1 }
+        model.requestStop()
+        // SwiftUI writes `false` to the alert binding when a button is tapped,
+        // potentially before the button's action runs — confirmStop() must not
+        // be guarded on isPresented or every confirm would silently no-op.
+        model.isPresented = false
+        model.confirmStop()
+        #expect(stops == 1)
+    }
 }
