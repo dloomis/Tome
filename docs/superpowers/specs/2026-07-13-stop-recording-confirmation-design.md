@@ -43,8 +43,15 @@ A standard macOS alert (SwiftUI `.alert`) over the Tome window:
 
 - **Title:** "Are you sure you want to stop recording?"
 - **Buttons:**
-  - **Cancel** — cancel role, **default button** (Return and Esc both cancel).
+  - **Cancel** — cancel role, **default button** (Return cancels).
   - **Stop Recording** — destructive role; closes the dialog and stops the session.
+
+**As shipped (manual verification 2026-07-13):** Esc does nothing — SwiftUI
+drops the cancel-role's implicit Esc equivalent when the button also carries
+`.keyboardShortcut(.defaultAction)`, and a button holds only one shortcut.
+Accepted deliberately: Return-cancels was the verified priority, and the
+fallback (dropping the Return default to restore Esc) risked Return landing
+on the destructive button. Bail-out paths are Return or clicking Cancel.
 
 Cancel is deliberately the default: the entire premise of the feature is that
 the stop was probably accidental, so the low-effort keys (Return, Esc) must
