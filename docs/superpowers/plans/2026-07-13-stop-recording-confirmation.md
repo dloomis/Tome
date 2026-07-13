@@ -319,14 +319,22 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Files:** none (verification only; fix-forward if a check fails).
 
-The view wiring has no unit-test seam, so this checklist is the acceptance gate. Launch a dev build:
+The view wiring has no unit-test seam, so this checklist is the acceptance gate.
+
+**Do NOT launch via `swift run Tome`** — a bare SPM executable has no app bundle,
+and `UNUserNotificationCenter.current()` (touched at boot by `NotificationPresenter`)
+hard-aborts with `bundleProxyForCurrentProcess is nil`. **Do NOT run
+`scripts/build_swift_app.sh` either** — its final step overwrites
+`/Applications/Tome.app`. Instead assemble a dev bundle from the debug binary
+(the script's steps minus the install): copy the binary + `Info.plist` +
+`PkgInfo` into `dist/Tome-stopconfirm.app`, copy `Sparkle.framework` from
+`Tome/.build/artifacts/sparkle` into `Contents/Frameworks`, add the
+`@executable_path/../Frameworks` rpath with `install_name_tool`, sign
+inside-out with the stable identity (`Tome Self-Signed`), then:
 
 ```bash
-cd /Users/nic/programming/tome/Tome
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run Tome
+open dist/Tome-stopconfirm.app
 ```
-
-(or the usual app-bundle path via `scripts/build_swift_app.sh` if `swift run` misbehaves for GUI features).
 
 - [ ] Start a Voice Memo → click **Stop Recording** → dialog appears with title "Are you sure you want to stop recording?" and buttons Cancel / Stop Recording; the elapsed timer keeps counting behind it.
 - [ ] Click **Cancel** → dialog closes, recording continues, transcript still flowing.
