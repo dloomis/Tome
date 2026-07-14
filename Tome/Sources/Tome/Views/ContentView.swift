@@ -873,6 +873,7 @@ struct ContentView: View {
                 handle: handle,
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                mergeGapSeconds: settings.diarizationMergeGapSeconds,
                 retention: retention,
                 exportVoiceprints: settings.exportVoiceprints,
                 discardIfShorterThanOrEqual: discardLimit
@@ -996,6 +997,7 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                    mergeGapSeconds: settings.diarizationMergeGapSeconds,
                     exportVoiceprints: settings.exportVoiceprints,
                     // Mic-only orphans (voice memos): the WAV IS the mic, so keeping
                     // the live "You" lines would duplicate every word.
@@ -1150,6 +1152,7 @@ struct ContentView: View {
                     asr: services.asrCoordinator,
                     clusterThreshold: Float(settings.diarizationClusterThreshold),
                     numberOfSpeakers: settings.diarizationNumberOfSpeakers,
+                    mergeGapSeconds: settings.diarizationMergeGapSeconds,
                     exportVoiceprints: settings.exportVoiceprints,
                     preserveYou: preserveYou
                 )

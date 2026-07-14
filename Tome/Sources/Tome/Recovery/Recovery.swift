@@ -82,6 +82,7 @@ enum Recovery {
         asr: ASRCoordinator,
         clusterThreshold: Float,
         numberOfSpeakers: Int,
+        mergeGapSeconds: Double = 1.5,
         exportVoiceprints: Bool = false,
         preserveYou: Bool = true
     ) async throws -> URL {
@@ -131,7 +132,8 @@ enum Recovery {
             asrCoordinator: asr,
             bufferURL: wavURL,
             segments: segments,
-            speakerNumberBase: preserveYou ? 2 : 1
+            speakerNumberBase: preserveYou ? 2 : 1,
+            mergeGapSeconds: mergeGapSeconds
         )
 
         do {

@@ -12,6 +12,9 @@ struct SegmentReTranscriber: Sendable {
     /// implicit Speaker 1), 1 for mic-only in-person diarization (every speaker, including
     /// the recording user, comes from the diarizer).
     let speakerNumberBase: Int
+    /// Max gap (seconds) between two consecutive same-speaker segments that still merges
+    /// them into one block/re-transcription span. See `AppSettings.diarizationMergeGapSeconds`.
+    let mergeGapSeconds: Double
 
     func run() async -> [ReTranscribedSegment]? {
         do {
@@ -21,11 +24,11 @@ struct SegmentReTranscriber: Sendable {
 
             let speakerMap = speakerLabels(from: segments.map(\.speakerId), startingAt: speakerNumberBase)
 
-            // Merge consecutive segments from the same speaker (< 0.5s gap)
+            // Merge consecutive segments from the same speaker (gap ≤ mergeGapSeconds)
             var merged: [DiarizedSegment] = []
             for seg in segments {
                 if let last = merged.last, last.speakerId == seg.speakerId,
-                   seg.startTime - last.endTime < 0.5 {
+                   seg.startTime - last.endTime <= Float(mergeGapSeconds) {
                     merged[merged.count - 1] = DiarizedSegment(
                         speakerId: last.speakerId,
                         startTime: last.startTime,
