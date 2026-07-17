@@ -5,7 +5,7 @@ import os
 // VAD + ASR pipeline
 final class StreamingTranscriber: @unchecked Sendable {
     private let asrCoordinator: ASRCoordinator
-    private let vadManager: VadManager
+    private var vad: any VADStream
     private let speaker: Speaker
     private let audioSource: AudioSource
     private let onPartial: @Sendable (String) -> Void
@@ -13,7 +13,12 @@ final class StreamingTranscriber: @unchecked Sendable {
     /// *started* (not when ASR finished). The session's offset markers are derived
     /// downstream as `startTime − sessionStart`, so this must reflect the audio
     /// position, not the transcription latency.
-    private let onFinal: @Sendable (String, Date) -> Void
+    ///
+    /// Awaited before `run()` continues — so when `run()` returns, every
+    /// finalized utterance has been *delivered*, not merely scheduled. The
+    /// stop path depends on this: it awaits `run()`'s task and then snapshots
+    /// the transcript, which must already contain the tail utterance.
+    private let onFinal: @Sendable (String, Date) async -> Void
     private let log = Logger(subsystem: tomeLogSubsystem, category: "StreamingTranscriber")
 
     /// Resampler from source format to 16kHz mono Float32.
@@ -27,14 +32,14 @@ final class StreamingTranscriber: @unchecked Sendable {
 
     init(
         asrCoordinator: ASRCoordinator,
-        vadManager: VadManager,
+        vad: any VADStream,
         speaker: Speaker,
         audioSource: AudioSource = .microphone,
         onPartial: @escaping @Sendable (String) -> Void,
-        onFinal: @escaping @Sendable (String, Date) -> Void
+        onFinal: @escaping @Sendable (String, Date) async -> Void
     ) {
         self.asrCoordinator = asrCoordinator
-        self.vadManager = vadManager
+        self.vad = vad
         self.speaker = speaker
         self.audioSource = audioSource
         self.onPartial = onPartial
@@ -49,9 +54,16 @@ final class StreamingTranscriber: @unchecked Sendable {
 
     /// Main loop: reads audio buffers, runs VAD, transcribes speech segments.
     /// Returns `true` if the loop exited due to fatal (repeated) errors.
+    ///
+    /// Runs until `stream` FINISHES — the capture layer finishes its
+    /// continuation on stop, buffered audio drains, and the in-progress
+    /// utterance is flushed below. Do not cancel the task running this as the
+    /// stop path: the ASR backends (FluidAudio, WhisperKit) check
+    /// `Task.checkCancellation()` throughout inference, so a cancelled flush
+    /// throws and the tail of the recording is silently dropped (task-13
+    /// smoke-test finding, 2026-07-09).
     @discardableResult
     func run(stream: AsyncStream<AVAudioPCMBuffer>) async -> Bool {
-        var vadState = await vadManager.makeStreamState()
         var speechSamples: [Float] = []
         var vadBuffer: [Float] = []
         var isSpeaking = false
@@ -93,18 +105,11 @@ final class StreamingTranscriber: @unchecked Sendable {
                 consumedSamples += Self.vadChunkSize
 
                 do {
-                    let result = try await vadManager.processStreamingChunk(
-                        chunk,
-                        state: vadState,
-                        config: .default,
-                        returnSeconds: true,
-                        timeResolution: 2
-                    )
-                    vadState = result.state
+                    let event = try await vad.process(chunk)
                     consecutiveErrors = 0
 
-                    if let event = result.event {
-                        switch event.kind {
+                    if let event {
+                        switch event {
                         case .speechStart:
                             isSpeaking = true
                             speechSamples.removeAll(keepingCapacity: true)
@@ -158,7 +163,16 @@ final class StreamingTranscriber: @unchecked Sendable {
             }
         }
 
+        // Stream finished (capture stopped): flush the in-progress utterance.
+        // Speech still running at stop never gets a VAD speechEnd, so without
+        // this the tail of the recording is dropped. The sub-chunk remainder
+        // in `vadBuffer` (< 256ms that never reached the VAD) is speech too —
+        // fold it in rather than discarding it.
+        if isSpeaking && !vadBuffer.isEmpty {
+            speechSamples.append(contentsOf: vadBuffer)
+        }
         if speechSamples.count > 8000 {
+            diagLog("[\(self.speaker.rawValue)] flushing end-of-stream segment: samples=\(speechSamples.count)")
             _ = await transcribeSegment(speechSamples, startTime: startDate(forSample: segmentStartSample))
         } else if !speechSamples.isEmpty {
             diagLog("[\(self.speaker.rawValue)] dropping short end-of-stream remnant: samples=\(speechSamples.count) (<8000 ≈ 0.5s)")
@@ -174,10 +188,11 @@ final class StreamingTranscriber: @unchecked Sendable {
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return true }
             log.info("[\(self.speaker.rawValue)] transcribed: \(text.prefix(80))")
-            onFinal(text, startTime)
+            await onFinal(text, startTime)
             return true
         } catch {
             log.error("ASR error: \(error.localizedDescription)")
+            diagLog("[\(self.speaker.rawValue)] ASR error on \(samples.count)-sample segment: \(error.localizedDescription)")
             return false
         }
     }

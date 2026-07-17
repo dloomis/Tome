@@ -105,6 +105,24 @@ struct TranscriptSessionSnapshot: Sendable {
     /// session context. Captured at session start so a user changing the setting
     /// mid-recording doesn't shift the prefix on a session already in flight.
     let filenameDateFormat: String
+
+    /// Copy re-pointed at an externally-renamed note (the user's vault pipeline
+    /// can retitle a note before post-processing reaches it — see
+    /// `TranscriptFinalizer.relocateRenamedNote`). Clears the rename inputs
+    /// (`suggestedFilename` / `sessionContext`): the external pipeline chose the
+    /// new name deliberately, and finalization must not rename it back.
+    func relocated(to newPath: URL) -> TranscriptSessionSnapshot {
+        TranscriptSessionSnapshot(
+            filePath: newPath,
+            sessionStartTime: sessionStartTime,
+            sessionEndTime: sessionEndTime,
+            speakersDetected: speakersDetected,
+            sourceApp: sourceApp,
+            sessionContext: "",
+            suggestedFilename: nil,
+            filenameDateFormat: filenameDateFormat
+        )
+    }
 }
 
 // MARK: - Session Handle

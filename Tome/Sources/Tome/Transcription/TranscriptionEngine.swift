@@ -43,6 +43,14 @@ final class TranscriptionEngine {
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
 
+    /// Monotonic session token, bumped at the top of every `start()` and `stop()`.
+    /// Async rebuilds (`restartSystemAudioLeg`) capture it on entry and re-check
+    /// after each suspension: `isRunning` alone can't tell "still this session"
+    /// from "stopped and immediately restarted", and during `stop()`'s long drain
+    /// `isRunning` is still true — a rebuild racing that window would otherwise
+    /// spin up a fresh SCStream + sysTask that nothing tears down.
+    private var sessionGeneration = 0
+
     /// Polls `SystemAudioCapture.lastSampleTime` and surfaces a warning if SCStream
     /// silently stops delivering samples (display sleep without our activity assertion,
     /// permission revoked mid-session, captured app quit, etc.).
@@ -95,12 +103,12 @@ final class TranscriptionEngine {
     func start(
         locale: Locale,
         inputDeviceID: AudioDeviceID = 0,
-        appBundleID: String? = nil,
         recordingContext: SessionRecordingContext? = nil,
         captureSystemAudio: Bool = true
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
+        sessionGeneration += 1
         lastError = nil
 
         guard await ensureMicrophonePermission() else { return }
@@ -111,6 +119,13 @@ final class TranscriptionEngine {
         startupGateFired = false
         startupGateTask?.cancel()
         startupGateTask = nil
+        // System-audio startup gate (mic gate's system-side analogue).
+        sysStartupGateFired = false
+        sysStartupGateTask?.cancel()
+        sysStartupGateTask = nil
+        // Retained so the system-audio startup gate can rebuild the leg without
+        // re-plumbing it from ContentView.
+        activeRecordingContext = recordingContext
         beginLiveActivity()
 
         // 1. Verify ASR readiness. Model download/load lives in
@@ -217,7 +232,6 @@ final class TranscriptionEngine {
             diagLog("[ENGINE-4] starting system audio capture...")
             do {
                 sysStreams = try await systemCapture.bufferStream(
-                    appBundleID: appBundleID,
                     recordingContext: recordingContext
                 )
                 currentBufferURL = sysStreams?.bufferURL
@@ -249,14 +263,17 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
-            vadManager: vadManager,
+            vad: SileroVADStream(manager: vadManager),
             speaker: .you,
             audioSource: .microphone,
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
+            // Awaited (not fire-and-forget): stop() drains the transcriber task,
+            // and that drain must guarantee the utterance is IN the store when it
+            // returns — stopSession snapshots the transcript right after.
             onFinal: { text, startTime in
-                Task { @MainActor in
+                await MainActor.run {
                     store.volatileYouText = ""
                     store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
@@ -274,30 +291,17 @@ final class TranscriptionEngine {
 
         // 5. Start system audio transcription
         if let sysStream = sysStreams?.systemAudio {
-            let sysTranscriber = StreamingTranscriber(
-                asrCoordinator: asrCoordinator,
-                vadManager: vadManager,
-                speaker: .them,
-                audioSource: .system,
-                onPartial: { text in
-                    Task { @MainActor in store.volatileThemText = text }
-                },
-                onFinal: { text, startTime in
-                    Task { @MainActor in
-                        store.volatileThemText = ""
-                        store.append(Utterance(text: text, speaker: .them, timestamp: startTime))
-                    }
-                }
-            )
-            let reportSysError: @Sendable (String) -> Void = { [weak self] msg in
-                Task { @MainActor in self?.lastError = msg }
-            }
-            sysTask = Task.detached {
-                let hadFatalError = await sysTranscriber.run(stream: sysStream)
-                if hadFatalError {
-                    reportSysError("System audio transcription failed — restart session")
-                }
-            }
+            spinUpSystemTranscription(stream: sysStream, vadManager: vadManager)
+        }
+
+        // 5b. System-audio startup-delivery gate: SCStream's per-stream cold start
+        //     can race the same way the mic's A2DP→HFP flip does — startCapture()
+        //     succeeds but the tap delivers nothing, with no didStopWithError. Force
+        //     ONE rebuild of the system leg if no sample lands within the window,
+        //     collapsing the wait before the 15s stall watchdog would alarm. Only
+        //     armed when we actually brought the leg up.
+        if sysStreams != nil {
+            armSystemStartupDeliveryGate()
         }
 
         // Watch BOTH capture legs, not just system audio — a mic that stops
@@ -323,14 +327,168 @@ final class TranscriptionEngine {
     /// re-arms nothing. Reset at the top of each `start()`.
     private var startupGateFired = false
 
-    /// Pure decision for the startup-delivery gate (below). Extracted so the
-    /// never-delivered-vs-delivered distinction and the strict one-shot rule can
-    /// be unit-tested without audio hardware. Force a single mic restart only
-    /// when the engine is still running, the tap has NEVER delivered a sample
-    /// this session (`firstSampleAt == nil` — distinct from delivered-then-quiet,
-    /// which is the watchdog's job), the gate hasn't already fired, and no
-    /// debounced config/HAL rebuild is already in flight (that rebuild re-opens
-    /// the mic on its own — don't stack a second restart on top).
+    /// System-audio analogue of `startupGateTask`/`startupGateFired`. One-shot per
+    /// `start()`: rebuild the system leg once if it never delivers a sample.
+    private var sysStartupGateTask: Task<Void, Never>?
+    private var sysStartupGateFired = false
+
+    /// One-shot grace check armed after each successful system-leg rebuild. A
+    /// rebuild re-seeds the stall watchdog's clock (`bufferStream` seeds
+    /// `_lastSampleTime` at start), so a rebuilt-but-still-silent leg wouldn't
+    /// trip the 15s watchdog until ~15s AFTER the rebuild — this alarms directly
+    /// at +5s instead. Cancelled in `stop()`.
+    private var sysRebuildGraceTask: Task<Void, Never>?
+
+    /// The current session's recording context, retained so the system-audio
+    /// startup gate can rebuild the leg (it needs the same sidecar/WAV identity)
+    /// without ContentView re-plumbing it. Set at `start()`, cleared at `stop()`.
+    private var activeRecordingContext: SessionRecordingContext?
+
+    /// Spin up the "Them" transcriber over a system-audio stream. Extracted from
+    /// `start()` so the system-audio startup gate can re-establish the leg on a
+    /// freshly-rebuilt stream without duplicating the wiring.
+    private func spinUpSystemTranscription(stream: sending AsyncStream<AVAudioPCMBuffer>, vadManager: VadManager) {
+        let store = transcriptStore
+        let sysTranscriber = StreamingTranscriber(
+            asrCoordinator: asrCoordinator,
+            vad: SileroVADStream(manager: vadManager),
+            speaker: .them,
+            audioSource: .system,
+            onPartial: { text in
+                Task { @MainActor in store.volatileThemText = text }
+            },
+            onFinal: { text, startTime in
+                await MainActor.run {
+                    store.volatileThemText = ""
+                    store.append(Utterance(text: text, speaker: .them, timestamp: startTime))
+                }
+            }
+        )
+        let reportSysError: @Sendable (String) -> Void = { [weak self] msg in
+            Task { @MainActor in self?.lastError = msg }
+        }
+        sysTask?.cancel()
+        sysTask = Task.detached {
+            let hadFatalError = await sysTranscriber.run(stream: stream)
+            if hadFatalError {
+                reportSysError("System audio transcription failed — restart session")
+            }
+        }
+    }
+
+    /// Arm the one-shot system-audio startup-delivery gate. Mirrors
+    /// `armStartupDeliveryGate` (the mic side) but for the SCStream leg: if no
+    /// sample arrives within the window, rebuild the leg ONCE. The window is longer
+    /// than the mic's 3s because ScreenCaptureKit's first-sample latency is higher
+    /// (shareable-content query + stream negotiation). Timeline note: the rebuild
+    /// re-seeds the stall watchdog's clock, so the watchdog alone wouldn't alarm on
+    /// a rebuilt-but-still-silent leg until ~15s post-rebuild — the +5s grace check
+    /// armed by `restartSystemAudioLeg` owns that alarm instead.
+    private func armSystemStartupDeliveryGate() {
+        sysStartupGateTask?.cancel()
+        sysStartupGateTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled else { return }
+            await self?.handleSystemStartupGate()
+        }
+    }
+
+    /// Fire-time decision + action for the system-audio startup gate. Same pure
+    /// predicate as the mic gate: rebuild only when the engine is still running,
+    /// the leg has NEVER delivered a sample this session (`firstSampleTime == nil`
+    /// — distinct from delivered-then-paused, which is the watchdog's job), the
+    /// gate hasn't already fired, and no rebuild is already in flight.
+    @MainActor
+    private func handleSystemStartupGate() async {
+        guard Self.shouldForceStartupRestart(
+                  firstSampleAt: systemCapture.firstSampleTime,
+                  isRunning: isRunning,
+                  alreadyFired: sysStartupGateFired,
+                  rebuildInFlight: sysRebuildInFlight
+              )
+        else { return }
+        sysStartupGateFired = true
+        diagLog("[SYS-STARTGATE] no system-audio sample within 8s — rebuilding the system leg once")
+        await restartSystemAudioLeg()
+    }
+
+    /// True between `restartSystemAudioLeg` entry and exit. With both the startup
+    /// gate and the watchdog able to trigger rebuilds, this stops a second rebuild
+    /// from tearing down the one still coming up.
+    private var sysRebuildInFlight = false
+
+    /// Tear down and re-establish the system-audio leg on the current session.
+    /// Reuses the retained recording context so the rebuilt WAV keeps the same
+    /// session identity/path. If the rebuild itself fails to come up, surface it —
+    /// a persistent zero-delivery is a permission/routing problem a further retry
+    /// won't fix. A rebuild that SUCCEEDS but stays silent is caught by the +5s
+    /// grace check armed below (the watchdog's re-seeded clock is too slow — see
+    /// `sysRebuildGraceTask`).
+    @MainActor
+    private func restartSystemAudioLeg() async {
+        guard isRunning, let vadManager, !sysRebuildInFlight else { return }
+        sysRebuildInFlight = true
+        defer { sysRebuildInFlight = false }
+        // Staleness token: `isRunning` is NOT sufficient across the awaits below —
+        // stop() keeps it true until after its (up to 15s) transcriber drain, and a
+        // stop-then-quick-restart flips it back to true for a DIFFERENT session.
+        // Re-check the generation after every suspension.
+        let generation = sessionGeneration
+        sysTask?.cancel()
+        sysTask = nil
+        await systemCapture.stop()
+        guard generation == sessionGeneration, isRunning else { return }
+        do {
+            let streams = try await systemCapture.bufferStream(recordingContext: activeRecordingContext)
+            guard generation == sessionGeneration, isRunning else {
+                // Stale: a stop (or a new session's start) raced the bring-up.
+                // Unwind the capture we just started so it can't leak an SCStream
+                // and an orphaned $TMPDIR WAV into whatever session runs next.
+                await systemCapture.stop()
+                return
+            }
+            currentBufferURL = streams.bufferURL
+            spinUpSystemTranscription(stream: streams.systemAudio, vadManager: vadManager)
+            diagLog("[SYS-STARTGATE] system leg rebuilt")
+            armSystemRebuildGraceCheck(generation: generation)
+        } catch {
+            guard generation == sessionGeneration, isRunning else { return }
+            let msg = "System audio isn't being captured — recording mic only."
+            diagLog("[SYS-STARTGATE] rebuild failed: \(error.localizedDescription)")
+            lastError = msg
+            Task { await NotificationPresenter.shared.postCaptureStall(leg: "System audio", detail: msg) }
+        }
+    }
+
+    /// Arm the +5s post-rebuild grace check: if the just-rebuilt system leg never
+    /// delivers a first sample, alarm directly with the same message/notification
+    /// as a failed rebuild. `firstSampleTime` was reset by the rebuild's
+    /// `systemCapture.stop()`, so nil here means the NEW stream stayed silent —
+    /// distinct from delivered-then-paused (still the watchdog's job). Respects the
+    /// session-generation guard so a stop or stop-then-restart makes it a no-op.
+    private func armSystemRebuildGraceCheck(generation: Int) {
+        sysRebuildGraceTask?.cancel()
+        sysRebuildGraceTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration, self.isRunning else { return }
+            guard self.systemCapture.firstSampleTime == nil else { return }  // delivered — healthy
+            let msg = "System audio isn't being captured — recording mic only."
+            diagLog("[SYS-STARTGATE] rebuilt system leg still silent after 5s — alerting")
+            self.lastError = msg
+            Task { await NotificationPresenter.shared.postCaptureStall(leg: "System audio", detail: msg) }
+        }
+    }
+
+    /// Pure decision shared by BOTH startup-delivery gates (mic below, system in
+    /// `handleSystemStartupGate`). Extracted so the never-delivered-vs-delivered
+    /// distinction and the strict one-shot rule can be unit-tested without audio
+    /// hardware. Force a single restart only when the engine is still running,
+    /// the leg has NEVER delivered a sample this session (`firstSampleAt == nil`
+    /// — distinct from delivered-then-quiet, which is the watchdog's job), the
+    /// gate hasn't already fired, and no rebuild is already in flight (mic: the
+    /// debounced config/HAL rebuild; system: `sysRebuildInFlight`) — that rebuild
+    /// re-opens the leg on its own, don't stack a second restart on top.
     nonisolated static func shouldForceStartupRestart(
         firstSampleAt: Date?,
         isRunning: Bool,
@@ -520,14 +678,14 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let micTranscriber = StreamingTranscriber(
             asrCoordinator: asrCoordinator,
-            vadManager: vadManager,
+            vad: SileroVADStream(manager: vadManager),
             speaker: .you,
             audioSource: .microphone,
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
             onFinal: { text, startTime in
-                Task { @MainActor in
+                await MainActor.run {
                     store.volatileYouText = ""
                     store.append(Utterance(text: text, speaker: .you, timestamp: startTime))
                 }
@@ -614,26 +772,65 @@ final class TranscriptionEngine {
     }
 
     func stop() async {
+        // Invalidate any in-flight system-leg rebuild BEFORE the first await:
+        // `isRunning` stays true until the end of this method, so the generation
+        // token is what actually stops a racing `restartSystemAudioLeg` from
+        // resurrecting capture mid-teardown.
+        sessionGeneration += 1
         lastError = nil
         removeDefaultDeviceListener()
         startupGateTask?.cancel()
         startupGateTask = nil
+        sysStartupGateTask?.cancel()
+        sysStartupGateTask = nil
+        sysRebuildGraceTask?.cancel()
+        sysRebuildGraceTask = nil
+        activeRecordingContext = nil
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil
         recentMicRebuilds = []
         sysWatchdogTask?.cancel()
         sysWatchdogTask = nil
-        micTask?.cancel()
-        sysTask?.cancel()
-        micTask = nil
-        sysTask = nil
+        // Stop the captures FIRST — each finishes its buffer stream, so the
+        // transcriber loops drain the queued audio and flush the in-progress
+        // utterance through ASR. Then AWAIT the transcriber tasks instead of
+        // cancelling them: FluidAudio and WhisperKit check
+        // `Task.checkCancellation()` throughout inference, so the old
+        // cancel-first teardown made the stop-time flush throw and silently
+        // dropped the tail of every recording that was mid-speech at stop
+        // (task-13 smoke test, 2026-07-09: "ASR error" at stop, truncated or
+        // empty transcripts with the speech intact in the retained audio).
         await systemCapture.stop()
         micCapture.stop()
+        await drainTranscriberTasks()
+        micTask = nil
+        // A startup-gate rebuild racing this stop could have swapped in a NEW
+        // sysTask after drainTranscriberTasks snapshotted the old one — that
+        // task was never drained, so cancel (not just drop) the reference.
+        sysTask?.cancel()
+        sysTask = nil
         currentMicDeviceID = 0
         isRunning = false
         assetStatus = "Ready"
         endLiveActivity()
+    }
+
+    /// Wait for the transcriber tasks to finish their end-of-stream flush.
+    /// Bounded: a wedged ASR call must not hang stop forever — past the
+    /// deadline the tasks are cancelled, abandoning the pending segment (the
+    /// retained recording still preserves that audio).
+    private func drainTranscriberTasks(deadline: Duration = .seconds(15)) async {
+        let tasks = [micTask, sysTask].compactMap { $0 }
+        guard !tasks.isEmpty else { return }
+        let watchdog = Task {
+            try? await Task.sleep(for: deadline)
+            guard !Task.isCancelled else { return }
+            diagLog("[ENGINE-STOP] transcriber drain exceeded \(deadline) — cancelling")
+            for task in tasks { task.cancel() }
+        }
+        for task in tasks { await task.value }
+        watchdog.cancel()
     }
 
     // MARK: - Activity assertion + system-audio watchdog
@@ -671,6 +868,7 @@ final class TranscriptionEngine {
             var sysDetector = CaptureStallDetector(threshold: 15)
             var micDetector = CaptureStallDetector(threshold: 15)
             var stalledTicksSinceRestart = 0
+            var sysStalledTicksSinceRestart = 0
             var failedRecoveryAttempts = 0
             var lastTick = Date()
             while !Task.isCancelled {
@@ -696,14 +894,45 @@ final class TranscriptionEngine {
                 // alarms. A seeded clock must never CLEAR a stall (see
                 // CaptureStallDetector.evaluate(canResume:)).
                 let micTapSample = mic.lastSampleTime
+                // canResume mirrors the mic rule: `lastSampleTime` is SEEDED at
+                // bufferStream start, and a system-leg rebuild re-seeds it — only
+                // a real delivered buffer (firstSampleTime set) may clear the
+                // stall latch, or every rebuild would phantom-resume the alarm.
                 let sysEvent = systemLegActive
-                    ? sysDetector.evaluate(lastSample: sysCapture.lastSampleTime, now: now)
+                    ? sysDetector.evaluate(
+                        lastSample: sysCapture.lastSampleTime,
+                        now: now,
+                        canResume: sysCapture.firstSampleTime != nil
+                    )
                     : nil
                 let micEvent = micDetector.evaluate(
                     lastSample: micTapSample ?? mic.captureStartTime,
                     now: now,
                     canResume: micTapSample != nil
                 )
+
+                // System-leg auto-rebuild, same discipline as the mic side: one
+                // attempt when the stall first latches, then re-attempt every 3
+                // stalled ticks. The latch (not fresh events) drives the cadence —
+                // each rebuild re-seeds the sample clock, so fresh stall events
+                // only fire ~15s apart while the latch counts every tick.
+                var attemptSysRestart = false
+                if let sysEvent {
+                    switch sysEvent {
+                    case .stalled:
+                        attemptSysRestart = true
+                        sysStalledTicksSinceRestart = 0
+                    case .resumed:
+                        sysStalledTicksSinceRestart = 0
+                    }
+                } else if sysDetector.isStalled {
+                    sysStalledTicksSinceRestart += 1
+                    if sysStalledTicksSinceRestart >= 3 {
+                        sysStalledTicksSinceRestart = 0
+                        attemptSysRestart = true
+                        diagLog("[WATCHDOG] system audio still stalled — re-attempting rebuild")
+                    }
+                }
 
                 var attemptMicRestart = false
                 if let micEvent {
@@ -755,12 +984,19 @@ final class TranscriptionEngine {
                 // THIS session; Settings keeps the user's pin for next time.
                 let surrenderPin = attemptMicRestart && failedRecoveryAttempts >= 3
 
-                guard sysEvent != nil || micEvent != nil || attemptMicRestart else { continue }
+                guard sysEvent != nil || micEvent != nil || attemptMicRestart || attemptSysRestart else { continue }
                 let restart = attemptMicRestart
+                let sysRestart = attemptSysRestart
                 await MainActor.run {
                     guard let self, self.isRunning else { return }
                     if let sysEvent { self.handleStallEvent(sysEvent, leg: "System audio") }
                     if let micEvent { self.handleStallEvent(micEvent, leg: "Microphone") }
+                    if sysRestart {
+                        diagLog("[WATCHDOG] attempting automatic system-audio rebuild")
+                        // Async and generation-guarded; the stall banner from
+                        // handleStallEvent stays up until real samples resume.
+                        Task { await self.restartSystemAudioLeg() }
+                    }
                     if surrenderPin && self.userSelectedDeviceID != 0 {
                         diagLog("[WATCHDOG] pinned mic failed \(failedRecoveryAttempts) recovery cycles — following System Default for this session")
                         let msg = "The selected microphone kept failing — following the system default for this session. Your Settings choice is unchanged."

@@ -35,6 +35,12 @@ struct ContentView: View {
     @State private var stopConfirmation = StopConfirmationModel()
     @State private var savedFileURL: URL?
     @State private var bannerDismissTask: Task<Void, Never>?
+    /// Set when a short session was discarded (`AppSettings.discardShortMeetings`).
+    /// In-app analogue of the save banner: the discard notification is skipped when
+    /// permission is denied, and a transcript silently vanishing from the vault is
+    /// exactly what this feature's messaging exists to prevent.
+    @State private var discardNotice: String?
+    @State private var discardDismissTask: Task<Void, Never>?
     @State private var sessionElapsed: Int = 0
     /// Identity of the session currently being captured, carried through to the
     /// `PostProcessingJob` at stop time so the job can be tracked by session id.
@@ -48,9 +54,9 @@ struct ContentView: View {
     /// Single-consumer channel that serializes utterance writes to the markdown
     /// transcript and the JSONL crash-recovery file. Prevents the two stores from
     /// drifting out of order when `handleNewUtterance` fires faster than the
-    /// individual Task closures can run.
-    @State private var utteranceContinuation: AsyncStream<UtteranceWrite>.Continuation?
-    @State private var utteranceWriterTask: Task<Void, Never>?
+    /// individual Task closures can run. `stopSession` awaits its `flush()`
+    /// barrier before closing the session files.
+    @State private var utteranceChannel: UtteranceWriteChannel?
 
     /// How many of `transcriptStore.utterances` have already been handed to the
     /// writer channel. `handleNewUtterance` drains everything past this cursor so a
@@ -59,12 +65,6 @@ struct ContentView: View {
     /// persists all of them — the old `.last`-only yield silently dropped the
     /// earlier line(s). Reset to 0 whenever the store is cleared for a new session.
     @State private var persistedUtteranceCount = 0
-
-    private struct UtteranceWrite: Sendable {
-        let speaker: Speaker
-        let text: String
-        let timestamp: Date
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,9 +84,11 @@ struct ContentView: View {
                 )
             }
 
-            // Save banner
+            // Save banner (or the discard notice — never both; a discard writes nothing)
             if let url = savedFileURL, activeSessionType == nil {
                 saveBanner(url: url)
+            } else if let notice = discardNotice, activeSessionType == nil {
+                discardBanner(notice)
             }
 
             // Waveform ribbon
@@ -148,11 +150,20 @@ struct ContentView: View {
         }
         .onChange(of: transcriptionEngine?.isRunning ?? false) { _, running in
             // Mirror live recording state into AppServices so the MenuBarExtra
-            // scene (which can't see the engine) can show a recording indicator.
+            // scene (which can't see the engine) can show a recording indicator,
+            // and into the APIServer so /health and the start/stop gates answer
+            // off the MainActor.
             services.isRecording = running
+            apiServer.updateIsRecording(running)
             // Session ended through another path (capture error, API stop,
             // notification stop) — withdraw a pending stop confirmation.
             if !running { stopConfirmation.recordingDidEnd() }
+        }
+        .onChange(of: services.modelProvisioner.canStartRecording, initial: true) { _, ready in
+            // Mirror model readiness into the APIServer: /health's modelsReady
+            // and the /start 503 gate must respond even while a modal alert or
+            // panel has the MainActor parked in a nested run loop.
+            apiServer.updateModelsReady(ready)
         }
         .onChange(of: settings.transcriptionLanguage) {
             // Push setting changes to the ASR actor so subsequent transcribe calls
@@ -197,26 +208,17 @@ struct ContentView: View {
             }
 
             // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
-            if utteranceWriterTask == nil {
-                let (stream, cont) = AsyncStream.makeStream(of: UtteranceWrite.self)
-                utteranceContinuation = cont
-                let logger = services.transcriptLogger
-                let store = services.sessionStore
-                utteranceWriterTask = Task {
-                    defer { diagLog("[CHANNEL] utterance writer exited") }
-                    for await u in stream {
-                        let speakerName = u.speaker == .you ? "You" : "Them"
-                        await logger.append(speaker: speakerName, text: u.text, timestamp: u.timestamp)
-                        await store.appendRecord(SessionRecord(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
-                    }
-                }
+            if utteranceChannel == nil {
+                utteranceChannel = UtteranceWriteChannel(
+                    logger: services.transcriptLogger,
+                    store: services.sessionStore
+                )
             }
 
             apiServer.register(
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
-                canStartRecording: { services.modelProvisioner.canStartRecording },
                 onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
@@ -345,6 +347,25 @@ struct ContentView: View {
                 )
             }
             transcriptionEngine?.lastError = failure.message
+        }
+        .onChange(of: services.postProcessingQueue.lastDiscard) { _, discard in
+            guard let discard else { return }
+            // A discarded session still "finished" — walk the API lifecycle out of
+            // `.transcribing` just like completion/failure, or /status would report a
+            // transcription that never ends.
+            apiServer.sessionDidComplete(id: discard.jobId)
+            // In-app signal FIRST, independent of notification permission — with
+            // notifications denied the postDiscard below is silent, and the user
+            // must still learn why the transcript isn't in the vault.
+            discardNotice = "Short recording discarded (\(discard.durationSeconds)s) — at or under your discard threshold"
+            discardDismissTask?.cancel()
+            discardDismissTask = Task {
+                try? await Task.sleep(for: .seconds(8))
+                if !Task.isCancelled { discardNotice = nil }
+            }
+            Task {
+                await NotificationPresenter.shared.postDiscard(durationSeconds: discard.durationSeconds)
+            }
         }
     }
 
@@ -495,6 +516,31 @@ struct ContentView: View {
         .overlay(Divider(), alignment: .bottom)
     }
 
+    /// Save-banner variant for a discarded short session: same slot and styling,
+    /// but nothing was written, so no open-file affordance.
+    private func discardBanner(_ notice: String) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.fg2.opacity(0.15))
+                .frame(width: 16, height: 16)
+                .overlay(
+                    Image(systemName: "trash")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color.fg2)
+                )
+            Text(notice)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(Color.fg1)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.bg1.opacity(0.7))
+        .overlay(Divider(), alignment: .top)
+        .overlay(Divider(), alignment: .bottom)
+    }
+
     // MARK: - Helpers
 
     private var isRunning: Bool {
@@ -586,13 +632,17 @@ struct ContentView: View {
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
+        discardNotice = nil
+        discardDismissTask?.cancel()
 
         let sid = sessionId ?? SessionStore.generateSessionId()
 
-        // Determine output folder and app bundle ID based on session type
+        // Determine output folder and source-app label based on session type. The
+        // resolved conferencing app only labels the note (`source_app`) — system
+        // audio is captured display-wide, not scoped to that app's process (see
+        // SystemAudioCapture.bufferStream), so no bundle ID flows to the engine.
         let outputPath: String
         let sourceApp: String
-        var appBundleID: String?
         var resolvedAppName: String?
 
         switch type {
@@ -602,7 +652,6 @@ struct ContentView: View {
                let bundleID = frontApp.bundleIdentifier,
                let appName = conferencingAppName(bundleID) {
                 sourceApp = appName
-                appBundleID = bundleID
                 resolvedAppName = appName
             } else {
                 sourceApp = "Call"
@@ -682,7 +731,6 @@ struct ContentView: View {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
-                    appBundleID: appBundleID,
                     recordingContext: recordingContext
                 )
             } else {
@@ -725,6 +773,12 @@ struct ContentView: View {
         let startFailureReason = transcriptionEngine?.lastError
         await transcriptionEngine?.stop()
         transcriptionEngine?.lastError = startFailureReason ?? "Couldn't start recording."
+
+        // Same drain-then-barrier as stopSession: if capture partially came up,
+        // whatever was transcribed must reach the files before they close (and
+        // the speakersDetected guard below relies on the logger having seen it).
+        handleNewUtterance()
+        await utteranceChannel?.flush()
 
         // Close the half-open transcript session and delete the empty note created
         // before the failed start. Guarded: only remove the note when no utterances
@@ -789,6 +843,13 @@ struct ContentView: View {
             ? settings.recordingsFolderURL.map(RecordingRetentionConfig.init(folder:))
             : nil
 
+        // Short-recording discard applies to call captures only (voice memos are
+        // never dropped). Passing nil for voice memos / when the setting is off
+        // leaves the job's normal save path untouched.
+        let discardLimit: TimeInterval? = (wasCallCapture && settings.discardShortMeetings)
+            ? TimeInterval(settings.discardShortMeetingSeconds)
+            : nil
+
         Task {
             // Snapshot capture state BEFORE tearing down the engine, since the engine
             // may begin a new session (which reuses the capture objects) immediately.
@@ -802,6 +863,17 @@ struct ContentView: View {
             let wavWriteErrors = transcriptionEngine?.systemAudioWriteErrorCount ?? 0
 
             await transcriptionEngine?.stop()
+
+            // The engine drained the transcribers before returning, so every
+            // final utterance — including the one flushed at stop — is now in
+            // transcriptStore. But the write path to disk is still async:
+            // SwiftUI's .onChange may not have ticked, and the writer channel
+            // consumes in the background. Drain the cursor explicitly, then
+            // barrier the channel so the markdown + JSONL appends land BEFORE
+            // endSession() closes those files — an append after close is lost.
+            handleNewUtterance()
+            await utteranceChannel?.flush()
+
             await services.sessionStore.endSession()
             guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
                 transcriptionEngine?.assetStatus = "Ready"
@@ -828,7 +900,8 @@ struct ContentView: View {
                 clusterThreshold: Float(settings.diarizationClusterThreshold),
                 numberOfSpeakers: settings.diarizationNumberOfSpeakers,
                 retention: retention,
-                exportVoiceprints: settings.exportVoiceprints
+                exportVoiceprints: settings.exportVoiceprints,
+                discardIfShorterThanOrEqual: discardLimit
             )
 
             services.postProcessingQueue.enqueue(job)
@@ -929,10 +1002,17 @@ struct ContentView: View {
                 failed.append("\(orphan.wavURL.lastPathComponent): no sidecar — use Cmd+Opt+R")
                 continue
             }
-            let transcriptURL = sidecar.transcriptURL
+            var transcriptURL = sidecar.transcriptURL
             if !FileManager.default.fileExists(atPath: transcriptURL.path) {
-                failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
-                continue
+                // The sidecar path can go stale when the vault pipeline renames a
+                // note before its session finalizes — the note is still findable
+                // by its preserved `source_file:` frontmatter key.
+                if let renamed = TranscriptFinalizer.relocateRenamedNote(from: transcriptURL) {
+                    transcriptURL = renamed
+                } else {
+                    failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
+                    continue
+                }
             }
 
             do {
@@ -1160,7 +1240,7 @@ struct ContentView: View {
         // `.last` lost the earlier line from both the markdown and JSONL files.
         for index in persistedUtteranceCount..<count {
             let u = transcriptStore.utterances[index]
-            utteranceContinuation?.yield(UtteranceWrite(speaker: u.speaker, text: u.text, timestamp: u.timestamp))
+            utteranceChannel?.write(speaker: u.speaker, text: u.text, timestamp: u.timestamp)
         }
         persistedUtteranceCount = count
     }
