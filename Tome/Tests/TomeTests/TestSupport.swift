@@ -49,6 +49,7 @@ enum TestSupport {
     /// end-of-session snapshot for finalizer/job tests.
     static func makeSessionNote(
         vault: URL,
+        sessionGuid: String = "test-session-guid",
         suggestedFilename: String? = nil,
         utterances: [(speaker: String, text: String, offsetSeconds: Double)] = [("You", "hello world", 2.0)]
     ) async throws -> TranscriptSessionSnapshot {
@@ -56,6 +57,7 @@ enum TestSupport {
         let url = try await logger.startSession(
             sourceApp: "Test",
             vaultPath: vault.path,
+            sessionGuid: sessionGuid,
             suggestedFilename: suggestedFilename
         )
         _ = url
@@ -73,6 +75,7 @@ enum TestSupport {
     /// that need fields (suggestedFilename, timings) the logger didn't set.
     static func snapshot(
         filePath: URL,
+        sessionGuid: String = "test-session-guid",
         start: Date = Date(timeIntervalSinceNow: -60),
         end: Date = Date(),
         speakers: Set<String> = ["You"],
@@ -81,6 +84,8 @@ enum TestSupport {
     ) -> TranscriptSessionSnapshot {
         TranscriptSessionSnapshot(
             filePath: filePath,
+            sessionGuid: sessionGuid,
+            calendarEventId: nil,
             sessionStartTime: start,
             sessionEndTime: end,
             speakersDetected: speakers,

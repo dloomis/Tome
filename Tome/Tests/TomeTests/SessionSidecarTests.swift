@@ -8,6 +8,7 @@ import Testing
         SessionSidecar(
             schema: SessionSidecar.currentSchema,
             sessionId: "session_2026-07-05_10-00-00",
+            sessionGuid: "11111111-1111-4111-8111-111111111111",
             transcriptPath: transcriptPath,
             startedAt: Date(timeIntervalSince1970: 1_780_000_000),
             sourceApp: "Teams",
@@ -29,6 +30,7 @@ import Testing
         let wav = dir.appendingPathComponent("memo.mic.wav")
         let context = SessionRecordingContext(
             sessionId: "memo",
+            sessionGuid: "22222222-2222-4222-8222-222222222222",
             transcriptURL: URL(fileURLWithPath: "/vault/Memo.md"),
             sourceApp: "Voice Memo",
             sessionType: .voiceMemo,

@@ -22,6 +22,8 @@ actor TranscriptLogger {
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
     private var suggestedFilename: String?
     private var filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss"
+    private var sessionGuid: String = ""
+    private var calendarEventId: String?
 
     /// Set when a flush/synchronize/reopen path fails or when the underlying file
     /// disappears (vault unmounted). Read by the UI through the periodic
@@ -32,11 +34,17 @@ actor TranscriptLogger {
         suggestedFilename = name
     }
 
+    /// `sessionGuid` is the session's correlation key, written into the note's
+    /// frontmatter immediately (not at finalize time) so a crash-orphaned
+    /// transcript already carries it. Defaults to a fresh mint so no path can
+    /// produce an unstamped note.
     @discardableResult
     func startSession(
         sourceApp: String,
         vaultPath: String,
         sessionType: SessionType = .callCapture,
+        sessionGuid: String = UUID().uuidString.lowercased(),
+        calendarEventId: String? = nil,
         suggestedFilename: String? = nil,
         filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss",
         filenameTypeLabel: String? = nil
@@ -48,6 +56,8 @@ actor TranscriptLogger {
         self.utteranceBuffer = []
         self.suggestedFilename = suggestedFilename
         self.filenameDateFormat = filenameDateFormat
+        self.sessionGuid = sessionGuid
+        self.calendarEventId = calendarEventId
         self.lastError = nil
 
         let expandedPath = NSString(string: vaultPath).expandingTildeInPath
@@ -108,6 +118,7 @@ time: "\(timeStr)"
 duration: "00:00"
 source_app: "\(sourceApp)"
 source_file: "\(filename)"
+session_guid: "\(sessionGuid)"
 attendees: []
 context: ""
 tags:
@@ -294,6 +305,8 @@ tags:
 
         let snapshot = TranscriptSessionSnapshot(
             filePath: filePath,
+            sessionGuid: sessionGuid,
+            calendarEventId: calendarEventId,
             sessionStartTime: startTime,
             sessionEndTime: endTime,
             speakersDetected: speakersDetected,
@@ -314,5 +327,7 @@ tags:
         sessionContext = ""
         suggestedFilename = nil
         filenameDateFormat = "yyyy-MM-dd HH-mm-ss"
+        sessionGuid = ""
+        calendarEventId = nil
     }
 }

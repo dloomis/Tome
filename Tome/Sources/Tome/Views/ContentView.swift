@@ -219,7 +219,7 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
-                onStart: { type, sessionId, context, filename in startSession(type: type, sessionId: sessionId, meetingContext: context, suggestedFilename: filename) },
+                onStart: { type, sessionId, sessionGuid, context, filename in startSession(type: type, sessionId: sessionId, sessionGuid: sessionGuid, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
             apiServer.start()
@@ -338,7 +338,8 @@ struct ContentView: View {
             guard let failure else { return }
             // Walk the API lifecycle out of `.transcribing` — without this a failed
             // job left /status reporting a transcription that would never finish.
-            apiServer.sessionDidComplete(id: failure.jobId)
+            // The by-guid table records `failed` + the message for new pollers.
+            apiServer.sessionDidFail(id: failure.jobId, message: failure.message)
             // The WAVs were preserved; tell the user now, not at next launch.
             Task {
                 await NotificationPresenter.shared.postJobFailure(
@@ -352,8 +353,9 @@ struct ContentView: View {
             guard let discard else { return }
             // A discarded session still "finished" — walk the API lifecycle out of
             // `.transcribing` just like completion/failure, or /status would report a
-            // transcription that never ends.
-            apiServer.sessionDidComplete(id: discard.jobId)
+            // transcription that never ends. By-guid pollers see `failed`: nothing
+            // was written, so `complete` (with no transcript) would read as a bug.
+            apiServer.sessionDidFail(id: discard.jobId, message: "Discarded: short recording (\(discard.durationSeconds)s ≤ threshold)")
             // In-app signal FIRST, independent of notification permission — with
             // notifications denied the postDiscard below is silent, and the user
             // must still learn why the transcript isn't in the vault.
@@ -612,7 +614,7 @@ struct ContentView: View {
         NotificationPresenter.shared.clearSilencePrompt()
     }
 
-    private func startSession(type: SessionType, sessionId: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
+    private func startSession(type: SessionType, sessionId: String? = nil, sessionGuid: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
         // UI gating makes this unreachable from the buttons; API starts and
         // races land here. Surfaced via the same error row the UI already has.
         guard services.modelProvisioner.canStartRecording else {
@@ -636,6 +638,10 @@ struct ContentView: View {
         discardDismissTask?.cancel()
 
         let sid = sessionId ?? SessionStore.generateSessionId()
+        // Uniform identity: API starts arrive with a guid (caller-supplied or
+        // handler-minted); manual menu-bar starts mint here, so every session's
+        // artifacts carry one.
+        let guid = sessionGuid ?? UUID().uuidString.lowercased()
 
         // Determine output folder and source-app label based on session type. The
         // resolved conferencing app only labels the note (`source_app`) — system
@@ -679,6 +685,7 @@ struct ContentView: View {
             await services.sessionStore.startSession(sessionId: sid)
             apiServer.sessionDidStart(
                 id: sid,
+                guid: guid,
                 subject: effectiveContext?.subject,
                 suggestedFilename: suggestedFilename
             )
@@ -688,6 +695,8 @@ struct ContentView: View {
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
                     sessionType: type,
+                    sessionGuid: guid,
+                    calendarEventId: meetingContext?.calendarEventId,
                     suggestedFilename: suggestedFilename,
                     filenameDateFormat: settings.filenameDateFormat,
                     filenameTypeLabel: type == .voiceMemo
@@ -702,7 +711,7 @@ struct ContentView: View {
                 // exists to delete since startSession threw.
                 await services.sessionStore.endSession()
                 apiServer.sessionDidStop(id: sid)
-                apiServer.sessionDidComplete(id: sid)
+                apiServer.sessionDidFail(id: sid, message: "Couldn't create the transcript: \(error.localizedDescription)")
                 transcriptionEngine?.lastError = error.localizedDescription
                 services.isSessionPending = false   // start aborted (F-2)
                 return
@@ -721,6 +730,7 @@ struct ContentView: View {
 
             let recordingContext = SessionRecordingContext(
                 sessionId: sid,
+                sessionGuid: guid,
                 transcriptURL: transcriptURL,
                 sourceApp: sourceApp,
                 sessionType: type,
@@ -792,8 +802,9 @@ struct ContentView: View {
 
         // Walk the API out of `.recording` back to idle (a bare sessionDidComplete
         // would stall, since it refuses to advance while state is `.recording`).
+        // Recorded as `failed` in the by-guid table — nothing was produced.
         apiServer.sessionDidStop(id: sessionId)
-        apiServer.sessionDidComplete(id: sessionId)
+        apiServer.sessionDidFail(id: sessionId, message: transcriptionEngine?.lastError ?? "Recording failed to start")
 
         // Return the UI to idle: the control bar shows Start, not Stop.
         activeSessionType = nil
@@ -918,7 +929,7 @@ struct ContentView: View {
     /// the active recording's UI takes precedence and a system notification handles it.
     private func handleJobCompleted(jobId: String, savedURL: URL, sessionType: SessionType) {
         apiServer.diarizationDidComplete()
-        apiServer.sessionDidComplete(id: jobId)
+        apiServer.sessionDidComplete(id: jobId, savedURL: savedURL)
 
         Task { await NotificationPresenter.shared.postCompletion(savedURL: savedURL, sessionType: sessionType) }
 

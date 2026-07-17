@@ -58,6 +58,9 @@ func speakerLabels(from orderedIds: some Sequence<String>, startingAt: Int = 2) 
 /// through to the audio capture for sidecar emission.
 struct SessionRecordingContext: Sendable {
     let sessionId: String
+    /// Correlation GUID (caller-supplied via the API, else Tome-minted at start).
+    /// Rides into the crash-recovery sidecar so an orphan keeps its identity.
+    let sessionGuid: String
     let transcriptURL: URL
     let sourceApp: String
     let sessionType: SessionType
@@ -90,6 +93,13 @@ struct SessionRecord: Codable {
 /// replaces "Them" with specific speaker labels.
 struct TranscriptSessionSnapshot: Sendable {
     let filePath: URL
+    /// Correlation GUID for this session — already stamped into the live note's
+    /// frontmatter (`session_guid:`) at start; carried here so post-processing
+    /// artifacts (voiceprint sidecar) can be keyed to the same identity.
+    let sessionGuid: String
+    /// Calendar event id from the API caller's `meetingContext`, when present.
+    /// Persisted for future frontmatter emission; currently metadata-only.
+    let calendarEventId: String?
     let sessionStartTime: Date
     /// Wall-clock moment the session stopped, captured in `TranscriptLogger.endSession()`.
     /// Duration is `sessionEndTime − sessionStartTime`; pinning it at stop time keeps
@@ -114,6 +124,8 @@ struct TranscriptSessionSnapshot: Sendable {
     func relocated(to newPath: URL) -> TranscriptSessionSnapshot {
         TranscriptSessionSnapshot(
             filePath: newPath,
+            sessionGuid: sessionGuid,
+            calendarEventId: calendarEventId,
             sessionStartTime: sessionStartTime,
             sessionEndTime: sessionEndTime,
             speakersDetected: speakersDetected,
@@ -133,6 +145,9 @@ struct TranscriptSessionSnapshot: Sendable {
 /// speaker information through the diarization → rebuild → finalize pipeline.
 struct SessionHandle: Sendable {
     let id: String
+    /// Correlation GUID, sourced from the transcript snapshot (single source of
+    /// truth — the value already stamped in the note's frontmatter).
+    var sessionGuid: String { transcript.sessionGuid }
     let sessionType: SessionType
     let sourceApp: String
     /// Path to the buffered system audio WAV. Nil when the session did not capture

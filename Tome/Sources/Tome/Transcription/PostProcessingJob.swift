@@ -259,7 +259,7 @@ final class PostProcessingJob: Identifiable {
             // and `startingAt` must equal the base the body rewrite used.
             if didRebuildSpeakers,
                let diar = diarOutput,
-               let sidecar = VoiceprintSidecar.build(from: diar, source: voiceprintSource, includesYou: voiceprintIncludesYou, startingAt: speakerBase) {
+               let sidecar = VoiceprintSidecar.build(from: diar, source: voiceprintSource, includesYou: voiceprintIncludesYou, startingAt: speakerBase, sessionGuid: handle.sessionGuid) {
                 let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: savedPath)
                 do {
                     try VoiceprintSidecar.write(sidecar, to: sidecarURL)

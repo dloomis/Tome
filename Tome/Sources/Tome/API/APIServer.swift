@@ -22,6 +22,37 @@ enum SessionLifecycleState: String, Codable, Sendable {
 /// MainActor, and only while a session is active.
 final class APIServer: @unchecked Sendable {
 
+    // MARK: - Per-GUID Session Tracking
+
+    /// Coarse per-session state for `/sessions/by-guid/{guid}/status`. Collapses
+    /// the job's finer phases (queued|diarizing|reTranscribing|finalizing) into
+    /// `transcribing` — callers only need the coarse state.
+    enum TrackedSessionState: String, Sendable {
+        case recording
+        case transcribing
+        case complete
+        case failed
+    }
+
+    /// One session's identity + lifecycle, keyed by its GUID. Registered at
+    /// start (API handlers register atomically inside the start gate; manual
+    /// menu-bar starts register via `sessionDidStart`) and retained past
+    /// completion so a polling caller can still resolve a finished session.
+    struct TrackedSession: Sendable {
+        let sessionGuid: String
+        let sessionId: String
+        var state: TrackedSessionState
+        let startedAt: Date
+        /// Final transcript URL — set on completion, after collision suffixes/renames.
+        var transcriptURL: URL?
+        var errorMessage: String?
+        var finishedAt: Date?
+    }
+
+    /// Retain every live session plus at most this many finished (complete or
+    /// failed) ones. Evicted oldest-finished-first at finish time — no timers.
+    static let maxFinishedTrackedSessions = 20
+
     // MARK: - Mirrored State
 
     /// Everything the MainActor-free endpoints answer from. Guarded by `lock`.
@@ -44,8 +75,21 @@ final class APIServer: @unchecked Sendable {
         /// session goes idle.
         var recordingSubject: String?
         var recordingFilename: String?
+        /// GUID of the in-flight session, echoed by GET /status. Lifecycle
+        /// mirrors `recordingSubject`/`recordingFilename`.
+        var recordingGuid: String?
         var isRecording = false
         var modelsReady = false
+        /// GUID-keyed session table for `/sessions/by-guid/`. Live sessions plus
+        /// the most recent `maxFinishedTrackedSessions` finished ones.
+        var sessionsByGuid: [String: TrackedSession] = [:]
+        /// Reverse index: the completion/failure events that flow in from the
+        /// post-processing queue carry only the internal sessionId. On sessionId
+        /// reuse (second-granular ids) the newest registration wins — same
+        /// limitation as `sessionStates`.
+        var guidBySessionId: [String: String] = [:]
+        /// Finished GUIDs in finish order, for capped eviction.
+        var finishedGuidOrder: [String] = []
     }
 
     private let lock = NSLock()
@@ -67,7 +111,8 @@ final class APIServer: @unchecked Sendable {
 
     // Guarded by `lock` (Sendable, so handlers may read them on the API queue).
     private var _sessionStore: SessionStore?
-    private var _onStartSession: (@MainActor @Sendable (SessionType, String, MeetingContext?, String?) -> Void)?
+    /// (type, sessionId, sessionGuid, meetingContext, suggestedFilename)
+    private var _onStartSession: (@MainActor @Sendable (SessionType, String, String, MeetingContext?, String?) -> Void)?
     private var _onStopSession: (@MainActor @Sendable () -> Void)?
 
     // MARK: - Networking
@@ -103,7 +148,7 @@ final class APIServer: @unchecked Sendable {
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
-        onStart: @escaping @MainActor @Sendable (SessionType, String, MeetingContext?, String?) -> Void,
+        onStart: @escaping @MainActor @Sendable (SessionType, String, String, MeetingContext?, String?) -> Void,
         onStop: @escaping @MainActor @Sendable () -> Void
     ) {
         self.transcriptStore = transcriptStore
@@ -144,11 +189,59 @@ final class APIServer: @unchecked Sendable {
         withState { $0.lifecycleState }
     }
 
+    /// Register a session in the GUID table so `/sessions/by-guid/{guid}/status`
+    /// resolves it. Idempotent per guid — the API start handlers register inside
+    /// their atomic gate (so a poll racing the MainActor pickup already resolves),
+    /// and `sessionDidStart` re-registers harmlessly; manual menu-bar starts reach
+    /// the table only through `sessionDidStart`.
+    func registerSession(guid: String, sessionId: String) {
+        withState { s in Self.registerTracked(guid: guid, sessionId: sessionId, in: &s) }
+    }
+
+    private static func registerTracked(guid: String, sessionId: String, in s: inout State) {
+        guard s.sessionsByGuid[guid] == nil else { return }
+        s.sessionsByGuid[guid] = TrackedSession(
+            sessionGuid: guid,
+            sessionId: sessionId,
+            state: .recording,
+            startedAt: Date()
+        )
+        s.guidBySessionId[sessionId] = guid
+    }
+
+    /// Move a tracked session to a terminal state and evict beyond the finished
+    /// cap. No-op when the session was never registered or already finished — a
+    /// late duplicate completion must not flip a `failed` verdict (or vice versa).
+    private static func finishTracked(
+        sessionId: String, as newState: TrackedSessionState,
+        transcriptURL: URL?, message: String?, in s: inout State
+    ) {
+        guard let guid = s.guidBySessionId[sessionId],
+              var tracked = s.sessionsByGuid[guid],
+              tracked.finishedAt == nil else { return }
+        tracked.state = newState
+        tracked.transcriptURL = transcriptURL ?? tracked.transcriptURL
+        tracked.errorMessage = message
+        tracked.finishedAt = Date()
+        s.sessionsByGuid[guid] = tracked
+        s.finishedGuidOrder.append(guid)
+        while s.finishedGuidOrder.count > maxFinishedTrackedSessions {
+            let evicted = s.finishedGuidOrder.removeFirst()
+            guard let dead = s.sessionsByGuid[evicted], dead.finishedAt != nil else { continue }
+            s.sessionsByGuid.removeValue(forKey: evicted)
+            if s.guidBySessionId[dead.sessionId] == evicted {
+                s.guidBySessionId.removeValue(forKey: dead.sessionId)
+            }
+        }
+    }
+
     /// Mark a session as started (called by ContentView after startSession succeeds).
     /// `subject`/`suggestedFilename` are the resolved recording identity (API context,
     /// else autodetected, else nil) echoed by GET /status; passing them here also
     /// clears any stale values from a prior session on a no-context UI start.
-    func sessionDidStart(id: String, subject: String? = nil, suggestedFilename: String? = nil) {
+    /// `guid` also lands the session in the by-guid table (idempotent for API
+    /// starts, which already registered inside the start gate).
+    func sessionDidStart(id: String, guid: String? = nil, subject: String? = nil, suggestedFilename: String? = nil) {
         withState { s in
             s.currentSessionId = id
             s.sessionStates[id] = .recording
@@ -156,6 +249,10 @@ final class APIServer: @unchecked Sendable {
             s.hasDiarizationCompleted = false
             s.recordingSubject = subject
             s.recordingFilename = suggestedFilename
+            s.recordingGuid = guid ?? s.recordingGuid
+            if let guid {
+                Self.registerTracked(guid: guid, sessionId: id, in: &s)
+            }
         }
     }
 
@@ -168,6 +265,12 @@ final class APIServer: @unchecked Sendable {
             if s.currentSessionId == id {
                 s.lifecycleState = .transcribing
             }
+            if let guid = s.guidBySessionId[id],
+               var tracked = s.sessionsByGuid[guid],
+               tracked.state == .recording {
+                tracked.state = .transcribing
+                s.sessionsByGuid[guid] = tracked
+            }
         }
     }
 
@@ -179,9 +282,12 @@ final class APIServer: @unchecked Sendable {
 
     /// Mark that a specific session's transcript file has been finalized. The `id`
     /// is required because a different session may be recording when this fires
-    /// from the background queue's completion event.
-    func sessionDidComplete(id: String) {
+    /// from the background queue's completion event. `savedURL` is the final
+    /// transcript location (after collision suffixes/renames), surfaced to
+    /// by-guid pollers; nil for paths with nothing written (rolled-back starts).
+    func sessionDidComplete(id: String, savedURL: URL? = nil) {
         withState { s in
+            Self.finishTracked(sessionId: id, as: .complete, transcriptURL: savedURL, message: nil, in: &s)
             s.sessionStates[id] = .complete
             // Only advance the top-level lifecycle if this is the most recent session.
             // A newer session's `.recording` takes precedence.
@@ -199,12 +305,24 @@ final class APIServer: @unchecked Sendable {
                     s.currentSessionId = nil
                     s.recordingSubject = nil
                     s.recordingFilename = nil
+                    s.recordingGuid = nil
                 } else if s.lifecycleState == .complete {
                     // This was an older session's completion; don't touch currentSessionId.
                     s.lifecycleState = .idle
                 }
             }
         }
+    }
+
+    /// Mark a session as failed (post-processing threw, the session was discarded,
+    /// or a start rolled back). Walks the legacy global lifecycle exactly like a
+    /// completion — old pollers see `complete` and reset to idle as before — while
+    /// the by-guid table records `failed` + the message for new clients.
+    func sessionDidFail(id: String, message: String) {
+        withState { s in
+            Self.finishTracked(sessionId: id, as: .failed, transcriptURL: nil, message: message, in: &s)
+        }
+        sessionDidComplete(id: id)
     }
 
     // MARK: - Server Lifecycle
@@ -394,6 +512,12 @@ final class APIServer: @unchecked Sendable {
         case ("POST", "/sessions/stop"):
             return handleStopSession(body: body)
 
+        // Must precede the generic /sessions/{id}/status pattern, which would
+        // otherwise capture "by-guid/{guid}" as an {id}.
+        case ("GET", let p) where p.matchesPattern("/sessions/by-guid/", suffix: "/status"):
+            let guid = p.extractSegment(prefix: "/sessions/by-guid/", suffix: "/status")
+            return handleSessionGuidStatus(guid: guid)
+
         case ("GET", let p) where p.matchesPattern("/sessions/", suffix: "/status"):
             let id = p.extractSegment(prefix: "/sessions/", suffix: "/status")
             return await handleSessionStatus(sessionId: id)
@@ -433,13 +557,14 @@ final class APIServer: @unchecked Sendable {
         }
 
         let sessionId = SessionStore.generateSessionId()
+        let sessionGuid = Self.acceptOrMintGuid(req?.sessionGuid)
 
         // One critical section: the gate check and the state transition are
         // atomic, so rapid duplicate requests can't both pass, and a /status
         // poll landing before the MainActor picks up onStartSession already
-        // sees .recording. `.transcribing` is NOT a blocker — post-processing
-        // of a previous session runs in the background so a new recording can
-        // start immediately.
+        // sees .recording (and can already resolve the guid). `.transcribing`
+        // is NOT a blocker — post-processing of a previous session runs in the
+        // background so a new recording can start immediately.
         enum Gate { case alreadyRecording, notReady, accepted }
         let gate: Gate = withState { s in
             if s.isRecording || s.lifecycleState == .recording { return .alreadyRecording }
@@ -450,6 +575,8 @@ final class APIServer: @unchecked Sendable {
             s.lifecycleState = .recording
             s.recordingSubject = req?.meetingContext?.subject
             s.recordingFilename = req?.suggestedFilename
+            s.recordingGuid = sessionGuid
+            Self.registerTracked(guid: sessionGuid, sessionId: sessionId, in: &s)
             return .accepted
         }
         switch gate {
@@ -465,10 +592,29 @@ final class APIServer: @unchecked Sendable {
         let context = req?.meetingContext
         let filename = req?.suggestedFilename
         Task { @MainActor in
-            onStart?(.callCapture, sessionId, context, filename)
+            onStart?(.callCapture, sessionId, sessionGuid, context, filename)
         }
 
-        return (200, #"{"ok":true}"#)
+        return (200, encode(WhisperCalStartResponse(
+            ok: true, sessionGuid: sessionGuid, sessionId: sessionId
+        )))
+    }
+
+    /// The caller's guid when usable, else a fresh lowercase UUIDv4. Any
+    /// non-empty string ≤ 64 chars is accepted — non-UUID shapes are the
+    /// caller's own correlation keys, not an error. The charset is restricted
+    /// because the guid is written verbatim into YAML frontmatter
+    /// (`session_guid: "<guid>"`) — a quote or newline would corrupt the note.
+    private static let guidAllowedScalars = CharacterSet(
+        charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:@+"
+    )
+
+    private static func acceptOrMintGuid(_ supplied: String?) -> String {
+        if let supplied, !supplied.isEmpty, supplied.count <= 64,
+           supplied.unicodeScalars.allSatisfy({ guidAllowedScalars.contains($0) }) {
+            return supplied
+        }
+        return UUID().uuidString.lowercased()
     }
 
     private func handleWhisperCalStop() -> (Int, String) {
@@ -486,14 +632,14 @@ final class APIServer: @unchecked Sendable {
         // Echo the active recording's identity while a session is in flight, so the
         // caller can show *which* meeting is recording. Omitted when idle/complete,
         // or when there's no subject/filename to report.
-        let (lifecycle, subject, filename) = withState {
-            ($0.lifecycleState, $0.recordingSubject, $0.recordingFilename)
+        let (lifecycle, subject, filename, guid) = withState {
+            ($0.lifecycleState, $0.recordingSubject, $0.recordingFilename, $0.recordingGuid)
         }
         let recording: WhisperCalRecordingInfo?
         if lifecycle == .recording || lifecycle == .transcribing,
-           subject != nil || filename != nil {
+           subject != nil || filename != nil || guid != nil {
             recording = WhisperCalRecordingInfo(
-                subject: subject, suggestedFilename: filename
+                subject: subject, suggestedFilename: filename, sessionGuid: guid
             )
         } else {
             recording = nil
@@ -521,6 +667,7 @@ final class APIServer: @unchecked Sendable {
         }
 
         let sessionId = SessionStore.generateSessionId()
+        let sessionGuid = Self.acceptOrMintGuid(req.sessionGuid)
 
         // Same atomic gate-and-transition as handleWhisperCalStart.
         enum Gate { case alreadyRecording, notReady, accepted }
@@ -533,6 +680,8 @@ final class APIServer: @unchecked Sendable {
             s.lifecycleState = .recording
             s.recordingSubject = req.meetingContext?.subject
             s.recordingFilename = nil
+            s.recordingGuid = sessionGuid
+            Self.registerTracked(guid: sessionGuid, sessionId: sessionId, in: &s)
             return .accepted
         }
         switch gate {
@@ -547,11 +696,29 @@ final class APIServer: @unchecked Sendable {
         let onStart = lock.withLock { _onStartSession }
         let context = req.meetingContext
         Task { @MainActor in
-            onStart?(type, sessionId, context, nil)
+            onStart?(type, sessionId, sessionGuid, context, nil)
         }
 
         return (200, encode(SessionStartResponse(
-            sessionId: sessionId, status: "starting"
+            sessionId: sessionId, sessionGuid: sessionGuid, status: "starting"
+        )))
+    }
+
+    /// GET /sessions/by-guid/{guid}/status — per-session lifecycle keyed by the
+    /// correlation GUID. Answers from the lock-guarded table (never the MainActor),
+    /// so it's safe in WhisperCal's polling path. 404 means never-seen or evicted.
+    private func handleSessionGuidStatus(guid: String) -> (Int, String) {
+        guard let tracked = withState({ $0.sessionsByGuid[guid] }) else {
+            return (404, #"{"error":"unknown sessionGuid"}"#)
+        }
+        return (200, encode(SessionGuidStatusResponse(
+            sessionGuid: tracked.sessionGuid,
+            sessionId: tracked.sessionId,
+            state: tracked.state.rawValue,
+            startedAt: tracked.state == .recording ? iso8601.string(from: tracked.startedAt) : nil,
+            transcriptFilename: tracked.transcriptURL?.lastPathComponent,
+            transcriptPath: tracked.transcriptURL?.path,
+            error: tracked.errorMessage
         )))
     }
 
@@ -1033,12 +1200,12 @@ final class APIServer: @unchecked Sendable {
         "/start": {
           "post": {
             "summary": "Start call capture (WhisperCal)",
-            "description": "Starts a new call capture recording. Returns 409 if already recording.",
+            "description": "Starts a new call capture recording. Returns 409 if already recording. The response echoes the caller-supplied sessionGuid (or a Tome-minted one) plus the internal sessionId, so the caller can track this exact session via /sessions/by-guid/{sessionGuid}/status.",
             "requestBody": {
               "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WhisperCalStartRequest" } } }
             },
             "responses": {
-              "200": { "description": "Recording started", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+              "200": { "description": "Recording started", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WhisperCalStartResponse" } } } },
               "409": { "description": "Already recording" },
               "503": { "description": "Transcription model not ready" }
             }
@@ -1106,6 +1273,19 @@ final class APIServer: @unchecked Sendable {
             }
           }
         },
+        "/sessions/by-guid/{sessionGuid}/status": {
+          "get": {
+            "summary": "Get session status by correlation GUID",
+            "description": "Per-session lifecycle keyed by the sessionGuid supplied at (or minted by) start. Retains every live session plus the 20 most recently finished; older sessions return 404. When complete, transcriptFilename/transcriptPath name the FINAL transcript file, after collision suffixes and renames.",
+            "parameters": [
+              { "name": "sessionGuid", "in": "path", "required": true, "schema": { "type": "string" } }
+            ],
+            "responses": {
+              "200": { "description": "Session status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionGuidStatusResponse" } } } },
+              "404": { "description": "Unknown sessionGuid (never seen, or evicted)" }
+            }
+          }
+        },
         "/sessions/{sessionId}/status": {
           "get": {
             "summary": "Get session status",
@@ -1147,8 +1327,29 @@ final class APIServer: @unchecked Sendable {
           "WhisperCalStartRequest": {
             "type": "object",
             "properties": {
+              "sessionGuid": { "type": "string", "maxLength": 64, "description": "Caller-generated correlation key for this session (canonically a lowercase UUIDv4). Echoed in the response and stamped into the transcript frontmatter (session_guid) and voiceprint sidecar. Minted by Tome when absent." },
               "suggestedFilename": { "type": "string", "description": "Output filename (without extension) for matching the transcript back to the meeting note." },
               "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
+            }
+          },
+          "WhisperCalStartResponse": {
+            "type": "object",
+            "properties": {
+              "ok": { "type": "boolean" },
+              "sessionGuid": { "type": "string", "description": "The caller-supplied guid, or a Tome-minted lowercase UUIDv4 when none was supplied." },
+              "sessionId": { "type": "string", "description": "Internal session id (second-granular, reusable — NOT a correlation key; use sessionGuid)." }
+            }
+          },
+          "SessionGuidStatusResponse": {
+            "type": "object",
+            "properties": {
+              "sessionGuid": { "type": "string" },
+              "sessionId": { "type": "string" },
+              "state": { "type": "string", "enum": ["recording", "transcribing", "complete", "failed"] },
+              "startedAt": { "type": "string", "format": "date-time", "description": "Present while recording." },
+              "transcriptFilename": { "type": "string", "description": "Final transcript basename (after collision -1/-2 suffixes and renames). Present when complete." },
+              "transcriptPath": { "type": "string", "description": "Absolute path of the finalized transcript. Present when complete." },
+              "error": { "type": "string", "description": "Present when state is failed." }
             }
           },
           "RecordingInfo": {
@@ -1156,7 +1357,8 @@ final class APIServer: @unchecked Sendable {
             "description": "The active recording's identity, present on /status only while recording or transcribing.",
             "properties": {
               "subject": { "type": "string", "description": "Subject/title of the meeting being recorded, from the start request's meetingContext (or Tome's autodetection)." },
-              "suggestedFilename": { "type": "string", "description": "The suggestedFilename supplied at start, if any." }
+              "suggestedFilename": { "type": "string", "description": "The suggestedFilename supplied at start, if any." },
+              "sessionGuid": { "type": "string", "description": "Correlation GUID of the in-flight session (caller-supplied or Tome-minted)." }
             }
           },
           "StartSessionRequest": {
@@ -1164,6 +1366,7 @@ final class APIServer: @unchecked Sendable {
             "required": ["type"],
             "properties": {
               "type": { "type": "string", "enum": ["callCapture", "voiceMemo"] },
+              "sessionGuid": { "type": "string", "maxLength": 64, "description": "Caller-generated correlation key; see WhisperCalStartRequest.sessionGuid." },
               "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
             }
           },
@@ -1186,6 +1389,7 @@ final class APIServer: @unchecked Sendable {
             "type": "object",
             "properties": {
               "sessionId": { "type": "string" },
+              "sessionGuid": { "type": "string", "description": "Correlation key for /sessions/by-guid/ — echoed if supplied, minted otherwise." },
               "status": { "type": "string", "enum": ["starting"] }
             }
           },

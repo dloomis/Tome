@@ -15,7 +15,7 @@ import Testing
         let sysWAV = try TestSupport.writeWAV(at: dir.appendingPathComponent("a.wav"), seconds: 1.5)
         try SessionSidecar.write(
             SessionSidecar(
-                schema: SessionSidecar.currentSchema, sessionId: "a",
+                schema: SessionSidecar.currentSchema, sessionId: "a", sessionGuid: "guid-a",
                 transcriptPath: "/vault/A.md", startedAt: Date(), sourceApp: "Test",
                 sessionType: .callCapture, sampleRate: 48_000, channels: 1,
                 bitsPerSample: 32, appVersion: "test"
@@ -52,7 +52,7 @@ import Testing
         let micWAV = try TestSupport.writeWAV(at: dir.appendingPathComponent("memo.mic.wav"), seconds: 1.5)
         try SessionSidecar.write(
             SessionSidecar(
-                schema: SessionSidecar.currentSchema, sessionId: "memo",
+                schema: SessionSidecar.currentSchema, sessionId: "memo", sessionGuid: "guid-memo",
                 transcriptPath: "/vault/Memo.md", startedAt: Date(), sourceApp: "Voice Memo",
                 sessionType: .voiceMemo, sampleRate: 48_000, channels: 1,
                 bitsPerSample: 32, appVersion: "test"
@@ -120,7 +120,7 @@ import Testing
         try TestSupport.writeWAV(at: dir.appendingPathComponent("a.mic.wav"), seconds: 1.5)
         try SessionSidecar.write(
             SessionSidecar(
-                schema: SessionSidecar.currentSchema, sessionId: "a",
+                schema: SessionSidecar.currentSchema, sessionId: "a", sessionGuid: "guid-a",
                 transcriptPath: "/vault/A.md", startedAt: Date(), sourceApp: "T",
                 sessionType: .callCapture, sampleRate: 48_000, channels: 1,
                 bitsPerSample: 32, appVersion: "test"

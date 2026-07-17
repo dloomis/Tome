@@ -13,11 +13,17 @@ struct MeetingContext: Codable, Sendable {
 /// Request body for POST /api/v1/sessions/start
 struct StartSessionRequest: Codable, Sendable {
     let type: String
+    /// Caller-supplied correlation key (see `WhisperCalStartRequest.sessionGuid`).
+    let sessionGuid: String?
     let meetingContext: MeetingContext?
 }
 
 /// Request body for POST /api/v1/start (WhisperCal integration)
 struct WhisperCalStartRequest: Codable, Sendable {
+    /// Caller-supplied correlation key for this session, echoed in the response
+    /// and stamped into every output artifact. Any non-empty string ≤ 64 chars
+    /// is accepted (canonically a lowercase UUIDv4); Tome mints one when absent.
+    let sessionGuid: String?
     let suggestedFilename: String?
     let meetingContext: MeetingContext?
 }
@@ -41,6 +47,33 @@ struct HealthResponse: Codable, Sendable {
 struct WhisperCalRecordingInfo: Codable, Sendable {
     let subject: String?
     let suggestedFilename: String?
+    /// The session GUID (caller-supplied or Tome-minted) of the in-flight session.
+    let sessionGuid: String?
+}
+
+/// Response body for POST /api/v1/start — echoes the correlation identifiers so
+/// the caller can track this exact session through `/sessions/by-guid/`. Replaces
+/// the historical bare `{"ok":true}` literal; old clients that only read `ok`
+/// are unaffected by the additive fields.
+struct WhisperCalStartResponse: Codable, Sendable {
+    let ok: Bool
+    let sessionGuid: String
+    let sessionId: String
+}
+
+/// Response body for GET /api/v1/sessions/by-guid/{guid}/status.
+struct SessionGuidStatusResponse: Codable, Sendable {
+    let sessionGuid: String
+    let sessionId: String
+    let state: String            // recording | transcribing | complete | failed
+    /// ISO 8601 start moment — present while recording.
+    let startedAt: String?
+    /// Final transcript basename, after collision suffixes and renames — when complete.
+    let transcriptFilename: String?
+    /// Absolute path of the finalized transcript — when complete.
+    let transcriptPath: String?
+    /// Failure phase or message — when state == "failed".
+    let error: String?
 }
 
 /// Response body for GET /api/v1/status (WhisperCal integration). `recording` is
@@ -53,6 +86,8 @@ struct WhisperCalStatusResponse: Codable, Sendable {
 
 struct SessionStartResponse: Codable, Sendable {
     let sessionId: String
+    /// Correlation key for `/sessions/by-guid/` — echoed if supplied, minted otherwise.
+    let sessionGuid: String
     let status: String
 }
 

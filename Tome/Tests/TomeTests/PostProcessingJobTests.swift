@@ -96,7 +96,7 @@ import Testing
         // Mic-only sessions emit a sidecar next to the mic WAV; success must remove it.
         try SessionSidecar.write(
             SessionSidecar(
-                schema: SessionSidecar.currentSchema, sessionId: "j2",
+                schema: SessionSidecar.currentSchema, sessionId: "j2", sessionGuid: "guid-j2",
                 transcriptPath: fx.snapshot.filePath.path, startedAt: fx.snapshot.sessionStartTime,
                 sourceApp: "Test", sessionType: .voiceMemo, sampleRate: 48_000,
                 channels: 1, bitsPerSample: 32, appVersion: "test"
@@ -172,7 +172,7 @@ import Testing
         // the crash-recovery pairing we must keep valid across the rename.
         let systemWAV = fx.dir.appendingPathComponent("j4.wav")
         let sidecar = SessionSidecar(
-            schema: SessionSidecar.currentSchema, sessionId: "j4",
+            schema: SessionSidecar.currentSchema, sessionId: "j4", sessionGuid: "guid-j4",
             transcriptPath: fx.snapshot.filePath.path,
             startedAt: fx.snapshot.sessionStartTime, sourceApp: "Test", sessionType: .callCapture,
             sampleRate: 48_000, channels: 1, bitsPerSample: 32, appVersion: "test"

@@ -92,11 +92,19 @@ enum Recovery {
         // segment.startTime offsets reconstruct to real wall-clock timestamps.
         let sessionStartTime = wav.modifiedAt.addingTimeInterval(-wav.durationSeconds)
 
+        // The note's own `session_guid:` (stamped at session start by the live
+        // logger) is the identity every recovered artifact must reuse — minting
+        // a fresh one here would disagree with the frontmatter. Nil only for
+        // notes from pre-guid builds.
+        let sessionGuid = parseSessionGuid(fromTranscriptAt: transcriptURL)
+
         // We don't actually parse much from the .md — the body is what we rewrite,
         // and frontmatter is preserved verbatim (the user's pipeline curates it
         // outside Tome). We just need *a* snapshot to feed the existing functions.
         var snapshot = TranscriptSessionSnapshot(
             filePath: transcriptURL,
+            sessionGuid: sessionGuid ?? "",
+            calendarEventId: nil,
             sessionStartTime: sessionStartTime,
             sessionEndTime: wav.modifiedAt,  // recording end ≈ WAV's last write
             speakersDetected: ["You", "Them"],
@@ -166,7 +174,7 @@ enum Recovery {
         // sidecar's "Speaker N" keys come from the same `speakerLabels` map the body rewrite
         // used. Best-effort: the transcript is already saved, so a failure here is non-fatal.
         if exportVoiceprints {
-            if let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false) {
+            if let sidecar = VoiceprintSidecar.build(from: diar, source: "system", includesYou: false, sessionGuid: sessionGuid) {
                 let sidecarURL = VoiceprintSidecar.sidecarURL(forTranscript: transcriptURL)
                 do {
                     try VoiceprintSidecar.write(sidecar, to: sidecarURL)
@@ -182,6 +190,22 @@ enum Recovery {
 
         diagLog("[RECOVERY] complete: \(transcriptURL.lastPathComponent)")
         return transcriptURL
+    }
+
+    /// Read the `session_guid:` frontmatter key from the transcript head, quoted
+    /// or not (external YAML round-trips strip quotes — same tolerance as
+    /// `TranscriptFinalizer.relocateRenamedNote`). Nil for pre-guid notes.
+    static func parseSessionGuid(fromTranscriptAt url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        let data = (try? handle.read(upToCount: 4096)) ?? nil
+        try? handle.close()
+        guard let data else { return nil }
+        let head = String(decoding: data, as: UTF8.self)
+        guard let regex = try? NSRegularExpression(pattern: #"(?m)^session_guid:\s*"?([^"\n]+?)"?\s*$"#),
+              let match = regex.firstMatch(in: head, range: NSRange(head.startIndex..., in: head)),
+              let range = Range(match.range(at: 1), in: head) else { return nil }
+        let guid = String(head[range])
+        return guid.isEmpty ? nil : guid
     }
 
     private static func updateDurationFields(at url: URL, durationSeconds: Int) {

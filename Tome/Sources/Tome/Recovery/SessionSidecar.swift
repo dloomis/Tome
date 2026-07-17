@@ -10,12 +10,17 @@ import Foundation
 /// gets smarter (multi-stream attribution, per-segment confidence priors, etc.),
 /// and the reader needs to handle older sidecars gracefully.
 struct SessionSidecar: Codable, Sendable {
-    /// Bump when adding required fields. Current schema=1 carries everything
-    /// `Recovery.run` needs to rebuild a `TranscriptSessionSnapshot`.
-    static let currentSchema = 1
+    /// Bump when adding required fields. Schema=1 carries everything
+    /// `Recovery.run` needs to rebuild a `TranscriptSessionSnapshot`;
+    /// schema=2 adds the optional `sessionGuid` correlation key (optional so
+    /// schema-1 sidecars from older builds still decode).
+    static let currentSchema = 2
 
     let schema: Int
     let sessionId: String
+    /// Correlation GUID of the session this WAV belongs to. Nil only for
+    /// sidecars written by pre-guid builds.
+    let sessionGuid: String?
     let transcriptPath: String
     let startedAt: Date
     let sourceApp: String
@@ -58,6 +63,7 @@ struct SessionSidecar: Codable, Sendable {
         let sidecar = SessionSidecar(
             schema: currentSchema,
             sessionId: context.sessionId,
+            sessionGuid: context.sessionGuid,
             transcriptPath: context.transcriptURL.path,
             startedAt: context.startedAt,
             sourceApp: context.sourceApp,
@@ -124,6 +130,7 @@ struct SessionSidecar: Codable, Sendable {
         let updated = SessionSidecar(
             schema: old.schema,
             sessionId: old.sessionId,
+            sessionGuid: old.sessionGuid,
             transcriptPath: newTranscriptURL.path,
             startedAt: old.startedAt,
             sourceApp: old.sourceApp,

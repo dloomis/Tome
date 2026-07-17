@@ -38,6 +38,11 @@ struct VoiceprintSidecar: Codable, Sendable {
     let source: String
     /// True when the diarized stream includes the recording user (mic-only sessions).
     let includesYou: Bool
+    /// Correlation GUID of the originating session — matches the transcript's
+    /// `session_guid:` frontmatter. Optional (schema stays 1: additive field,
+    /// unknown-field-tolerant decoders are unaffected); nil for backfill runs
+    /// that predate the guid.
+    let sessionGuid: String?
     /// Keyed by transcript labels ("Speaker 2", …) so a consumer can join a centroid to
     /// the label it confirmed during speaker tagging.
     let speakers: [String: Speaker]
@@ -54,7 +59,7 @@ struct VoiceprintSidecar: Codable, Sendable {
     /// "SPEAKER_n" ids to the friendly labels the transcript body uses, via the shared
     /// `speakerLabels` map, so the keys line up with what the speaker-tag step sees.
     /// Returns nil when there is nothing worth writing.
-    static func build(from diar: DiarizationOutput, source: String, includesYou: Bool, startingAt: Int = 2) -> VoiceprintSidecar? {
+    static func build(from diar: DiarizationOutput, source: String, includesYou: Bool, startingAt: Int = 2, sessionGuid: String? = nil) -> VoiceprintSidecar? {
         guard !diar.centroids.isEmpty else { return nil }
 
         let labelMap = speakerLabels(from: diar.segments.map(\.speakerId), startingAt: startingAt)
@@ -90,6 +95,7 @@ struct VoiceprintSidecar: Codable, Sendable {
             dimension: dimension,
             source: source,
             includesYou: includesYou,
+            sessionGuid: sessionGuid,
             speakers: speakers
         )
     }
