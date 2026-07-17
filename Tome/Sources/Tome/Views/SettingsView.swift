@@ -208,6 +208,20 @@ private struct TranscriptionTab: View {
                 Text("Expected speaker count. 0 = automatic. Default: 0")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+
+                HStack {
+                    Text("Same-Speaker Merge Gap")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text(String(format: "%.2fs", settings.diarizationMergeGapSeconds))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .trailing)
+                }
+                Slider(value: $settings.diarizationMergeGapSeconds, in: 0.0...3.0, step: 0.25)
+                Text("Merges a speaker's consecutive segments up to this pause into one block — higher combines sentence fragments into paragraphs. Never merges different speakers. Default: 1.50s")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

@@ -1105,7 +1105,8 @@ final class TranscriptionEngine {
         asrCoordinator: ASRCoordinator,
         bufferURL: URL,
         segments: [DiarizedSegment],
-        speakerNumberBase: Int = 2
+        speakerNumberBase: Int = 2,
+        mergeGapSeconds: Double = 1.5
     ) async -> [ReTranscribedSegment]? {
         guard FileManager.default.fileExists(atPath: bufferURL.path) else {
             diagLog("[RETRANSCRIBE] FAILED: Buffer file missing at \(bufferURL.path)")
@@ -1118,7 +1119,8 @@ final class TranscriptionEngine {
             asrCoordinator: asrCoordinator,
             fileURL: bufferURL,
             segments: segments,
-            speakerNumberBase: speakerNumberBase
+            speakerNumberBase: speakerNumberBase,
+            mergeGapSeconds: mergeGapSeconds
         )
         let results = await transcriber.run()
 

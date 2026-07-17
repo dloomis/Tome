@@ -43,6 +43,10 @@ final class PostProcessingJob: Identifiable {
     let clusterThreshold: Float
     let numberOfSpeakers: Int
 
+    /// Max gap (seconds) that still merges consecutive same-speaker diarized segments
+    /// into one block. See `AppSettings.diarizationMergeGapSeconds`.
+    let mergeGapSeconds: Double
+
     /// When set, the combined session audio is exported as `.m4a` into this folder
     /// after the transcript is finalized. Nil = retention off.
     let retention: RecordingRetentionConfig?
@@ -58,11 +62,12 @@ final class PostProcessingJob: Identifiable {
     /// this only for call captures with `AppSettings.discardShortMeetings` enabled.
     let discardIfShorterThanOrEqual: TimeInterval?
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, discardIfShorterThanOrEqual: TimeInterval? = nil) {
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, mergeGapSeconds: Double = 1.5, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, discardIfShorterThanOrEqual: TimeInterval? = nil) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
         self.numberOfSpeakers = numberOfSpeakers
+        self.mergeGapSeconds = mergeGapSeconds
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
         self.discardIfShorterThanOrEqual = discardIfShorterThanOrEqual
@@ -180,7 +185,8 @@ final class PostProcessingJob: Identifiable {
                     asrCoordinator: asr,
                     bufferURL: bufferURL,
                     segments: segments,
-                    speakerNumberBase: speakerBase
+                    speakerNumberBase: speakerBase,
+                    mergeGapSeconds: mergeGapSeconds
                 )
 
                 if Task.isCancelled {

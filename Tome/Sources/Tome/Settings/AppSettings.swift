@@ -92,6 +92,16 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(diarizationNumberOfSpeakers, forKey: "diarizationNumberOfSpeakers") }
     }
 
+    /// Max gap (seconds) between two consecutive same-speaker diarized segments that
+    /// still merges them into one transcript block (and one re-transcription span).
+    /// Higher = fewer, longer blocks — collapses a speaker's sentence-by-sentence
+    /// fragments into a single paragraph and gives Parakeet more context per span.
+    /// A different speaker's turn always breaks the run, so this never merges two
+    /// people. Consumed in `SegmentReTranscriber`. Default 1.5.
+    var diarizationMergeGapSeconds: Double {
+        didSet { UserDefaults.standard.set(diarizationMergeGapSeconds, forKey: "diarizationMergeGapSeconds") }
+    }
+
     /// Seconds of continuous silence (mic + system audio both below threshold) before
     /// the active session asks the user to confirm stopping. Recording continues
     /// until the user confirms — silence never stops a session on its own. 0 disables
@@ -152,6 +162,9 @@ final class AppSettings {
             : defaults.integer(forKey: "discardShortMeetingSeconds")
         self.diarizationClusterThreshold = Self.migratedDouble(defaults, key: "diarizationClusterThreshold", legacyKey: "diarizationThreshold", fallback: 0.7)
         self.diarizationNumberOfSpeakers = Self.migratedInt(defaults, key: "diarizationNumberOfSpeakers", legacyKey: "diarizationMinSpeakers", fallback: 0)
+        self.diarizationMergeGapSeconds = defaults.object(forKey: "diarizationMergeGapSeconds") == nil
+            ? 1.5
+            : defaults.double(forKey: "diarizationMergeGapSeconds")
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil
             ? 120
             : defaults.integer(forKey: "silenceAutoStopSeconds")
