@@ -103,5 +103,10 @@ enum OrphanScanner {
         try? FileManager.default.removeItem(at: orphan.wavURL)
         SessionSidecar.deleteIfExists(forWAV: orphan.wavURL)
         try? FileManager.default.removeItem(at: SystemAudioCapture.micBufferURL(forSystemWAV: orphan.wavURL))
+        // Discarding (or successfully recovering) the session resolves any failure
+        // marker a failed post-processing job left for it.
+        let sessionId = orphan.sidecar?.sessionId
+            ?? orphan.wavURL.deletingPathExtension().lastPathComponent
+        JobFailureMarker.deleteIfExists(forSessionId: sessionId, in: orphan.wavURL.deletingLastPathComponent())
     }
 }

@@ -1022,8 +1022,25 @@ struct ContentView: View {
                 if let renamed = TranscriptFinalizer.relocateRenamedNote(from: transcriptURL) {
                     transcriptURL = renamed
                 } else {
-                    failed.append("\(transcriptURL.lastPathComponent): transcript file missing")
-                    continue
+                    // Nothing to relocate — the note was deleted externally
+                    // (incident 2026-07-23). Rebuild it from the session JSONL
+                    // next to the WAV so diarization has a note to land in.
+                    let jsonlURL = orphan.wavURL.deletingLastPathComponent()
+                        .appendingPathComponent("\(sidecar.sessionId).jsonl")
+                    do {
+                        try TranscriptRebuilder.rebuildLiveNote(
+                            jsonlURL: jsonlURL,
+                            at: transcriptURL,
+                            sessionType: sidecar.sessionType,
+                            sourceApp: sidecar.sourceApp,
+                            sessionGuid: sidecar.sessionGuid ?? "",
+                            sessionStart: sidecar.startedAt
+                        )
+                    } catch {
+                        let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        failed.append("\(transcriptURL.lastPathComponent): transcript missing and JSONL rebuild failed (\(msg))")
+                        continue
+                    }
                 }
             }
 

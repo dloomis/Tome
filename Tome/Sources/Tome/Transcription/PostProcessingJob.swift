@@ -108,6 +108,31 @@ final class PostProcessingJob: Identifiable {
             }
         }
 
+        // External-deletion fallback (incident 2026-07-23): deleting the meeting
+        // note in the vault pipeline removes the live transcript entirely, so
+        // there is nothing to relocate — and every rewrite step below would fail
+        // markdownReadFailed, aborting the job with the WAVs stranded. Rebuild a
+        // live-format note from the session JSONL and continue as an unlinked
+        // meeting. A rebuild failure isn't fatal here: the job then fails
+        // downstream exactly as before, preserving the capture files.
+        if !FileManager.default.fileExists(atPath: handle.transcript.filePath.path),
+           let jsonlURL = handle.jsonlURL,
+           FileManager.default.fileExists(atPath: jsonlURL.path) {
+            do {
+                try TranscriptRebuilder.rebuildLiveNote(
+                    jsonlURL: jsonlURL,
+                    at: handle.transcript.filePath,
+                    sessionType: handle.sessionType,
+                    sourceApp: handle.sourceApp,
+                    sessionGuid: handle.sessionGuid,
+                    sessionStart: handle.transcript.sessionStartTime
+                )
+                diagLogError("[JOB \(id)] transcript was deleted externally — rebuilt from \(jsonlURL.lastPathComponent), continuing as unlinked note")
+            } catch {
+                diagLogError("[JOB \(id)] transcript missing and JSONL rebuild failed: \(error) — job will fail downstream, capture files preserved")
+            }
+        }
+
         // Short-recording discard: a session at/under the user's threshold is almost
         // certainly a canceled or mis-started meeting. Drop it here — before any
         // expensive diarization — so nothing lands in the output folders. The
@@ -370,6 +395,12 @@ final class PostProcessingJob: Identifiable {
     /// success path: every failure/cancellation path leaves the files in place for
     /// the launch-time orphan scan — they are the only recovery source.
     private func cleanupCaptureFiles(discarding: Bool = false) {
+        // A stale failure marker from an earlier failed run of this session id is
+        // now contradicted by this verified success — remove it so tooling doesn't
+        // flag a session that actually finalized.
+        if let dir = handle.captureDirectory {
+            JobFailureMarker.deleteIfExists(forSessionId: id, in: dir)
+        }
         if let bufferURL = handle.wavBufferPath {
             SystemAudioCapture.cleanupBufferFile(bufferURL)
         }

@@ -120,10 +120,18 @@ final class PostProcessingQueue {
                     )
                 }
             } catch {
-                diagLog("[QUEUE] Job \(job.id) failed: \(error)")
+                diagLogError("[QUEUE] Job \(job.id) failed: \(error)")
+                let message = failureMessage(for: error)
+                // Leave a machine-readable marker next to the session's JSONL/WAVs
+                // so recovery tooling can find the failure without parsing logs.
+                // Not on cancellation — that's an unfinished session, not a failure,
+                // and the orphan scan is its normal path.
+                if case .cancelled = error {} else {
+                    JobFailureMarker.emit(for: job.handle, message: message)
+                }
                 lastFailure = JobFailure(
                     jobId: job.id,
-                    message: failureMessage(for: error),
+                    message: message,
                     sessionType: job.handle.sessionType,
                     failedAt: Date()
                 )

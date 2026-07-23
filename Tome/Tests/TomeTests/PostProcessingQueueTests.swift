@@ -46,6 +46,47 @@ import Testing
         #expect(queue.lastCompletion == nil, "a failed job must not look like a completion")
     }
 
+    @Test func failedJobLeavesMachineReadableMarker() async throws {
+        // Incident 2026-07-23: the failed session vanished with no artifact
+        // tooling could find. A failure must leave `<sessionId>.failed.json`
+        // next to the capture files.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let vault = dir.appendingPathComponent("vault", isDirectory: true)
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+
+        let snapshot = try await TestSupport.makeSessionNote(vault: vault)
+        try FileManager.default.removeItem(at: snapshot.filePath)
+        // No JSONL exists, so the rebuild fallback can't save this job — it fails.
+        let micWAV = try TestSupport.writeWAV(at: dir.appendingPathComponent("qmark-1.mic.wav"), seconds: 1)
+
+        let handle = SessionHandle(
+            id: "qmark-1",
+            sessionType: .callCapture,
+            sourceApp: "Test",
+            wavBufferPath: nil,
+            micWavPath: micWAV,
+            micFirstSampleTime: nil,
+            systemFirstSampleTime: nil,
+            transcript: snapshot
+        )
+        let queue = PostProcessingQueue(asr: ASRCoordinator())
+        queue.enqueue(PostProcessingJob(handle: handle, clusterThreshold: 0.7, numberOfSpeakers: 0))
+
+        var failure: PostProcessingQueue.JobFailure?
+        for _ in 0..<100 {
+            if let f = queue.lastFailure { failure = f; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        _ = try #require(failure)
+
+        let marker = try JobFailureMarker.read(from: JobFailureMarker.markerURL(forSessionId: "qmark-1", in: dir))
+        #expect(marker.sessionId == "qmark-1")
+        #expect(marker.sessionGuid == snapshot.sessionGuid)
+        #expect(!marker.error.isEmpty)
+        #expect(marker.micWavPath == micWAV.path)
+    }
+
     @Test func consecutiveIdenticalFailuresAreDistinctEvents() async throws {
         // ContentView observes lastFailure via onChange, which fires only when
         // the VALUE changes. Session ids are second-granular and reusable by API

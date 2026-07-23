@@ -16,10 +16,17 @@ actor TranscriptLogger {
     private var fileHandle: FileHandle?
     private var currentFilePath: URL?
     private var sessionStartTime: Date?
+    private var sessionType: SessionType = .callCapture
     private var speakersDetected: Set<String> = []
     private var sourceApp: String = "manual"
     private var sessionContext: String = ""
     private var utteranceBuffer: [(speaker: String, text: String, timestamp: Date)] = []
+    /// Every utterance of the current session, never cleared until the next
+    /// `startSession()`. `utteranceBuffer` alone can't recreate the note after an
+    /// external deletion (it's cleared per flush), and this full in-memory copy is
+    /// what lets `recreateTranscriptFile()` rebuild the whole body synchronously
+    /// without reaching into the session JSONL from inside the actor.
+    private var fullHistory: [(speaker: String, text: String, timestamp: Date)] = []
     private var suggestedFilename: String?
     private var filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss"
     private var sessionGuid: String = ""
@@ -51,9 +58,11 @@ actor TranscriptLogger {
     ) throws -> URL {
         self.sourceApp = sourceApp
         self.sessionStartTime = Date()
+        self.sessionType = sessionType
         self.speakersDetected = []
         self.sessionContext = ""
         self.utteranceBuffer = []
+        self.fullHistory = []
         self.suggestedFilename = suggestedFilename
         self.filenameDateFormat = filenameDateFormat
         self.sessionGuid = sessionGuid
@@ -66,20 +75,10 @@ actor TranscriptLogger {
 
         let now = sessionStartTime!
 
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "yyyy-MM-dd"
-        let timeFmt = DateFormatter()
-        timeFmt.dateFormat = "HH:mm"
-
-        let dateStr = dateFmt.string(from: now)
-        let timeStr = timeFmt.string(from: now)
-
-        let isVoiceMemo = sessionType == .voiceMemo
         // Heading label is purely cosmetic — keep the built-in names so the
         // YAML/markdown stays predictable for downstream tools. Filename label
         // is what the user actually sees in their vault, so use the override.
-        let headingLabel = isVoiceMemo ? "Voice Memo" : "Call Recording"
-        let defaultTypeLabel = headingLabel
+        let defaultTypeLabel = sessionType == .voiceMemo ? "Voice Memo" : "Call Recording"
         let chosenLabel = filenameTypeLabel ?? defaultTypeLabel
         // Empty override is valid ("date-only filenames"); preserve it. Sanitize
         // only non-empty user input, falling back to the default if sanitization
@@ -90,9 +89,6 @@ actor TranscriptLogger {
         } else {
             sanitizedTypeLabel = FilenameSanitizer.sanitize(chosenLabel) ?? defaultTypeLabel
         }
-        let noteType = isVoiceMemo ? "fleeting" : "meeting"
-        let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
-        let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
         let stem: String
         if let suggested = suggestedFilename,
@@ -110,7 +106,59 @@ actor TranscriptLogger {
         currentFilePath = Self.collisionFreeURL(in: directory, stem: stem)
         let filename = currentFilePath!.lastPathComponent
 
-        let content = """
+        let content = Self.documentHeader(
+            sessionType: sessionType,
+            sourceApp: sourceApp,
+            filename: filename,
+            sessionGuid: sessionGuid,
+            startTime: now
+        )
+
+        let created = FileManager.default.createFile(atPath: currentFilePath!.path, contents: content.data(using: .utf8))
+        guard created else { throw TranscriptLoggerError.cannotCreateFile(currentFilePath!.path) }
+        fileHandle = try FileHandle(forWritingTo: currentFilePath!)
+        fileHandle?.seekToEndOfFile()
+        return currentFilePath!
+    }
+
+    /// First free `<stem>.md`, `<stem>-1.md`, `<stem>-2.md`, … in `directory`.
+    /// Falls back to a UUID suffix rather than ever reusing an occupied path.
+    private static func collisionFreeURL(in directory: URL, stem: String) -> URL {
+        let first = directory.appendingPathComponent("\(stem).md")
+        guard FileManager.default.fileExists(atPath: first.path) else { return first }
+        for n in 1...100 {
+            let candidate = directory.appendingPathComponent("\(stem)-\(n).md")
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return directory.appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(8)).md")
+    }
+
+    /// The live note's initial content: YAML frontmatter + headings through the
+    /// `## Transcript` section marker. Shared by `startSession`, the mid-session
+    /// self-heal (`recreateTranscriptFile`), and `TranscriptRebuilder`'s JSONL
+    /// rebuilds — every recreated note must parse identically to one the live
+    /// logger wrote, or the finalize/diarization regexes stop matching.
+    static func documentHeader(
+        sessionType: SessionType,
+        sourceApp: String,
+        filename: String,
+        sessionGuid: String,
+        startTime: Date
+    ) -> String {
+        let dateFmt = DateFormatter()
+        dateFmt.dateFormat = "yyyy-MM-dd"
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm"
+        let dateStr = dateFmt.string(from: startTime)
+        let timeStr = timeFmt.string(from: startTime)
+
+        let isVoiceMemo = sessionType == .voiceMemo
+        let headingLabel = isVoiceMemo ? "Voice Memo" : "Call Recording"
+        let noteType = isVoiceMemo ? "fleeting" : "meeting"
+        let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
+        let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
+
+        return """
 ---
 type: \(noteType)
 created: "\(dateStr)"
@@ -143,24 +191,38 @@ tags:
 ## Transcript
 
 """
-
-        let created = FileManager.default.createFile(atPath: currentFilePath!.path, contents: content.data(using: .utf8))
-        guard created else { throw TranscriptLoggerError.cannotCreateFile(currentFilePath!.path) }
-        fileHandle = try FileHandle(forWritingTo: currentFilePath!)
-        fileHandle?.seekToEndOfFile()
-        return currentFilePath!
     }
 
-    /// First free `<stem>.md`, `<stem>-1.md`, `<stem>-2.md`, … in `directory`.
-    /// Falls back to a UUID suffix rather than ever reusing an occupied path.
-    private static func collisionFreeURL(in directory: URL, stem: String) -> URL {
-        let first = directory.appendingPathComponent("\(stem).md")
-        guard FileManager.default.fileExists(atPath: first.path) else { return first }
-        for n in 1...100 {
-            let candidate = directory.appendingPathComponent("\(stem)-\(n).md")
-            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+    /// Render utterances into the body format the live flush writes: a
+    /// `**Speaker** (offset-seconds)` marker line, the text, and a blank line.
+    static func renderUtterances(
+        _ entries: [(speaker: String, text: String, timestamp: Date)],
+        start: Date
+    ) -> String {
+        var lines = ""
+        for entry in entries {
+            let offset = entry.timestamp.timeIntervalSince(start)
+            lines += "**\(entry.speaker)** (\(formatTimeOffset(offset)))\n"
+            lines += "\(entry.text)\n\n"
         }
-        return directory.appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(8)).md")
+        return lines
+    }
+
+    /// Apply a session context to note content: patches the frontmatter
+    /// `context:` field and fills the `## Context` body section. Shared by
+    /// `updateContext` and the self-heal path (which must not lose a context
+    /// applied before the note vanished).
+    private static func applyingContext(_ text: String, to content: String) -> String {
+        var content = content
+        if let range = content.range(of: #"context: ".*""#, options: .regularExpression) {
+            content.replaceSubrange(range, with: "context: \(yamlQuote(text))")
+        }
+        if let contextStart = content.range(of: "## Context\n"),
+           let contextEnd = content.range(of: "\n---\n\n## Transcript", range: contextStart.upperBound..<content.endIndex) {
+            let replaceRange = contextStart.upperBound..<contextEnd.lowerBound
+            content.replaceSubrange(replaceRange, with: "\n\(text)\n")
+        }
+        return content
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -169,34 +231,50 @@ tags:
         let label = speaker == "You" ? "You" : "Them"
         speakersDetected.insert(label)
         utteranceBuffer.append((speaker: label, text: text, timestamp: timestamp))
+        fullHistory.append((speaker: label, text: text, timestamp: timestamp))
         flushBuffer()  // Flush every utterance for crash safety
     }
 
-    /// Periodic flush — call from a timer or at intervals
+    /// Periodic flush — call from a timer or at intervals. Also the timer-cadence
+    /// leg of the disappearance self-heal: with no new utterances, `flushBuffer`'s
+    /// own existence check never runs, so re-check (and recreate) here.
     func flushIfNeeded() {
         if !utteranceBuffer.isEmpty {
             flushBuffer()
         }
-        // Vault-disappeared detection: surfaces unmount/eject within the timer cadence.
         if let path = currentFilePath, !FileManager.default.fileExists(atPath: path.path) {
-            lastError = "Transcript file disappeared — vault may be unmounted"
+            recreateTranscriptFile()
         }
     }
 
     private func flushBuffer() {
+        guard let filePath = currentFilePath else { return }
+
+        // Self-heal on external deletion (incident 2026-07-23): the user deleting
+        // the meeting note in their vault pipeline unlinks the live transcript,
+        // but APFS keeps the retained FileHandle valid — every write lands in an
+        // orphaned inode and vanishes when the handle closes. Recreating from
+        // `fullHistory` (which still includes the current buffer) turns that
+        // silent total loss into a normal "unlinked meeting" that finalizes and
+        // diarizes as usual.
+        guard FileManager.default.fileExists(atPath: filePath.path) else {
+            recreateTranscriptFile()
+            return
+        }
+
+        // A lost handle (e.g. reopen failure after a context rewrite) must not
+        // strand utterances in the buffer forever — retry the reopen per flush.
+        if fileHandle == nil {
+            fileHandle = try? FileHandle(forWritingTo: filePath)
+            fileHandle?.seekToEndOfFile()
+        }
         guard let fileHandle, !utteranceBuffer.isEmpty else { return }
 
         // Per-line marker is the offset (in seconds, ms precision) from the session
         // start — the same t=0 the retained recording is anchored to — so it drops
         // straight into an Obsidian Media Extended `#t=` fragment.
         let start = sessionStartTime ?? utteranceBuffer.first?.timestamp ?? Date()
-
-        var lines = ""
-        for entry in utteranceBuffer {
-            let offset = entry.timestamp.timeIntervalSince(start)
-            lines += "**\(entry.speaker)** (\(formatTimeOffset(offset)))\n"
-            lines += "\(entry.text)\n\n"
-        }
+        let lines = Self.renderUtterances(utteranceBuffer, start: start)
 
         guard let data = lines.data(using: .utf8) else { return }
         fileHandle.seekToEndOfFile()
@@ -206,37 +284,77 @@ tags:
         } catch {
             // Keep buffered utterances so the next flush retries instead of losing them.
             lastError = "Transcript write failed: \(error.localizedDescription)"
-            diagLog("[LOGGER] flushBuffer write failed: \(error)")
+            diagLogError("[LOGGER] flushBuffer write failed: \(error)")
             return
         }
 
         utteranceBuffer.removeAll()
     }
 
+    /// The live note vanished out from under us — a *supported* external action
+    /// (deleting the meeting note in the vault pipeline deletes Tome's transcript).
+    /// Tome's contract is to carry on as an unlinked meeting: rebuild the whole
+    /// note (frontmatter, context, full utterance history) at the same path and
+    /// keep recording, so post-processing later runs unchanged. Failure leaves
+    /// `lastError` set and everything retained in memory + the session JSONL;
+    /// each subsequent flush retries, so a remounted vault heals on its own.
+    @discardableResult
+    private func recreateTranscriptFile() -> Bool {
+        guard let filePath = currentFilePath, let startTime = sessionStartTime else { return false }
+        try? fileHandle?.close()
+        fileHandle = nil
+
+        var isDir: ObjCBool = false
+        let directory = filePath.deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else {
+            // Whole folder gone — that's an unmount/eviction, not a note deletion.
+            // Don't recreate the directory: on an unmounted volume that would
+            // write into the empty mountpoint on the boot disk.
+            lastError = "Transcript file disappeared — vault may be unmounted"
+            diagLogError("[LOGGER] transcript folder missing — can't recreate \(filePath.lastPathComponent); \(fullHistory.count) utterances retained in memory + session JSONL")
+            return false
+        }
+
+        var content = Self.documentHeader(
+            sessionType: sessionType,
+            sourceApp: sourceApp,
+            filename: filePath.lastPathComponent,
+            sessionGuid: sessionGuid,
+            startTime: startTime
+        )
+        if !sessionContext.isEmpty {
+            content = Self.applyingContext(sessionContext, to: content)
+        }
+        content += Self.renderUtterances(fullHistory, start: startTime)
+
+        guard FileManager.default.createFile(atPath: filePath.path, contents: content.data(using: .utf8)) else {
+            lastError = "Transcript file disappeared and couldn't be recreated"
+            diagLogError("[LOGGER] recreate failed at \(filePath.path); \(fullHistory.count) utterances retained in memory + session JSONL")
+            return false
+        }
+        fileHandle = try? FileHandle(forWritingTo: filePath)
+        fileHandle?.seekToEndOfFile()
+        try? fileHandle?.synchronize()
+        utteranceBuffer.removeAll()  // fullHistory ⊇ buffer; everything just landed
+        lastError = nil
+        diagLogError("[LOGGER] transcript disappeared externally — recreated \(filePath.lastPathComponent) with \(fullHistory.count) utterances, continuing as unlinked note")
+        return true
+    }
+
     func updateContext(_ text: String) {
         sessionContext = text
         guard let filePath = currentFilePath else { return }
 
-        // Flush any buffered utterances first, then fsync before close so any
-        // pending pages are durable before the atomic-replace rewrites the file.
+        // Flush any buffered utterances first (this also self-heals a deleted
+        // note), then fsync before close so any pending pages are durable before
+        // the atomic-replace rewrites the file.
         flushBuffer()
         try? fileHandle?.synchronize()
         try? fileHandle?.close()
         fileHandle = nil
 
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
-
-        // Update frontmatter context field
-        if let range = content.range(of: #"context: ".*""#, options: .regularExpression) {
-            content.replaceSubrange(range, with: "context: \(Self.yamlQuote(text))")
-        }
-
-        // Update ## Context body section
-        if let contextStart = content.range(of: "## Context\n"),
-           let contextEnd = content.range(of: "\n---\n\n## Transcript", range: contextStart.upperBound..<content.endIndex) {
-            let replaceRange = contextStart.upperBound..<contextEnd.lowerBound
-            content.replaceSubrange(replaceRange, with: "\n\(text)\n")
-        }
+        guard let raw = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+        let content = Self.applyingContext(text, to: raw)
 
         // Atomic write — fsync the tmp file before replace so it lands on disk
         // before the rename. Without this, a crash between replace and the next
@@ -257,7 +375,7 @@ tags:
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
         } catch {
             lastError = "Context rewrite failed: \(error.localizedDescription)"
-            diagLog("[LOGGER] updateContext rewrite failed: \(error)")
+            diagLogError("[LOGGER] updateContext rewrite failed: \(error)")
             try? FileManager.default.removeItem(at: tmpPath)
         }
 
@@ -265,7 +383,7 @@ tags:
         fileHandle = try? FileHandle(forWritingTo: filePath)
         if fileHandle == nil {
             lastError = "Lost transcript handle after context update"
-            diagLog("[LOGGER] reopen failed after updateContext")
+            diagLogError("[LOGGER] reopen failed after updateContext (next flush retries the reopen)")
         }
         fileHandle?.seekToEndOfFile()
     }
@@ -323,8 +441,11 @@ tags:
     private func resetState() {
         currentFilePath = nil
         sessionStartTime = nil
+        sessionType = .callCapture
         speakersDetected = []
         sessionContext = ""
+        utteranceBuffer = []
+        fullHistory = []
         suggestedFilename = nil
         filenameDateFormat = "yyyy-MM-dd HH-mm-ss"
         sessionGuid = ""

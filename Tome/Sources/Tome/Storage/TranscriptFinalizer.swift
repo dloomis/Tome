@@ -421,7 +421,7 @@ enum TranscriptFinalizer {
         do {
             return try String(contentsOf: filePath, encoding: .utf8)
         } catch {
-            diagLog("[FINALIZER] \(context): transcript unreadable at \(filePath.path): \(error)")
+            diagLogError("[FINALIZER] \(context): transcript unreadable at \(filePath.path): \(error)")
             throw .markdownReadFailed("\(context): couldn't read \(filePath.lastPathComponent) — \(error.localizedDescription)")
         }
     }
@@ -444,14 +444,14 @@ enum TranscriptFinalizer {
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
         } catch {
-            diagLog("[FINALIZER] \(context): tmp write failed at \(tmpPath.path): \(error)")
+            diagLogError("[FINALIZER] \(context): tmp write failed at \(tmpPath.path): \(error)")
             throw .markdownWriteFailed("\(context): tmp write failed — \(error.localizedDescription)")
         }
         do {
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
         } catch {
             try? FileManager.default.removeItem(at: tmpPath)
-            diagLog("[FINALIZER] \(context): replaceItemAt failed for \(filePath.path): \(error)")
+            diagLogError("[FINALIZER] \(context): replaceItemAt failed for \(filePath.path): \(error)")
             throw .markdownWriteFailed("\(context): replaceItemAt failed — \(error.localizedDescription)")
         }
     }

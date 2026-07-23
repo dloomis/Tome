@@ -25,6 +25,14 @@ func diagLog(_ msg: String) {
     diagLogger.notice("\(msg, privacy: .public)")
 }
 
+/// `diagLog` at `.error` — for events that lose or endanger user data (transcript
+/// disappearance, write failures, failed finalize jobs). Same persistence as
+/// `.notice`, but errors survive longer in the log store and stand out when
+/// triaging a `log show` capture.
+func diagLogError(_ msg: String) {
+    diagLogger.error("\(msg, privacy: .public)")
+}
+
 /// Dual-stream mic + system audio transcription.
 @Observable
 @MainActor

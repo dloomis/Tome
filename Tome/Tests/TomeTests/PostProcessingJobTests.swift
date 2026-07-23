@@ -143,6 +143,51 @@ import Testing
                 "a prior session's preserved (unfinalized) audio must survive this session's success")
     }
 
+    @Test func deletedNoteIsRebuiltFromJSONLAndFinalized() async throws {
+        // Incident 2026-07-23: the live note was deleted externally before the
+        // job ran (nothing to relocate). With the session JSONL next to the
+        // capture WAVs, the job must rebuild the note and finalize normally
+        // instead of failing with markdownReadFailed.
+        let fx = try await makeFixture(id: "j13")
+        defer { TestSupport.remove(fx.dir) }
+
+        // Pin the session length so finalization has a visible duration to write.
+        let sessionSnap = snapshot(fx, durationSeconds: 65)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let record = SessionRecord(
+            speaker: .you,
+            text: "rebuilt from journal",
+            timestamp: sessionSnap.sessionStartTime.addingTimeInterval(3)
+        )
+        try (String(decoding: try encoder.encode(record), as: UTF8.self) + "\n")
+            .write(to: fx.dir.appendingPathComponent("j13.jsonl"), atomically: true, encoding: .utf8)
+
+        try FileManager.default.removeItem(at: fx.snapshot.filePath)
+        let job = makeJob(makeHandle(id: "j13", fixture: fx, snapshot: sessionSnap))
+
+        let saved = try requireSaved(try await job.run(using: ASRCoordinator()))
+        let content = try String(contentsOf: saved, encoding: .utf8)
+        #expect(content.contains("rebuilt from journal"),
+                "the note must be reconstructed from the session JSONL")
+        #expect(content.contains("duration: \"01:05\""),
+                "the rebuilt note must go through normal frontmatter finalization")
+    }
+
+    @Test func successCleansUpStaleFailureMarker() async throws {
+        let fx = try await makeFixture(id: "j14")
+        defer { TestSupport.remove(fx.dir) }
+
+        // Marker left by an earlier failed run of the same session id.
+        try Data("{}".utf8).write(to: JobFailureMarker.markerURL(forSessionId: "j14", in: fx.dir))
+
+        let job = makeJob(makeHandle(id: "j14", fixture: fx))
+        _ = try requireSaved(try await job.run(using: ASRCoordinator()))
+
+        #expect(!FileManager.default.fileExists(atPath: JobFailureMarker.markerURL(forSessionId: "j14", in: fx.dir).path),
+                "a verified success must remove the stale failure marker")
+    }
+
     @Test func finalizeFailurePreservesSourceAudio() async throws {
         let fx = try await makeFixture(id: "j3")
         defer { TestSupport.remove(fx.dir) }

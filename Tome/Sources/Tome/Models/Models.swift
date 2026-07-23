@@ -165,6 +165,21 @@ struct SessionHandle: Sendable {
     /// values are not fatal but indicate the diarization input may be incomplete —
     /// the post-processing job logs a warning before diarizing.
     var wavWriteErrorCount: Int = 0
+
+    /// Directory holding this session's capture artifacts (WAVs, session JSONL,
+    /// sidecars). Derived strictly from the capture WAV paths — nil when the
+    /// session carried no capture files (only test-shaped handles do), so nothing
+    /// here can ever point a test at the real app-support sessions directory.
+    var captureDirectory: URL? {
+        (wavBufferPath ?? micWavPath)?.deletingLastPathComponent()
+    }
+
+    /// The session's crash-recovery JSONL (`<sessionId>.jsonl`), written by
+    /// `SessionStore` next to the capture WAVs. Existence is not guaranteed —
+    /// callers check before reading.
+    var jsonlURL: URL? {
+        captureDirectory?.appendingPathComponent("\(id).jsonl")
+    }
 }
 
 // MARK: - Recording Retention

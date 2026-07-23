@@ -78,16 +78,99 @@ import Testing
         #expect(!(try #require(nonEmpty).speakersDetected.isEmpty))
     }
 
-    @Test func flushIfNeededFlagsDisappearedNote() async throws {
-        // The vault-unmounted banner depends on this lastError; previously untested.
+    // MARK: - Self-heal on external deletion (incident 2026-07-23)
+
+    @Test func appendAfterExternalDeletionRecreatesNoteWithFullHistory() async throws {
+        // Deleting the meeting note in the vault pipeline (WhisperCal) deletes the
+        // live transcript mid-session — a supported action. The logger must NOT
+        // keep writing into the orphaned inode; it recreates the note (frontmatter
+        // + everything recorded so far) and carries on as an unlinked meeting.
+        let vault = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(vault) }
+
+        let logger = TranscriptLogger()
+        let url = try await logger.startSession(sourceApp: "T", vaultPath: vault.path, sessionGuid: "heal-guid")
+        let start = Date()
+        await logger.append(speaker: "You", text: "before deletion", timestamp: start)
+
+        try FileManager.default.removeItem(at: url)
+        await logger.append(speaker: "Them", text: "after deletion", timestamp: start.addingTimeInterval(5))
+
+        #expect(FileManager.default.fileExists(atPath: url.path), "note must be recreated at the same path")
+        let content = try String(contentsOf: url, encoding: .utf8)
+        #expect(content.contains("before deletion"), "pre-deletion history must be replayed into the recreated note")
+        #expect(content.contains("after deletion"))
+        #expect(content.contains("session_guid: \"heal-guid\""), "recreated frontmatter must keep the session identity")
+        #expect(content.contains("## Transcript"), "recreated note must parse like a live one (finalize anchors on this)")
+        #expect(await logger.lastError == nil, "a successful self-heal is not an error state")
+
+        // The session must finalize normally from here.
+        let snapshot = await logger.endSession()
+        #expect(try #require(snapshot).filePath == url)
+    }
+
+    @Test func flushIfNeededRecreatesDeletedNoteWithoutNewUtterances() async throws {
+        // The deletion can happen during silence — no append will run, so the
+        // timer-cadence flushIfNeeded is the self-heal path.
         let vault = try TestSupport.makeTempDir()
         defer { TestSupport.remove(vault) }
 
         let logger = TranscriptLogger()
         let url = try await logger.startSession(sourceApp: "T", vaultPath: vault.path)
+        await logger.append(speaker: "You", text: "only utterance", timestamp: Date())
+
         try FileManager.default.removeItem(at: url)
         await logger.flushIfNeeded()
-        #expect(await logger.lastError?.contains("disappeared") == true)
+
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        #expect(try String(contentsOf: url, encoding: .utf8).contains("only utterance"))
+        #expect(await logger.lastError == nil)
+        _ = await logger.endSession()
+    }
+
+    @Test func missingVaultFolderStillFlagsErrorAndHealsOnRemount() async throws {
+        // A missing *folder* is an unmount/eviction, not a note deletion — no
+        // recreate (that would write into the dead mountpoint), keep the banner
+        // error. When the folder comes back, the next flush self-heals with the
+        // full history intact.
+        let vault = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(vault) }
+        let sub = vault.appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+
+        let logger = TranscriptLogger()
+        let url = try await logger.startSession(sourceApp: "T", vaultPath: sub.path)
+        await logger.append(speaker: "You", text: "kept in memory", timestamp: Date())
+
+        try FileManager.default.removeItem(at: sub)
+        await logger.flushIfNeeded()
+        #expect(await logger.lastError?.contains("vault may be unmounted") == true)
+        #expect(!FileManager.default.fileExists(atPath: url.path), "must not recreate into a missing folder")
+
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        await logger.flushIfNeeded()
+        #expect(FileManager.default.fileExists(atPath: url.path), "remount heals on the next flush")
+        #expect(try String(contentsOf: url, encoding: .utf8).contains("kept in memory"))
+        #expect(await logger.lastError == nil)
+        _ = await logger.endSession()
+    }
+
+    @Test func contextSurvivesRecreation() async throws {
+        let vault = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(vault) }
+
+        let logger = TranscriptLogger()
+        let url = try await logger.startSession(sourceApp: "T", vaultPath: vault.path)
+        await logger.updateContext("Quarterly planning")
+        await logger.append(speaker: "You", text: "hello", timestamp: Date())
+
+        try FileManager.default.removeItem(at: url)
+        await logger.append(speaker: "You", text: "world", timestamp: Date())
+
+        let content = try String(contentsOf: url, encoding: .utf8)
+        #expect(content.contains("context: \"Quarterly planning\""), "an applied context must survive the rebuild")
+        #expect(content.contains("hello"))
+        #expect(content.contains("world"))
         _ = await logger.endSession()
     }
 
