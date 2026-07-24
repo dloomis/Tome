@@ -1,6 +1,8 @@
+import AppKit
 import SwiftUI
 import CoreAudio
 import Sparkle
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @Bindable var settings: AppSettings
@@ -61,7 +63,7 @@ private struct GeneralTab: View {
 @Observable
 @MainActor
 private final class InputDeviceList {
-    private(set) var devices: [(id: AudioDeviceID, name: String)] = []
+    private(set) var devices: [(id: AudioDeviceID, uid: String, name: String)] = []
     private var listenerBlock: AudioObjectPropertyListenerBlock?
 
     private var devicesAddress = AudioObjectPropertyAddress(
@@ -99,19 +101,65 @@ private struct AudioTab: View {
     @Bindable var settings: AppSettings
     @State private var deviceList = InputDeviceList()
 
+    /// True when the persisted selection points at a device that isn't present
+    /// right now (unplugged USB mic, an audio router's virtual device while the
+    /// router app is closed). The selection is kept — shown as "(unavailable)" —
+    /// instead of being reset, so it survives reboots and router restarts.
+    private var selectionUnavailable: Bool {
+        !settings.inputDeviceUID.isEmpty
+            && !deviceList.devices.contains(where: { $0.uid == settings.inputDeviceUID })
+    }
+
     var body: some View {
         Form {
             Section("Input") {
-                Picker("Microphone", selection: $settings.inputDeviceID) {
-                    Text("System Default (recommended)").tag(AudioDeviceID(0))
-                    ForEach(deviceList.devices, id: \.id) { device in
-                        Text(device.name).tag(device.id)
+                Picker("Microphone", selection: $settings.inputDeviceUID) {
+                    Text("System Default (recommended)").tag("")
+                    // Devices with no readable UID can't round-trip through a
+                    // UID-keyed selection (and would collide on the "" tag).
+                    ForEach(deviceList.devices.filter { !$0.uid.isEmpty }, id: \.uid) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    if selectionUnavailable {
+                        Text("\(settings.inputDeviceName.isEmpty ? "Selected microphone" : settings.inputDeviceName) (unavailable)")
+                            .tag(settings.inputDeviceUID)
                     }
                 }
                 .font(.system(size: 12))
+                .onChange(of: settings.inputDeviceUID) { _, newUID in
+                    // Keep the display name in sync for the "(unavailable)" row.
+                    if let device = deviceList.devices.first(where: { $0.uid == newUID }) {
+                        settings.inputDeviceName = device.name
+                    } else if newUID.isEmpty {
+                        settings.inputDeviceName = ""
+                    }
+                }
                 Text("System Default follows macOS — when AirPods connect, recording moves with them. Pinning a specific mic fights macOS's automatic switching and can drop out during Bluetooth transitions; if a pinned mic keeps failing mid-session, Tome falls back to System Default for that session.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+            }
+
+            Section("System Audio") {
+                Text("Apps listed here are excluded from system-audio capture. Audio routers (Elgato Wave Link, Krisp, …) re-broadcast your microphone as their own audio, which would transcribe your voice a second time as \u{201C}Them\u{201D}. Excluding a router never drops the other side of a call — that audio belongs to the meeting app itself. Pure virtual-device drivers (BlackHole) have no app audio to exclude. Changes apply at the next recording.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                ForEach(settings.excludedAudioAppIDs, id: \.self) { bundleID in
+                    ExcludedAppRow(bundleID: bundleID) {
+                        settings.excludedAudioAppIDs.removeAll { $0 == bundleID }
+                    }
+                }
+                HStack {
+                    Button("Add App…", action: promptForAppsToExclude)
+                    Spacer()
+                    Button("Restore Defaults") {
+                        // Re-seed the built-ins without touching user additions.
+                        for id in AppSettings.builtinExcludedAudioApps
+                        where !settings.excludedAudioAppIDs.contains(id) {
+                            settings.excludedAudioAppIDs.append(id)
+                        }
+                    }
+                    .font(.system(size: 11))
+                }
             }
 
             Section("Silence") {
@@ -136,6 +184,63 @@ private struct AudioTab: View {
         .formStyle(.grouped)
         .onAppear { deviceList.start() }
         .onDisappear { deviceList.stop() }
+    }
+
+    /// App chooser in place of hand-typed bundle IDs: pick .app bundles and
+    /// extract their identifiers. Multi-select so a user can exclude a whole
+    /// router suite in one pass.
+    private func promptForAppsToExclude() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.message = "Choose apps to exclude from system-audio capture"
+        panel.prompt = "Exclude"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let id = Bundle(url: url)?.bundleIdentifier else { continue }
+            if !settings.excludedAudioAppIDs.contains(where: { $0.caseInsensitiveCompare(id) == .orderedSame }) {
+                settings.excludedAudioAppIDs.append(id)
+            }
+        }
+    }
+}
+
+/// One excluded app: icon + display name when the app is installed (bundle ID
+/// as the secondary line), bare bundle ID with "(not installed)" otherwise —
+/// an absent app's exclusion is still meaningful, it protects a future launch.
+private struct ExcludedAppRow: View {
+    let bundleID: String
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                    .resizable()
+                    .frame(width: 18, height: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(FileManager.default.displayName(atPath: appURL.path))
+                        .font(.system(size: 12))
+                    Text(bundleID)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(bundleID)
+                    .font(.system(size: 12, design: .monospaced))
+                Text("(not installed)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(action: onRemove) {
+                Image(systemName: "minus.circle")
+            }
+            .buttonStyle(.plain)
+            .help("Remove from exclusions")
+        }
     }
 }
 

@@ -60,10 +60,33 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         "com.spotify.client",
     ]
 
+    /// Lowercased union of the hardcoded media-player set and the user's
+    /// audio-router exclusions (`AppSettings.excludedAudioAppIDs`). Bundle-ID
+    /// matching is case-insensitive to be forgiving of hand-entered IDs.
+    /// Pure + static so the merge is unit-testable without ScreenCaptureKit.
+    static func exclusionBundleIDs(userList: [String]) -> Set<String> {
+        Set(noiseAppBundleIDs.map { $0.lowercased() })
+            .union(userList.map { $0.lowercased() })
+    }
+
+    /// Count of delivered buffers whose RMS exceeded ~-80 dBFS this capture.
+    /// SCStream delivers buffers CONTINUOUSLY even when the captured content is
+    /// pure digital silence (verified 2026-07-24), so the delivery-based gates
+    /// and stall watchdog can never detect an empty system leg — this content
+    /// counter is what the 60s no-system-audio warning and the end-of-session
+    /// note read. Threshold rationale: a quiet capture's per-buffer RMS measured
+    /// ~1e-5; speech measured ~4e-2; 1e-4 sits between with margin on both sides.
+    private let _audibleBufferCount = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
+    var audibleBufferCount: Int { _audibleBufferCount.withLock { $0 } }
+    static let audibleRMSThreshold: Float = 1e-4
+
     /// Start capturing system audio (every process on the display, mixed, minus
-    /// the known media players above). `recordingContext` is required for the
-    /// crash-recovery sidecar; when nil (legacy / test paths), falls back to the
-    /// old `$TMPDIR`-based unnamed WAV.
+    /// the known media players above and the user's audio-router exclusions in
+    /// `excludedBundleIDs` — routers like Wave Link render the user's own mic as
+    /// their app audio, which lands on this leg as phantom "Them" speech; see
+    /// docs/superpowers/specs/2026-07-24-own-voice-bleed-*.md).
+    /// `recordingContext` is required for the crash-recovery sidecar; when nil
+    /// (legacy / test paths), falls back to the old `$TMPDIR`-based unnamed WAV.
     ///
     /// We deliberately do NOT scope the filter to the conferencing app — inclusion
     /// filtering must never come back. A per-app `SCContentFilter(including: [app])`
@@ -77,7 +100,8 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     /// where inclusion wasn't: a media player renders its own audio, so excluding
     /// it can't drop audio a conferencing helper produces.
     func bufferStream(
-        recordingContext: SessionRecordingContext? = nil
+        recordingContext: SessionRecordingContext? = nil,
+        excludedBundleIDs: [String] = []
     ) async throws -> CaptureStreams {
         // Desktop/off-screen windows are irrelevant: only `displays` and
         // `applications` are read below, and both are populated independently of
@@ -89,9 +113,10 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             throw CaptureError.noDisplay
         }
 
-        let excludedApps = content.applications.filter { Self.noiseAppBundleIDs.contains($0.bundleIdentifier) }
+        let mergedExclusions = Self.exclusionBundleIDs(userList: excludedBundleIDs)
+        let excludedApps = content.applications.filter { mergedExclusions.contains($0.bundleIdentifier.lowercased()) }
         if !excludedApps.isEmpty {
-            diagLog("[SYS-CAPTURE] excluding \(excludedApps.count) media app(s) from capture: \(excludedApps.map(\.bundleIdentifier).joined(separator: ", "))")
+            diagLog("[SYS-CAPTURE] excluding \(excludedApps.count) app(s) from capture: \(excludedApps.map(\.bundleIdentifier).joined(separator: ", "))")
         }
         let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
 
@@ -117,6 +142,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             _stopped.withLock { $0 = false }
         }
         _writeErrors.withLock { $0 = 0 }
+        _audibleBufferCount.withLock { $0 = 0 }
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
@@ -224,6 +250,9 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         // Update audio level for visualizer
         let rms = Self.normalizedRMS(from: pcmBuffer)
         _audioLevel.value = min(rms * 25, 1.0)
+        if rms > Self.audibleRMSThreshold {
+            _audibleBufferCount.withLock { $0 += 1 }
+        }
         _lastSampleTime.withLock { $0 = Date() }
         _firstSampleTime.withLock { if $0 == nil { $0 = Date() } }
 

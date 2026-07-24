@@ -28,6 +28,10 @@ struct ControlBar: View {
     let silencePromptActive: Bool
     let statusMessage: String?
     let errorMessage: String?
+    /// Persistent non-fatal warning (amber, below the error line): capture is
+    /// running, but not the way the user configured it — e.g. recording from a
+    /// fallback mic because the selected device is unavailable.
+    let warningMessage: String?
     /// Provisioning status ("DOWNLOADING MODEL… 42%") — rendered like
     /// statusMessage but sourced from ModelProvisioner, NOT assetStatus
     /// (the API string-matches assetStatus; provisioning must not leak in).
@@ -52,6 +56,15 @@ struct ControlBar: View {
                 Text(error)
                     .font(.system(size: 10))
                     .foregroundStyle(Color.recordRed)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+            }
+
+            if let warning = warningMessage {
+                Text(warning)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 4)

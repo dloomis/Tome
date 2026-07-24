@@ -31,10 +31,44 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(transcriberModel.rawValue, forKey: "transcriberModel") }
     }
 
-    /// Stored as the AudioDeviceID integer. 0 means "use system default".
-    var inputDeviceID: AudioDeviceID {
-        didSet { UserDefaults.standard.set(Int(inputDeviceID), forKey: "inputDeviceID") }
+    /// Persisted CoreAudio device UID of the selected microphone. Empty string
+    /// means "use system default". UIDs (not AudioDeviceIDs) because numeric IDs
+    /// are transient — third-party HAL drivers (Wave Link et al.) reassign them
+    /// across driver reloads, app restarts, and reboots, which used to reset the
+    /// user's selection at every launch. Resolved to a live AudioDeviceID at each
+    /// capture bind by `TranscriptionEngine`.
+    var inputDeviceUID: String {
+        didSet { UserDefaults.standard.set(inputDeviceUID, forKey: "inputDeviceUID") }
     }
+
+    /// Last-known display name of the selected mic, so the Settings picker can
+    /// show "<name> (unavailable)" while the device is absent instead of going
+    /// blank. Maintained alongside `inputDeviceUID` by the picker.
+    var inputDeviceName: String {
+        didSet { UserDefaults.standard.set(inputDeviceName, forKey: "inputDeviceName") }
+    }
+
+    // MARK: - System-Audio Exclusions (audio routers)
+
+    /// Bundle IDs of audio-router apps excluded from system-audio capture.
+    /// Routers (Wave Link, Krisp, …) continuously render the user's mic as their
+    /// own app audio, which ScreenCaptureKit attributes to them per-process —
+    /// without exclusion the user's own voice lands on the "Them" leg (verified
+    /// 2026-07-24; see docs/superpowers/specs/2026-07-24-own-voice-bleed-*.md).
+    /// Exclusion never drops far-end call audio: SCK attributes that to the
+    /// conferencing app's own process.
+    var excludedAudioAppIDs: [String] {
+        didSet { UserDefaults.standard.set(excludedAudioAppIDs, forKey: "excludedAudioAppIDs") }
+    }
+
+    /// Built-in default exclusions. Only IDs verified against a real install
+    /// ship here — an ID that never matches is a silent no-op, i.e. silent
+    /// UNprotection. `com.elgato.WaveLink3` verified on-machine 2026-07-24
+    /// (Wave Link 3.2.2); `com.elgato.WaveLink` is Elgato's documented 1.x id.
+    static let builtinExcludedAudioApps: [String] = [
+        "com.elgato.WaveLink3",
+        "com.elgato.WaveLink",
+    ]
 
     var vaultMeetingsPath: String {
         didSet { UserDefaults.standard.set(vaultMeetingsPath, forKey: "vaultMeetingsPath") }
@@ -150,7 +184,34 @@ final class AppSettings {
         self.transcriptionLocale = defaults.string(forKey: "transcriptionLocale") ?? "en-US"
         self.transcriptionLanguage = (defaults.string(forKey: "transcriptionLanguage").flatMap(Language.init(rawValue:))) ?? .english
         self.transcriberModel = TranscriberModel.from(persisted: defaults.string(forKey: "transcriberModel"))
-        self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
+        // Mic selection: UID-persisted, with a one-time migration from the
+        // legacy raw-AudioDeviceID key (resolvable only if that device happens
+        // to be present right now — otherwise fall back to system default,
+        // which is what the old boot sanitizer would have done anyway).
+        let migratedSelection = Self.migratedInputSelection(
+            storedUID: defaults.string(forKey: "inputDeviceUID"),
+            storedName: defaults.string(forKey: "inputDeviceName"),
+            legacyID: AudioDeviceID(defaults.integer(forKey: "inputDeviceID")),
+            resolveUID: MicCapture.deviceUID(for:),
+            resolveName: MicCapture.deviceName(for:)
+        )
+        self.inputDeviceUID = migratedSelection.uid
+        self.inputDeviceName = migratedSelection.name
+        defaults.set(migratedSelection.uid, forKey: "inputDeviceUID")
+        defaults.set(migratedSelection.name, forKey: "inputDeviceName")
+        defaults.removeObject(forKey: "inputDeviceID")
+
+        // System-audio exclusions: seed built-ins exactly once each. Removals
+        // stick — a deleted default stays in the seen list, so a later release
+        // adding new defaults can't resurrect it.
+        let seeded = Self.seededExclusions(
+            current: defaults.stringArray(forKey: "excludedAudioAppIDs"),
+            seen: defaults.stringArray(forKey: "excludedAudioAppSeenDefaults"),
+            builtins: Self.builtinExcludedAudioApps
+        )
+        self.excludedAudioAppIDs = seeded.list
+        defaults.set(seeded.list, forKey: "excludedAudioAppIDs")
+        defaults.set(seeded.seen, forKey: "excludedAudioAppSeenDefaults")
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
         self.retainRecordings = defaults.bool(forKey: "retainRecordings")
@@ -191,6 +252,44 @@ final class AppSettings {
         if defaults.object(forKey: key) != nil { return defaults.integer(forKey: key) }
         if defaults.object(forKey: legacyKey) != nil { return defaults.integer(forKey: legacyKey) }
         return fallback
+    }
+
+    /// Pure mic-selection migration: an already-stored UID always wins; else a
+    /// legacy nonzero AudioDeviceID is resolved to its UID if the device is
+    /// present right now; else system default (empty UID). Resolvers injected
+    /// for testability without audio hardware.
+    nonisolated static func migratedInputSelection(
+        storedUID: String?,
+        storedName: String?,
+        legacyID: AudioDeviceID,
+        resolveUID: (AudioDeviceID) -> String?,
+        resolveName: (AudioDeviceID) -> String?
+    ) -> (uid: String, name: String) {
+        if let storedUID {
+            return (storedUID, storedName ?? "")
+        }
+        if legacyID != 0, let uid = resolveUID(legacyID) {
+            return (uid, resolveName(legacyID) ?? "")
+        }
+        return ("", "")
+    }
+
+    /// Pure exclusion-list seeding: append every builtin not yet in `seen` to
+    /// the current list, and record it as seen. User removals stick because
+    /// removed IDs remain in `seen`. First run (`current == nil`) seeds all
+    /// builtins.
+    nonisolated static func seededExclusions(
+        current: [String]?,
+        seen: [String]?,
+        builtins: [String]
+    ) -> (list: [String], seen: [String]) {
+        var list = current ?? []
+        var seenSet = seen ?? []
+        for id in builtins where !seenSet.contains(id) {
+            seenSet.append(id)
+            if !list.contains(id) { list.append(id) }
+        }
+        return (list, seenSet)
     }
 
     /// Apply current screen-share visibility to all app windows.

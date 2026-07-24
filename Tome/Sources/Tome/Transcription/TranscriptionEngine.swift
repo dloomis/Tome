@@ -89,8 +89,28 @@ final class TranscriptionEngine {
     /// Tracks the resolved mic device ID currently in use.
     private var currentMicDeviceID: AudioDeviceID = 0
 
-    /// Tracks whether user selected "System Default" (0) or a specific device.
-    private var userSelectedDeviceID: AudioDeviceID = 0
+    /// The user's mic selection as a persisted device UID ("" = System Default).
+    /// UID, not AudioDeviceID: numeric IDs are transient across driver reloads /
+    /// reboots (third-party HAL drivers especially), so the intent is stored
+    /// stably and re-resolved to a live ID at EVERY bind attempt — start,
+    /// restart, and watchdog rebuilds all aim at this.
+    private var userSelectedDeviceUID: String = ""
+
+    /// The session's audio-router exclusion list (AppSettings.excludedAudioAppIDs
+    /// at start time), retained like `activeRecordingContext` so system-leg
+    /// rebuilds re-apply the same SCContentFilter.
+    private var activeExcludedAudioAppIDs: [String] = []
+
+    /// Non-nil while capture runs on a device OTHER than the user's selection
+    /// (unresolvable UID at start, or an emergency fallback after a failed
+    /// bind). Rendered as a persistent ControlBar banner; the selection itself
+    /// is never changed — rebuild attempts keep aiming at the chosen device.
+    private(set) var micFallbackMessage: String?
+
+    /// One-shot check that the mic is delivering real audio (not exact digital
+    /// zeros — the signature of an unfed virtual router device or a hard-muted
+    /// input). Armed per start(), cancelled in stop().
+    private var micSilenceCheckTask: Task<Void, Never>?
 
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
@@ -110,9 +130,10 @@ final class TranscriptionEngine {
 
     func start(
         locale: Locale,
-        inputDeviceID: AudioDeviceID = 0,
+        inputDeviceUID: String = "",
         recordingContext: SessionRecordingContext? = nil,
-        captureSystemAudio: Bool = true
+        captureSystemAudio: Bool = true,
+        excludedAudioAppIDs: [String] = []
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
@@ -180,8 +201,22 @@ final class TranscriptionEngine {
         micCapture.onConfigurationChange = { [weak self] in
             Task { @MainActor in self?.scheduleMicRebuild(reason: "engine configuration change") }
         }
-        userSelectedDeviceID = inputDeviceID
-        let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID()
+        userSelectedDeviceUID = inputDeviceUID
+        activeExcludedAudioAppIDs = excludedAudioAppIDs
+        micFallbackMessage = nil
+        let targetMicID: AudioDeviceID?
+        if inputDeviceUID.isEmpty {
+            targetMicID = MicCapture.defaultInputDeviceID()
+        } else if let resolved = MicCapture.deviceID(forUID: inputDeviceUID) {
+            targetMicID = resolved
+        } else {
+            // The persisted UID resolves to no present device. Fall back to the
+            // system default FOR THIS SESSION and say so — the old behavior
+            // recorded a whole meeting off the built-in mic with no indication.
+            // The selection is preserved; watchdog rebuilds keep aiming at it.
+            targetMicID = MicCapture.defaultInputDeviceID()
+            reportMicFallback(boundDeviceID: targetMicID)
+        }
         currentMicDeviceID = targetMicID ?? 0
         currentMicBufferURL = recordingContext.flatMap { ctx in
             try? SystemAudioCapture.sessionsDirectory().appendingPathComponent("\(ctx.sessionId).mic.wav")
@@ -230,6 +265,7 @@ final class TranscriptionEngine {
         // flip races even that). Force ONE mic restart at 3s if no sample ever
         // arrives, collapsing the 15s watchdog wait.
         armStartupDeliveryGate()
+        armMicDigitalSilenceCheck()
 
         // 3. Start system audio capture. Skipped for mic-only sessions (voice memos /
         //    in-person meetings) — there the mic is the sole source and diarization runs
@@ -238,9 +274,20 @@ final class TranscriptionEngine {
         let sysStreams: SystemAudioCapture.CaptureStreams?
         if captureSystemAudio {
             diagLog("[ENGINE-4] starting system audio capture...")
+            // Warn-only router-signature diagnostic: a process running mic input
+            // AND audio output that is NOT excluded may be an audio router about
+            // to bleed the user's own voice onto this leg. Never auto-excluded —
+            // a conferencing app in a live call has the identical signature.
+            let unexcludedPassthrough = AudioProcessInspector.micPassthroughBundleIDs(
+                excluding: Set(excludedAudioAppIDs + [Bundle.main.bundleIdentifier ?? ""])
+            )
+            if !unexcludedPassthrough.isEmpty {
+                diagLog("[SYS-CAPTURE] mic-passthrough processes NOT excluded from capture: \(unexcludedPassthrough.joined(separator: ", ")) — if one is an audio router, own voice may appear as Them (Settings ▸ Audio ▸ System Audio)")
+            }
             do {
                 sysStreams = try await systemCapture.bufferStream(
-                    recordingContext: recordingContext
+                    recordingContext: recordingContext,
+                    excludedBundleIDs: excludedAudioAppIDs
                 )
                 currentBufferURL = sysStreams?.bufferURL
                 diagLog("[ENGINE-5] system audio capture started OK")
@@ -447,7 +494,10 @@ final class TranscriptionEngine {
         await systemCapture.stop()
         guard generation == sessionGeneration, isRunning else { return }
         do {
-            let streams = try await systemCapture.bufferStream(recordingContext: activeRecordingContext)
+            let streams = try await systemCapture.bufferStream(
+                recordingContext: activeRecordingContext,
+                excludedBundleIDs: activeExcludedAudioAppIDs
+            )
             guard generation == sessionGeneration, isRunning else {
                 // Stale: a stop (or a new session's start) raced the bring-up.
                 // Unwind the capture we just started so it can't leak an SCStream
@@ -497,6 +547,21 @@ final class TranscriptionEngine {
     /// gate hasn't already fired, and no rebuild is already in flight (mic: the
     /// debounced config/HAL rebuild; system: `sysRebuildInFlight`) — that rebuild
     /// re-opens the leg on its own, don't stack a second restart on top.
+    /// Pure decision for post-bind fallback reconciliation (see `restartMic`):
+    /// capture counts as "fallen back" only when the user pinned a specific
+    /// device (non-empty UID) and the device we actually bound is not the one
+    /// that UID currently resolves to (including resolving to nothing at all).
+    /// System Default selection can never be a fallback. Extracted for
+    /// unit-testing without audio hardware, like `shouldForceStartupRestart`.
+    nonisolated static func isMicFallbackActive(
+        selectedUID: String,
+        selectionResolvesTo: AudioDeviceID?,
+        boundDeviceID: AudioDeviceID
+    ) -> Bool {
+        guard !selectedUID.isEmpty else { return false }
+        return selectionResolvesTo != boundDeviceID
+    }
+
     nonisolated static func shouldForceStartupRestart(
         firstSampleAt: Date?,
         isRunning: Bool,
@@ -545,9 +610,82 @@ final class TranscriptionEngine {
                 // `silent: true` also suppresses the bind-failure fallback's
                 // postCaptureStall/lastError — a failed silent retry leaves the
                 // rescue to the stall watchdog rather than alarming the user.
-                self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true, silent: true)
+                self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true, silent: true)
             }
         }
+    }
+
+    /// Surface a mic fallback: capture is running on `boundDeviceID` instead of
+    /// the user's selection. Banner (via `micFallbackMessage`) + one notification
+    /// — the Tome window is typically hidden behind the meeting app when this
+    /// matters. Guarded against re-posting on every watchdog retry.
+    private func reportMicFallback(boundDeviceID: AudioDeviceID?) {
+        guard micFallbackMessage == nil else { return }
+        let actual = boundDeviceID.flatMap(MicCapture.deviceName(for:)) ?? "the system default microphone"
+        let msg = "Selected mic unavailable — recording from \(actual). Your Settings choice is unchanged."
+        micFallbackMessage = msg
+        diagLog("[MIC-FALLBACK] \(msg)")
+        Task { await NotificationPresenter.shared.postMicFallback(detail: msg) }
+    }
+
+    /// Clear fallback state after a bind landed back on the user's selection
+    /// (or the selection is System Default, where "fallback" has no meaning).
+    private func clearMicFallback() {
+        guard micFallbackMessage != nil else { return }
+        micFallbackMessage = nil
+        NotificationPresenter.shared.clearMicFallback()
+        diagLog("[MIC-FALLBACK] cleared — capture is back on the selected device")
+    }
+
+    /// One-shot at +8s, then a monitor: if the mic tap is DELIVERING buffers but
+    /// every sample so far is exactly zero, warn — a real mic's noise floor is
+    /// never exact zeros, so this is an unfed virtual device (its router app not
+    /// running; the device stays enumerable regardless) or a hard-muted input.
+    /// Distinct from the delivery gates/watchdog, which cannot see this: the
+    /// stream is alive, its content is empty. The monitor clears the warning if
+    /// real audio arrives later (user unmutes, router app launches).
+    private func armMicDigitalSilenceCheck() {
+        micSilenceCheckTask?.cancel()
+        let generation = sessionGeneration
+        micSilenceCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration, self.isRunning else { return }
+            guard self.micCapture.firstSampleTime != nil, !self.micCapture.sawNonzeroSample else {
+                // Healthy (or not yet delivering — the delivery gates own that).
+                // A previous device's still-posted warning is stale now.
+                self.clearMicSilenceWarning()
+                return
+            }
+            let name = MicCapture.deviceName(for: self.currentMicDeviceID) ?? "The selected microphone"
+            let msg = "\(name) is delivering silence — it may be muted, or the app that provides it (e.g. Wave Link) may not be running."
+            diagLog("[MIC-SILENCE] \(msg)")
+            self.micSilenceMessage = msg
+            self.lastError = msg
+            Task { await NotificationPresenter.shared.postMicDigitalSilence(detail: msg) }
+            // Monitor for recovery so the banner doesn't outlive the condition.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard generation == self.sessionGeneration, self.isRunning else { return }
+                if self.micCapture.sawNonzeroSample {
+                    diagLog("[MIC-SILENCE] real audio arrived — clearing the silence warning")
+                    self.clearMicSilenceWarning()
+                    return
+                }
+            }
+        }
+    }
+
+    /// The exact message posted by the digital-silence check, so the clear path
+    /// only wipes `lastError` when it still shows OUR warning (not some newer,
+    /// unrelated error).
+    private var micSilenceMessage: String?
+
+    private func clearMicSilenceWarning() {
+        guard let msg = micSilenceMessage else { return }
+        micSilenceMessage = nil
+        if lastError == msg { lastError = nil }
+        NotificationPresenter.shared.clearMicDigitalSilence()
     }
 
     /// Timestamps of recent config-driven rebuilds — loop suppression window.
@@ -613,12 +751,14 @@ final class TranscriptionEngine {
             self.recentMicRebuilds.append(now)
 
             diagLog("[ENGINE-MIC-REBUILD] \(reason) — restarting mic on current selection")
-            self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+            self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true)
         }
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
-    /// Pass the raw setting value (0 = system default, or a specific AudioDeviceID).
+    /// Pass the raw setting value ("" = system default, or a persisted device UID —
+    /// resolved to a live AudioDeviceID here, at bind time, because numeric IDs
+    /// shift across driver reloads while UIDs don't).
     /// `force` skips the same-device short-circuit — used by the capture watchdog to
     /// re-establish a mic whose tap stopped delivering on the SAME device.
     /// `updateSelection: false` marks an EMERGENCY rebind (fallback to default after
@@ -627,16 +767,28 @@ final class TranscriptionEngine {
     /// `silent: true` marks a startup-gate fast retry: on bind failure it does NOT
     /// post the user-facing stall notification or set `lastError` for this attempt
     /// — the true never-delivers wedge is still owned by the stall watchdog. Any
-    /// recursive fallback restart inside a silent attempt stays silent.
-    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false, updateSelection: Bool = true, silent: Bool = false) {
+    /// recursive fallback restart inside a silent attempt stays silent. The
+    /// RESULTING fallback state (recording off a non-selected device) is surfaced
+    /// even for silent attempts — only the attempt error is quiet, never the outcome.
+    func restartMic(inputDeviceUID: String, force: Bool = false, updateSelection: Bool = true, silent: Bool = false) {
         guard isRunning, let vadManager else { return }
 
         // Only update user selection when explicitly changed (not from OS listener,
         // not from an emergency fallback)
-        if updateSelection, inputDeviceID != 0 || userSelectedDeviceID != 0 {
-            userSelectedDeviceID = inputDeviceID
+        if updateSelection {
+            userSelectedDeviceUID = inputDeviceUID
         }
-        let targetMicID = inputDeviceID > 0 ? inputDeviceID : MicCapture.defaultInputDeviceID() ?? 0
+        let targetMicID: AudioDeviceID
+        if inputDeviceUID.isEmpty {
+            targetMicID = MicCapture.defaultInputDeviceID() ?? 0
+        } else if let resolved = MicCapture.deviceID(forUID: inputDeviceUID) {
+            targetMicID = resolved
+        } else {
+            // Selected device absent right now: bind the default for this
+            // attempt. The fallback banner is raised by the reconciliation at
+            // the end of the successful bind below.
+            targetMicID = MicCapture.defaultInputDeviceID() ?? 0
+        }
         guard force || targetMicID != currentMicDeviceID else {
             diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
             return
@@ -679,7 +831,7 @@ final class TranscriptionEngine {
             if targetMicID != 0,
                let fallback = MicCapture.defaultInputDeviceID(), fallback != targetMicID {
                 diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback)) — user selection preserved")
-                restartMic(inputDeviceID: 0, force: true, updateSelection: false, silent: silent)
+                restartMic(inputDeviceUID: "", force: true, updateSelection: false, silent: silent)
             }
             return
         }
@@ -710,6 +862,23 @@ final class TranscriptionEngine {
         }
 
         diagLog("[ENGINE-MIC-SWAP] mic restarted on device \(targetMicID)")
+
+        // Fallback-state reconciliation for the device we actually bound: raise
+        // the banner when capture landed off the user's selection (unresolvable
+        // UID, or the emergency default rebind above with the selection
+        // preserved), clear it when a later rebuild lands back on it. Runs on
+        // the SUCCESS path only — a failed bind changed nothing.
+        if Self.isMicFallbackActive(
+            selectedUID: userSelectedDeviceUID,
+            selectionResolvesTo: MicCapture.deviceID(forUID: userSelectedDeviceUID),
+            boundDeviceID: targetMicID
+        ) {
+            reportMicFallback(boundDeviceID: targetMicID)
+        } else {
+            clearMicFallback()
+        }
+        // The new device must prove it delivers real audio, same as at start.
+        armMicDigitalSilenceCheck()
     }
 
     // MARK: - Default Device Listener
@@ -726,9 +895,9 @@ final class TranscriptionEngine {
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.isRunning, self.userSelectedDeviceID == 0 else { return }
+                guard self.isRunning, self.userSelectedDeviceUID.isEmpty else { return }
                 // User has "System Default" selected — follow the OS default
-                self.restartMic(inputDeviceID: 0)
+                self.restartMic(inputDeviceUID: "")
             }
         }
         defaultDeviceListenerBlock = block
@@ -793,7 +962,14 @@ final class TranscriptionEngine {
         sysStartupGateTask = nil
         sysRebuildGraceTask?.cancel()
         sysRebuildGraceTask = nil
+        micSilenceCheckTask?.cancel()
+        micSilenceCheckTask = nil
+        micSilenceMessage = nil
+        micFallbackMessage = nil
+        NotificationPresenter.shared.clearMicDigitalSilence()
+        NotificationPresenter.shared.clearMicFallback()
         activeRecordingContext = nil
+        activeExcludedAudioAppIDs = []
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil
@@ -879,6 +1055,8 @@ final class TranscriptionEngine {
             var sysStalledTicksSinceRestart = 0
             var failedRecoveryAttempts = 0
             var lastTick = Date()
+            let watchdogStart = Date()
+            var postedSystemSilent = false
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 if Task.isCancelled { return }
@@ -896,6 +1074,25 @@ final class TranscriptionEngine {
                     continue
                 }
                 lastTick = now
+
+                // Content-aware empty-leg check: SCStream delivers buffers
+                // continuously even for pure digital silence (verified
+                // 2026-07-24), so the stall detectors below can never see an
+                // EMPTY system leg — only a stopped one. One warning per
+                // session at +60s with zero audible buffers; deliberately not
+                // the 8s startup-gate window, where a quiet meeting join would
+                // false-alarm every time.
+                if systemLegActive, !postedSystemSilent,
+                   now.timeIntervalSince(watchdogStart) >= 60,
+                   sysCapture.audibleBufferCount == 0 {
+                    postedSystemSilent = true
+                    diagLog("[WATCHDOG] no audible system audio 60s into the session — warning once")
+                    Task {
+                        await NotificationPresenter.shared.postSystemAudioSilent(
+                            detail: "No system audio detected yet. If the other side is talking, check the excluded apps in Settings \u{25B8} Audio."
+                        )
+                    }
+                }
 
                 // The mic's tap-written timestamp is authoritative; the start
                 // seed is only a baseline so a never-delivering device still
@@ -1005,16 +1202,16 @@ final class TranscriptionEngine {
                         // handleStallEvent stays up until real samples resume.
                         Task { await self.restartSystemAudioLeg() }
                     }
-                    if surrenderPin && self.userSelectedDeviceID != 0 {
+                    if surrenderPin && !self.userSelectedDeviceUID.isEmpty {
                         diagLog("[WATCHDOG] pinned mic failed \(failedRecoveryAttempts) recovery cycles — following System Default for this session")
                         let msg = "The selected microphone kept failing — following the system default for this session. Your Settings choice is unchanged."
                         self.lastError = msg
                         Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
-                        self.userSelectedDeviceID = 0
-                        self.restartMic(inputDeviceID: 0, force: true)
+                        self.userSelectedDeviceUID = ""
+                        self.restartMic(inputDeviceUID: "", force: true)
                     } else if restart {
                         diagLog("[WATCHDOG] attempting automatic mic restart")
-                        self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+                        self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true)
                     }
                 }
             }
@@ -1159,4 +1356,10 @@ final class TranscriptionEngine {
     /// Count of write failures on the system-audio WAV during the active capture.
     /// Snapshot at stop time, before `stop()` resets the capture's internal counter.
     var systemAudioWriteErrorCount: Int { systemCapture.writeErrorCount }
+
+    /// Buffers with audible content delivered on the system leg this session.
+    /// ContentView snapshots this at stop (before `stop()` frees the capture for
+    /// reuse) to append the "no system audio was captured" note for call
+    /// captures that stayed at zero.
+    var systemAudioAudibleBufferCount: Int { systemCapture.audibleBufferCount }
 }

@@ -58,6 +58,16 @@ final class MicCapture: @unchecked Sendable {
     private let _lastSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var lastSampleTime: Date? { _lastSampleTime.withLock { $0 } }
 
+    /// True once the tap has delivered at least one buffer with a non-zero
+    /// sample since the last `bufferStream` entry. A real microphone's noise
+    /// floor is never exactly zero, so a delivering-but-all-zero stream is the
+    /// signature of an unfed virtual device (an audio router's mix whose app is
+    /// not running — Wave Link's devices stay enumerable while it's closed) or
+    /// a hard-muted input. The engine reads this to warn instead of silently
+    /// recording zeros for a whole meeting.
+    private let _sawNonzeroSample = OSAllocatedUnfairLock<Bool>(uncheckedState: false)
+    var sawNonzeroSample: Bool { _sawNonzeroSample.withLock { $0 } }
+
     /// Wall-clock time capture was (re)started, seeded on successful engine
     /// start. The watchdog uses it as the stall baseline while the tap hasn't
     /// delivered yet — so a device that never sends a single buffer still alarms
@@ -206,6 +216,9 @@ final class MicCapture: @unchecked Sendable {
 
         return AsyncStream { continuation in
             errorHolder.value = nil
+            // Each (re)bind proves itself anew: a mid-session swap onto an unfed
+            // virtual device must not inherit the previous device's non-zero flag.
+            self._sawNonzeroSample.withLock { $0 = false }
 
             // Track the live continuation so `stop()` can finish the stream.
             // Any predecessor was already finished by the `stop()` that precedes
@@ -395,6 +408,7 @@ final class MicCapture: @unchecked Sendable {
             let retentionWriter = self._retentionWriter
             let firstSampleTime = self._firstSampleTime
             let lastSampleTime = self._lastSampleTime
+            let sawNonzeroSample = self._sawNonzeroSample
 
             var tapCallCount = 0
             let installException = TomeCatchObjCException {
@@ -402,6 +416,7 @@ final class MicCapture: @unchecked Sendable {
                 tapCallCount += 1
                 let rms = Self.normalizedRMS(from: buffer)
                 level.value = min(rms * 25, 1.0)
+                if rms > 0 { sawNonzeroSample.withLock { $0 = true } }
 
                 if tapCallCount <= 5 || tapCallCount % 100 == 0 {
                     diagLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
@@ -692,7 +707,7 @@ final class MicCapture: @unchecked Sendable {
 
     // MARK: - List available input devices
 
-    static func availableInputDevices() -> [(id: AudioDeviceID, name: String)] {
+    static func availableInputDevices() -> [(id: AudioDeviceID, uid: String, name: String)] {
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -719,7 +734,7 @@ final class MicCapture: @unchecked Sendable {
         )
         guard status == noErr else { return [] }
 
-        var result: [(id: AudioDeviceID, name: String)] = []
+        var result: [(id: AudioDeviceID, uid: String, name: String)] = []
 
         for deviceID in deviceIDs {
             // Check if device has input channels
@@ -764,7 +779,7 @@ final class MicCapture: @unchecked Sendable {
             status = AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, &name)
             guard status == noErr else { continue }
 
-            result.append((id: deviceID, name: name as String))
+            result.append((id: deviceID, uid: deviceUID(for: deviceID) ?? "", name: name as String))
         }
 
         return result
@@ -784,6 +799,14 @@ final class MicCapture: @unchecked Sendable {
         var size = UInt32(MemoryLayout<CFString>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name)
         return status == noErr ? name as String : nil
+    }
+
+    /// Resolve a persisted device UID to its current AudioDeviceID, or nil when
+    /// no present input device carries that UID. Called at every capture bind —
+    /// UIDs are stable across driver reloads/reboots while numeric IDs are not.
+    static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        guard !uid.isEmpty else { return nil }
+        return availableInputDevices().first(where: { $0.uid == uid })?.id
     }
 
     static func deviceUID(for deviceID: AudioDeviceID) -> String? {

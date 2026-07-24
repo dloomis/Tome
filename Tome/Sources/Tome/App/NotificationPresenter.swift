@@ -150,6 +150,79 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         center.removePendingNotificationRequests(withIdentifiers: [id])
     }
 
+    // MARK: - Mic fallback / digital silence / silent system leg
+
+    /// Fixed identifiers so re-posts replace (not stack) and each can be
+    /// withdrawn when its condition clears.
+    private nonisolated static let micFallbackRequestID = "tome-mic-fallback"
+    private nonisolated static let micSilenceRequestID = "tome-mic-digital-silence"
+    private nonisolated static let systemSilentRequestID = "tome-system-audio-silent"
+
+    /// Capture is running on a device other than the user's selection (the
+    /// selected mic's UID resolved to no present device, or its bind failed and
+    /// the engine fell back to the system default). Previously this fallback was
+    /// completely silent — a meeting could record off the built-in mic with no
+    /// indication until the transcript was read.
+    func postMicFallback(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: recording from a different microphone"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: Self.micFallbackRequestID, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw the fallback alert after capture lands back on the selected
+    /// device (or the session ends). Safe when nothing is posted.
+    func clearMicFallback() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.micFallbackRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.micFallbackRequestID])
+    }
+
+    /// The mic tap is delivering buffers whose samples are all exactly zero — an
+    /// unfed virtual device (audio-router app not running) or a hard-muted
+    /// input. Real microphones always carry a non-zero noise floor.
+    func postMicDigitalSilence(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: microphone is recording silence"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: Self.micSilenceRequestID, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    func clearMicDigitalSilence() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.micSilenceRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.micSilenceRequestID])
+    }
+
+    /// A call capture's system leg has produced no audible content — either 60s
+    /// into a live session (watchdog one-shot) or for an entire finished session
+    /// (stop-time note). Fixed ID: the stop-time post replaces the mid-session
+    /// one instead of stacking.
+    func postSystemAudioSilent(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: no system audio detected"
+        content.body = detail
+        content.sound = nil
+
+        let request = UNNotificationRequest(identifier: Self.systemSilentRequestID, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - Post-processing failure
 
     /// A finalization job failed after the session ended. The capture WAVs were

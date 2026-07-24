@@ -107,6 +107,7 @@ struct ContentView: View {
                 silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
+                warningMessage: transcriptionEngine?.micFallbackMessage,
                 modelStatus: modelStatusText,
                 canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
@@ -196,16 +197,11 @@ struct ContentView: View {
             // which awaits the provisioner settling).
             services.modelProvisioner.provision(settings.transcriberModel)
 
-            // Sanitize the persisted mic selection: AudioDeviceIDs are transient,
-            // so a device chosen last session (AirPods) may be absent — or worse,
-            // its numeric id reassigned — at this launch. An absent selection left
-            // the Settings picker EMPTY and sessions targeting a dead id. Fall
-            // back to System Default, which is always valid.
-            if settings.inputDeviceID != 0,
-               !MicCapture.availableInputDevices().contains(where: { $0.id == settings.inputDeviceID }) {
-                diagLog("[BOOT] persisted mic device \(settings.inputDeviceID) not present — resetting to System Default")
-                settings.inputDeviceID = 0
-            }
+            // No boot-time sanitize of the mic selection anymore: it's persisted
+            // by device UID (stable across reboots/driver reloads), an absent
+            // device renders as "(unavailable)" in the picker rather than a
+            // blank selection, and the engine resolves UID → live ID at every
+            // bind with a VISIBLE fallback when resolution fails.
 
             // Boot the single-consumer utterance writer so markdown + JSONL stay in lockstep.
             if utteranceChannel == nil {
@@ -322,9 +318,9 @@ struct ContentView: View {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
-        .onChange(of: settings.inputDeviceID) {
+        .onChange(of: settings.inputDeviceUID) {
             if isRunning {
-                transcriptionEngine?.restartMic(inputDeviceID: settings.inputDeviceID)
+                transcriptionEngine?.restartMic(inputDeviceUID: settings.inputDeviceUID)
             }
         }
         .onChange(of: transcriptStore.utterances.count as Int) {
@@ -740,8 +736,9 @@ struct ContentView: View {
             if type == .callCapture {
                 await transcriptionEngine?.start(
                     locale: settings.locale,
-                    inputDeviceID: settings.inputDeviceID,
-                    recordingContext: recordingContext
+                    inputDeviceUID: settings.inputDeviceUID,
+                    recordingContext: recordingContext,
+                    excludedAudioAppIDs: settings.excludedAudioAppIDs
                 )
             } else {
                 // Voice memos / in-person meetings are mic-only: skip system-audio
@@ -749,7 +746,7 @@ struct ContentView: View {
                 // runs on the mic track (see PostProcessingJob).
                 await transcriptionEngine?.start(
                     locale: settings.locale,
-                    inputDeviceID: settings.inputDeviceID,
+                    inputDeviceUID: settings.inputDeviceUID,
                     recordingContext: recordingContext,
                     captureSystemAudio: false
                 )
@@ -872,6 +869,7 @@ struct ContentView: View {
             let micFirstSample = transcriptionEngine?.micFirstSampleTime
             let systemFirstSample = transcriptionEngine?.systemFirstSampleTime
             let wavWriteErrors = transcriptionEngine?.systemAudioWriteErrorCount ?? 0
+            let audibleSystemBuffers = transcriptionEngine?.systemAudioAudibleBufferCount ?? 0
 
             await transcriptionEngine?.stop()
 
@@ -921,6 +919,23 @@ struct ContentView: View {
             // Job now running (isAnyJobRunning holds the lock); release the
             // stop-window pending lock (F-2).
             services.isSessionPending = false
+
+            // End-of-session note for a call capture whose system leg carried no
+            // audible content at all. Content-based, not delivery-based —
+            // SCStream delivers silent buffers continuously, so this is the only
+            // signal that "Them" is empty. Gated to sessions ≥60s so a quick
+            // test start/stop doesn't nag; the fixed notification ID replaces
+            // the watchdog's mid-session warning rather than stacking on it.
+            if wasCallCapture, audibleSystemBuffers == 0,
+               let firstSample = micFirstSample ?? systemFirstSample,
+               Date().timeIntervalSince(firstSample) >= 60 {
+                diagLog("[STOP] call capture ended with zero audible system-audio buffers — posting silent-leg note")
+                Task {
+                    await NotificationPresenter.shared.postSystemAudioSilent(
+                        detail: "This recording captured no system audio — the transcript contains only your side. If the other side was routed through an excluded app, review Settings \u{25B8} Audio."
+                    )
+                }
+            }
         }
     }
 
