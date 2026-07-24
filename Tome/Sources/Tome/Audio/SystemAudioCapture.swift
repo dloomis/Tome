@@ -103,11 +103,14 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         recordingContext: SessionRecordingContext? = nil,
         excludedBundleIDs: [String] = []
     ) async throws -> CaptureStreams {
-        // Desktop/off-screen windows are irrelevant: only `displays` and
-        // `applications` are read below, and both are populated independently of
-        // the window filtering — enumerating every window was pure WindowServer
-        // IPC cost on each session start and gate rebuild.
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        // `onScreenWindowsOnly` MUST stay false: with `true`, `content.applications`
+        // only lists apps that own an on-screen window, so a menu-bar/background app
+        // (Wave Link with its window closed — its normal state) silently vanishes
+        // from the list and the exclusion filter below can't match it. That re-admits
+        // the router's re-render and every recording gets a ~80ms+ echo (observed
+        // 2026-07-24: exclusion flapped with the Wave Link window's visibility).
+        // The extra window enumeration is IPC cost we pay for a correct filter.
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
 
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
