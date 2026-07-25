@@ -75,6 +75,16 @@ final class MicCapture: @unchecked Sendable {
     private let _captureStartTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var captureStartTime: Date? { _captureStartTime.withLock { $0 } }
 
+    /// Content telemetry for this capture: audible-buffer and write-failure
+    /// counts, reset on every `bufferStream` entry. Exists so a device-backed
+    /// system leg (`TranscriptionEngine.systemDeviceCapture`) reports the same
+    /// numbers the SCK leg does — the 60s no-audible warning, the end-of-session
+    /// note, and `SessionHandle.wavWriteErrorCount` all read them through the
+    /// engine's mode-routed accessors.
+    private let _content = CaptureContentCounters()
+    var audibleBufferCount: Int { _content.audibleBufferCount }
+    var writeErrorCount: Int { _content.writeErrorCount }
+
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
@@ -219,6 +229,9 @@ final class MicCapture: @unchecked Sendable {
             // Each (re)bind proves itself anew: a mid-session swap onto an unfed
             // virtual device must not inherit the previous device's non-zero flag.
             self._sawNonzeroSample.withLock { $0 = false }
+            // Same per-bind semantics for the content counters (matches
+            // SystemAudioCapture, which resets both in its own bufferStream).
+            self._content.reset()
 
             // Track the live continuation so `stop()` can finish the stream.
             // Any predecessor was already finished by the `stop()` that precedes
@@ -409,6 +422,7 @@ final class MicCapture: @unchecked Sendable {
             let firstSampleTime = self._firstSampleTime
             let lastSampleTime = self._lastSampleTime
             let sawNonzeroSample = self._sawNonzeroSample
+            let content = self._content
 
             var tapCallCount = 0
             let installException = TomeCatchObjCException {
@@ -417,6 +431,7 @@ final class MicCapture: @unchecked Sendable {
                 let rms = Self.normalizedRMS(from: buffer)
                 level.value = min(rms * 25, 1.0)
                 if rms > 0 { sawNonzeroSample.withLock { $0 = true } }
+                content.noteBuffer(rms: rms)
 
                 if tapCallCount <= 5 || tapCallCount % 100 == 0 {
                     diagLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
@@ -432,12 +447,24 @@ final class MicCapture: @unchecked Sendable {
                 guard let mono = Self.downmixToMono(buffer) else { return }
                 retentionWriter.withLock { state in
                     guard let state else { return }
-                    guard let converter = state.converter else {
-                        try? state.writer.write(mono)
-                        return
+                    let payload: AVAudioPCMBuffer
+                    if let converter = state.converter {
+                        guard let resampled = Self.resample(mono, using: converter) else { return }
+                        payload = resampled
+                    } else {
+                        payload = mono
                     }
-                    guard let resampled = Self.resample(mono, using: converter) else { return }
-                    try? state.writer.write(resampled)
+                    do {
+                        try state.writer.write(payload)
+                    } catch {
+                        // Previously `try?`-swallowed. Counted (and throttle-logged
+                        // like the SCK writer) so a device-backed system leg seeds
+                        // SessionHandle.wavWriteErrorCount with real data.
+                        let total = content.noteWriteError()
+                        if total == 1 || total % 100 == 0 {
+                            diagLog("[MIC-WAV-FAIL] write #\(total) failed: \(error)")
+                        }
+                    }
                 }
 
                 continuation.yield(mono)
@@ -855,6 +882,46 @@ private extension String {
         } else {
             self = "\(fourCC)"
         }
+    }
+}
+
+/// Per-capture content telemetry: how many delivered buffers carried audible
+/// content, and how many retention-WAV writes failed. Split out of `MicCapture`
+/// so the accounting rules are unit-testable without an audio device — the tap
+/// callback captures the instance the same way it captures the other locks.
+///
+/// The audible threshold is `SystemAudioCapture.audibleRMSThreshold` verbatim:
+/// both legs must agree on what "audible" means, or the same meeting would be
+/// judged silent on one capture path and not the other.
+final class CaptureContentCounters: @unchecked Sendable {
+    private let state = OSAllocatedUnfairLock<(audible: Int, writeErrors: Int)>(uncheckedState: (0, 0))
+
+    var audibleBufferCount: Int { state.withLock { $0.audible } }
+    var writeErrorCount: Int { state.withLock { $0.writeErrors } }
+
+    /// Count one delivered buffer. Sub-threshold buffers are delivered-but-empty
+    /// and deliberately don't count — that distinction is the whole point of the
+    /// counter (a stream can deliver continuously while carrying pure silence).
+    func noteBuffer(rms: Float) {
+        guard rms > SystemAudioCapture.audibleRMSThreshold else { return }
+        state.withLock { $0.audible += 1 }
+    }
+
+    /// Count one failed retention-WAV write; returns the new total so the caller
+    /// can throttle its logging.
+    @discardableResult
+    func noteWriteError() -> Int {
+        state.withLock { state -> Int in
+            state.writeErrors += 1
+            return state.writeErrors
+        }
+    }
+
+    /// Reset both counters. Called on every `bufferStream` entry so a mid-session
+    /// device rebuild starts its own accounting rather than inheriting the
+    /// previous device's.
+    func reset() {
+        state.withLock { $0 = (0, 0) }
     }
 }
 

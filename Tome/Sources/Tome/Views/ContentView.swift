@@ -51,6 +51,12 @@ struct ContentView: View {
     /// either at the end of boot (no onboarding) or when onboarding dismisses.
     @State private var hasScannedOrphans = false
 
+    /// A running mix-publishing mixer the user hasn't been told about yet
+    /// (`MixerLeanInPrompt`). Drives the one-time lean-in invitation banner.
+    /// Nil in every other case — including while recording, since the banner is
+    /// only evaluated at boot.
+    @State private var leanInMixer: (bundleID: String, name: String)?
+
     /// Single-consumer channel that serializes utterance writes to the markdown
     /// transcript and the JSONL crash-recovery file. Prevents the two stores from
     /// drifting out of order when `handleNewUtterance` fires faster than the
@@ -84,6 +90,12 @@ struct ContentView: View {
                 )
             }
 
+            // One-time invitation to point the call-audio source at a mixer mix.
+            // Idle-only (it's evaluated at boot) and never blocks recording.
+            if let mixer = leanInMixer, activeSessionType == nil {
+                mixerLeanInBanner(bundleID: mixer.bundleID, name: mixer.name)
+            }
+
             // Save banner (or the discard notice — never both; a discard writes nothing)
             if let url = savedFileURL, activeSessionType == nil {
                 saveBanner(url: url)
@@ -107,7 +119,7 @@ struct ContentView: View {
                 silencePromptActive: silencePromptActive,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
-                warningMessage: transcriptionEngine?.micFallbackMessage,
+                warningMessage: captureWarningMessage,
                 modelStatus: modelStatusText,
                 canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
@@ -244,6 +256,8 @@ struct ContentView: View {
             if hasCompletedOnboarding {
                 await checkForOrphanedSessionsOnce()
             }
+
+            evaluateMixerLeanInPrompt()
         }
         // Audio level polling
         .task {
@@ -405,6 +419,17 @@ struct ContentView: View {
         }
     }
 
+    /// Both capture-configuration warnings share the ControlBar's single amber
+    /// line — they're independent (a fallback mic and a fallback call-audio
+    /// source can be live at once) and each must stay visible.
+    private var captureWarningMessage: String? {
+        let warnings = [
+            transcriptionEngine?.micFallbackMessage,
+            transcriptionEngine?.systemSourceFallbackMessage,
+        ].compactMap { $0 }
+        return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+    }
+
     // MARK: - Top Bar
 
     private var topBar: some View {
@@ -512,6 +537,73 @@ struct ContentView: View {
         .background(Color.bg1.opacity(0.7))
         .overlay(Divider(), alignment: .top)
         .overlay(Divider(), alignment: .bottom)
+    }
+
+    // MARK: - Mixer lean-in prompt
+
+    /// Decide, once per launch, whether to invite the user into device-backed
+    /// call-audio capture. Invitation only — it never gates or delays recording,
+    /// and automatic mode stays fully correct for anyone who dismisses it.
+    private func evaluateMixerLeanInPrompt() {
+        guard let bundleID = MixerLeanInPrompt.mixerToPromptFor(
+            runningBundleIDs: MixerLeanInPrompt.runningApplicationBundleIDs(),
+            systemAudioSourceUID: settings.systemAudioSourceUID,
+            alreadyPromptedBundleIDs: MixerLeanInPrompt.promptedBundleIDs()
+        ) else { return }
+        leanInMixer = (bundleID: bundleID, name: MixerLeanInPrompt.displayName(forBundleID: bundleID))
+        diagLog("[LEAN-IN] mix-publishing mixer detected (\(bundleID)) — offering the call-audio source")
+    }
+
+    /// Same slot and styling as the save banner. The latch is set the moment the
+    /// invitation is *shown*: it's a one-shot per mixer, so accepting and
+    /// dismissing are both answers.
+    private func mixerLeanInBanner(bundleID: String, name: String) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.accent1.opacity(0.15))
+                .frame(width: 16, height: 16)
+                .overlay(
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color.accent1)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(name) detected")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.fg1)
+                Text("Tome can capture one of its mixes directly for cleaner call audio.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.fg2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            VStack(alignment: .trailing, spacing: 4) {
+                Button(action: { leanInMixer = nil }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.fg3)
+                }
+                .buttonStyle(.plain)
+                .help("Not now")
+                SettingsLink {
+                    Text("Set Up…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.accent1)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.bg1.opacity(0.7))
+        .overlay(Divider(), alignment: .top)
+        .overlay(Divider(), alignment: .bottom)
+        .onAppear {
+            // Aim the Settings window at the source picker for as long as the
+            // invitation is up, and burn the one-shot latch.
+            services.settingsTab = .audio
+            MixerLeanInPrompt.markPrompted(bundleID: bundleID)
+        }
     }
 
     /// Save-banner variant for a discarded short session: same slot and styling,
@@ -719,6 +811,9 @@ struct ContentView: View {
             }
 
             activeSessionType = type
+            // Starting a recording is an answer to the lean-in invitation too:
+            // don't re-present it in the save-banner slot when this session ends.
+            leanInMixer = nil
             detectedAppName = resolvedAppName
             activeMeetingTitle = effectiveContext?.subject
             currentSessionId = sid
@@ -738,7 +833,8 @@ struct ContentView: View {
                     locale: settings.locale,
                     inputDeviceUID: settings.inputDeviceUID,
                     recordingContext: recordingContext,
-                    excludedAudioAppIDs: settings.excludedAudioAppIDs
+                    excludedAudioAppIDs: settings.excludedAudioAppIDs,
+                    systemAudioSourceUID: settings.systemAudioSourceUID
                 )
             } else {
                 // Voice memos / in-person meetings are mic-only: skip system-audio
@@ -870,6 +966,9 @@ struct ContentView: View {
             let systemFirstSample = transcriptionEngine?.systemFirstSampleTime
             let wavWriteErrors = transcriptionEngine?.systemAudioWriteErrorCount ?? 0
             let audibleSystemBuffers = transcriptionEngine?.systemAudioAudibleBufferCount ?? 0
+            // Which source the "Them" leg actually bound, so the empty-leg note
+            // below points at the right thing to check.
+            let systemFromDevice = transcriptionEngine?.systemAudioSourceIsDevice ?? false
 
             await transcriptionEngine?.stop()
 
@@ -930,11 +1029,8 @@ struct ContentView: View {
                let firstSample = micFirstSample ?? systemFirstSample,
                Date().timeIntervalSince(firstSample) >= 60 {
                 diagLog("[STOP] call capture ended with zero audible system-audio buffers — posting silent-leg note")
-                Task {
-                    await NotificationPresenter.shared.postSystemAudioSilent(
-                        detail: "This recording captured no system audio — the transcript contains only your side. If the other side was routed through an excluded app, review Settings \u{25B8} Audio."
-                    )
-                }
+                let detail = TranscriptionEngine.systemAudioSilentDetail(deviceMode: systemFromDevice, atStop: true)
+                Task { await NotificationPresenter.shared.postSystemAudioSilent(detail: detail) }
             }
         }
     }

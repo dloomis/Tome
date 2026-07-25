@@ -206,6 +206,59 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         center.removePendingNotificationRequests(withIdentifiers: [Self.micSilenceRequestID])
     }
 
+    // MARK: - Call audio source (device / "lean-in" mode)
+
+    private nonisolated static let systemSourceFallbackRequestID = "tome-system-source-fallback"
+    private nonisolated static let systemSourceSilenceRequestID = "tome-system-source-silence"
+
+    /// The session is configured to capture call audio from a mixer's virtual
+    /// input device, but is recording via ScreenCaptureKit instead (device
+    /// absent, bind failed, or the device is the mic's own). Same rationale as
+    /// `postMicFallback`: recording from the wrong source must never be silent.
+    func postSystemSourceFallback(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: capturing call audio a different way"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: Self.systemSourceFallbackRequestID, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw the source-fallback alert once a rebuild lands back on the
+    /// configured device (or the session ends). Safe when nothing is posted.
+    func clearSystemSourceFallback() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.systemSourceFallbackRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.systemSourceFallbackRequestID])
+    }
+
+    /// The configured call-audio device is delivering buffers whose samples are
+    /// all exactly zero — the mixer app isn't running (its virtual devices stay
+    /// registered regardless) or the mix is empty. A mix bus with any live
+    /// channel always carries a non-zero noise floor.
+    func postSystemSourceSilence(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome: call audio device is delivering silence"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: Self.systemSourceSilenceRequestID, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    func clearSystemSourceSilence() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.systemSourceSilenceRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.systemSourceSilenceRequestID])
+    }
+
     /// A call capture's system leg has produced no audible content — either 60s
     /// into a live session (watchdog one-shot) or for an entire finished session
     /// (stop-time note). Fixed ID: the stop-time post replaces the mid-session

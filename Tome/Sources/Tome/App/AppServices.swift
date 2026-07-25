@@ -40,6 +40,11 @@ final class AppServices {
     /// as `saveTranscriptAction` — `ContentView` registers it during boot.
     @ObservationIgnored var recoverFromWAVAction: (() -> Void)?
 
+    /// Which Settings tab the Settings window shows. Bound by `SettingsView`'s
+    /// `TabView`, so anything that opens Settings can aim it — the mixer lean-in
+    /// prompt sets `.audio` before opening so the user lands on the source picker.
+    var settingsTab: SettingsTab = .general
+
     let modelProvisioner: ModelProvisioner
 
     /// True while orphan recovery or File ▸ Recover is re-transcribing.

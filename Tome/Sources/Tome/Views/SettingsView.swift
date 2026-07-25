@@ -2,7 +2,12 @@ import AppKit
 import SwiftUI
 import CoreAudio
 import Sparkle
-import UniformTypeIdentifiers
+
+/// Settings tabs, addressable so other parts of the app can open Settings on a
+/// specific one — the mixer lean-in prompt routes straight to Audio.
+enum SettingsTab: Hashable {
+    case general, audio, transcription, output, api
+}
 
 struct SettingsView: View {
     @Bindable var settings: AppSettings
@@ -10,17 +15,22 @@ struct SettingsView: View {
     let services: AppServices
 
     var body: some View {
-        TabView {
+        TabView(selection: Bindable(services).settingsTab) {
             GeneralTab(settings: settings, updater: updater)
                 .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(SettingsTab.general)
             AudioTab(settings: settings)
                 .tabItem { Label("Audio", systemImage: "mic.fill") }
+                .tag(SettingsTab.audio)
             TranscriptionTab(settings: settings, services: services)
                 .tabItem { Label("Transcription", systemImage: "waveform") }
+                .tag(SettingsTab.transcription)
             OutputTab(settings: settings)
                 .tabItem { Label("Output", systemImage: "folder.fill") }
+                .tag(SettingsTab.output)
             APITab()
                 .tabItem { Label("API", systemImage: "network") }
+                .tag(SettingsTab.api)
         }
         .frame(width: 520, height: 480)
     }
@@ -110,6 +120,22 @@ private struct AudioTab: View {
             && !deviceList.devices.contains(where: { $0.uid == settings.inputDeviceUID })
     }
 
+    /// Same "(unavailable)" treatment for the call-audio source. A mixer's
+    /// virtual device is absent whenever its driver is unloaded, and the
+    /// selection must survive that rather than silently resetting to automatic.
+    private var callAudioSourceUnavailable: Bool {
+        !settings.systemAudioSourceUID.isEmpty
+            && !deviceList.devices.contains(where: { $0.uid == settings.systemAudioSourceUID })
+    }
+
+    /// Selection-time warning for the one configuration that cannot work: the
+    /// same device on both legs. The engine refuses it outright at bind time
+    /// (`resolveSystemSource`) — this is the earlier, friendlier signal.
+    private var callAudioSourceIsMic: Bool {
+        !settings.systemAudioSourceUID.isEmpty
+            && settings.systemAudioSourceUID == settings.inputDeviceUID
+    }
+
     var body: some View {
         Form {
             Section("Input") {
@@ -139,27 +165,46 @@ private struct AudioTab: View {
                     .foregroundStyle(.secondary)
             }
 
+            // The whole surface of this section is the source picker. The
+            // audio-router exclusion list still ships (it is what makes
+            // automatic mode safe on a machine where a router is running) but
+            // it needs no per-user decisions now that mixer owners can just
+            // subscribe to a mix — see AppSettings.excludedAudioAppIDs.
             Section("System Audio") {
-                Text("Apps listed here are excluded from system-audio capture. Audio routers (Elgato Wave Link, Krisp, …) re-broadcast your microphone as their own audio, which would transcribe your voice a second time as \u{201C}Them\u{201D}. Excluding a router never drops the other side of a call — that audio belongs to the meeting app itself. Pure virtual-device drivers (BlackHole) have no app audio to exclude. Changes apply at the next recording.")
+                Picker("Call audio source", selection: $settings.systemAudioSourceUID) {
+                    Text("System audio (automatic)").tag("")
+                    ForEach(deviceList.devices.filter { !$0.uid.isEmpty }, id: \.uid) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    if callAudioSourceUnavailable {
+                        Text("\(settings.systemAudioSourceName.isEmpty ? "Selected device" : settings.systemAudioSourceName) (unavailable)")
+                            .tag(settings.systemAudioSourceUID)
+                    }
+                }
+                .font(.system(size: 12))
+                .onChange(of: settings.systemAudioSourceUID) { _, newUID in
+                    if let device = deviceList.devices.first(where: { $0.uid == newUID }) {
+                        settings.systemAudioSourceName = device.name
+                    } else if newUID.isEmpty {
+                        settings.systemAudioSourceName = ""
+                    }
+                }
+
+                if callAudioSourceIsMic {
+                    Label(
+                        "This is your microphone device — Tome would hear you twice. Pick a mix that excludes your mic.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                }
+
+                Text("Automatic captures every app's audio and filters out known audio routers and media players. If you run a mixer (Elgato Wave Link, Loopback, RØDE UNIFY), you can do better: build a mix containing the call/app audio with your own mic channel muted, then select that mix's device here. Verify it in QuickTime — record from the device and your voice must be absent.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                ForEach(settings.excludedAudioAppIDs, id: \.self) { bundleID in
-                    ExcludedAppRow(bundleID: bundleID) {
-                        settings.excludedAudioAppIDs.removeAll { $0 == bundleID }
-                    }
-                }
-                HStack {
-                    Button("Add App…", action: promptForAppsToExclude)
-                    Spacer()
-                    Button("Restore Defaults") {
-                        // Re-seed the built-ins without touching user additions.
-                        for id in AppSettings.builtinExcludedAudioApps
-                        where !settings.excludedAudioAppIDs.contains(id) {
-                            settings.excludedAudioAppIDs.append(id)
-                        }
-                    }
+                Text("Switch back to \u{201C}System audio (automatic)\u{201D} when the mixer app isn't running: its virtual devices stay listed while it's closed and deliver pure silence, so Tome can't tell from the device list alone. If you forget, Tome warns a few seconds into the recording. Changes apply at the next recording.")
                     .font(.system(size: 11))
-                }
+                    .foregroundStyle(.secondary)
             }
 
             Section("Silence") {
@@ -184,63 +229,6 @@ private struct AudioTab: View {
         .formStyle(.grouped)
         .onAppear { deviceList.start() }
         .onDisappear { deviceList.stop() }
-    }
-
-    /// App chooser in place of hand-typed bundle IDs: pick .app bundles and
-    /// extract their identifiers. Multi-select so a user can exclude a whole
-    /// router suite in one pass.
-    private func promptForAppsToExclude() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.application]
-        panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.message = "Choose apps to exclude from system-audio capture"
-        panel.prompt = "Exclude"
-        guard panel.runModal() == .OK else { return }
-        for url in panel.urls {
-            guard let id = Bundle(url: url)?.bundleIdentifier else { continue }
-            if !settings.excludedAudioAppIDs.contains(where: { $0.caseInsensitiveCompare(id) == .orderedSame }) {
-                settings.excludedAudioAppIDs.append(id)
-            }
-        }
-    }
-}
-
-/// One excluded app: icon + display name when the app is installed (bundle ID
-/// as the secondary line), bare bundle ID with "(not installed)" otherwise —
-/// an absent app's exclusion is still meaningful, it protects a future launch.
-private struct ExcludedAppRow: View {
-    let bundleID: String
-    let onRemove: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                    .resizable()
-                    .frame(width: 18, height: 18)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(FileManager.default.displayName(atPath: appURL.path))
-                        .font(.system(size: 12))
-                    Text(bundleID)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text(bundleID)
-                    .font(.system(size: 12, design: .monospaced))
-                Text("(not installed)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button(action: onRemove) {
-                Image(systemName: "minus.circle")
-            }
-            .buttonStyle(.plain)
-            .help("Remove from exclusions")
-        }
     }
 }
 

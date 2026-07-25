@@ -43,10 +43,23 @@ final class TranscriptionEngine {
 
     private let systemCapture = SystemAudioCapture()
     private let micCapture = MicCapture()
+
+    /// Device-backed system leg ("lean-in" mode): when the user points the call
+    /// audio source at a mixer's virtual input device, the "Them" leg is captured
+    /// through a SECOND `MicCapture` instead of ScreenCaptureKit. `MicCapture` is
+    /// reused deliberately — device binding with surfaced errors, append-reopen
+    /// crash-safe WAV retention, the HAL fast-path listener, the
+    /// delivery/first-sample timestamps and the unfed-virtual-device detector are
+    /// all exactly what a device leg needs, and all of it is already hardened by
+    /// the AirPods/HAL incidents. Two AVAudioEngine input captures on different
+    /// devices are fine: each engine binds its own HAL unit.
+    private let systemDeviceCapture = MicCapture()
     private let transcriptStore: TranscriptStore
 
     /// Combined audio level from mic and system for the UI meter.
-    var audioLevel: Float { max(micCapture.audioLevel, systemCapture.audioLevel) }
+    var audioLevel: Float {
+        max(micCapture.audioLevel, max(systemCapture.audioLevel, systemDeviceCapture.audioLevel))
+    }
 
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
@@ -98,8 +111,61 @@ final class TranscriptionEngine {
 
     /// The session's audio-router exclusion list (AppSettings.excludedAudioAppIDs
     /// at start time), retained like `activeRecordingContext` so system-leg
-    /// rebuilds re-apply the same SCContentFilter.
+    /// rebuilds re-apply the same SCContentFilter. Only consulted in automatic
+    /// (SCK) mode — device mode never builds an `SCContentFilter`.
     private var activeExcludedAudioAppIDs: [String] = []
+
+    /// The session's call-audio source selection (AppSettings.systemAudioSourceUID
+    /// at start time). "" = automatic/SCK. Retained — not collapsed to a resolved
+    /// device ID — so every rebuild RE-RESOLVES it: a device that was absent at
+    /// start is adopted the moment it reappears, exactly like the mic UID.
+    private var activeSystemSourceUID: String = ""
+
+    /// Which capture object the system leg is reading from right now. Held in a
+    /// lock rather than as a plain property because the capture watchdog polls it
+    /// from a background task to pick which leg's timestamps to read.
+    private let _systemSourceMode = OSAllocatedUnfairLock<SystemSourceMode>(uncheckedState: .sck)
+    private var systemSourceMode: SystemSourceMode {
+        get { _systemSourceMode.withLock { $0 } }
+        set { _systemSourceMode.withLock { $0 = newValue } }
+    }
+
+    /// Where the system ("Them") leg is captured from for the current session.
+    enum SystemSourceMode: Sendable, Equatable {
+        /// ScreenCaptureKit over the whole display, minus exclusions. The default.
+        case sck
+        /// A user-selected CoreAudio input device (a mixer's published mix).
+        case device(AudioDeviceID)
+
+        var isDevice: Bool { if case .device = self { return true } else { return false } }
+    }
+
+    /// Why a session configured for device mode is running on SCK instead. Each
+    /// reason is user-visible (Part C of the mixer-device spec): a session
+    /// recording from the "wrong" source must never be silent.
+    enum SystemSourceFallbackReason: Sendable, Equatable {
+        /// The configured UID resolves to no present input device.
+        case deviceUnavailable
+        /// The configured device IS the mic's device — capturing it on both legs
+        /// would transcribe every utterance twice.
+        case sameAsMic
+        /// The device resolved but the capture failed to bind.
+        case bindFailed
+    }
+
+    /// Outcome of resolving the session's call-audio source. Pure — see
+    /// `resolveSystemSource`.
+    enum SystemSourceResolution: Sendable, Equatable {
+        case sck
+        case device(AudioDeviceID)
+        case sckFallback(SystemSourceFallbackReason)
+    }
+
+    /// Non-nil while the system leg is running on SCK despite a configured
+    /// device source. Rendered as a persistent ControlBar banner alongside
+    /// `micFallbackMessage`; the selection itself is never changed, so every
+    /// rebuild keeps aiming at the chosen device.
+    private(set) var systemSourceFallbackMessage: String?
 
     /// Non-nil while capture runs on a device OTHER than the user's selection
     /// (unresolvable UID at start, or an emergency fallback after a failed
@@ -133,7 +199,8 @@ final class TranscriptionEngine {
         inputDeviceUID: String = "",
         recordingContext: SessionRecordingContext? = nil,
         captureSystemAudio: Bool = true,
-        excludedAudioAppIDs: [String] = []
+        excludedAudioAppIDs: [String] = [],
+        systemAudioSourceUID: String = ""
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
@@ -203,7 +270,10 @@ final class TranscriptionEngine {
         }
         userSelectedDeviceUID = inputDeviceUID
         activeExcludedAudioAppIDs = excludedAudioAppIDs
+        activeSystemSourceUID = captureSystemAudio ? systemAudioSourceUID : ""
+        systemSourceMode = .sck
         micFallbackMessage = nil
+        systemSourceFallbackMessage = nil
         let targetMicID: AudioDeviceID?
         if inputDeviceUID.isEmpty {
             targetMicID = MicCapture.defaultInputDeviceID()
@@ -271,35 +341,18 @@ final class TranscriptionEngine {
         //    in-person meetings) — there the mic is the sole source and diarization runs
         //    on the mic track, so capturing system audio would only add a stray "Them"
         //    stream and a needless ScreenCaptureKit permission prompt.
-        let sysStreams: SystemAudioCapture.CaptureStreams?
+        let sysStream: AsyncStream<AVAudioPCMBuffer>?
+        // Clear before the bring-up, not after: a bring-up that fails must leave
+        // NO buffer URL, or stopSession would snapshot the previous session's
+        // (already cleaned-up) WAV path into this session's job. Rebuilds
+        // deliberately keep the existing URL on failure — the WAV captured so far
+        // is still the one to finalize.
+        currentBufferURL = nil
         if captureSystemAudio {
-            diagLog("[ENGINE-4] starting system audio capture...")
-            // Warn-only router-signature diagnostic: a process running mic input
-            // AND audio output that is NOT excluded may be an audio router about
-            // to bleed the user's own voice onto this leg. Never auto-excluded —
-            // a conferencing app in a live call has the identical signature.
-            let unexcludedPassthrough = AudioProcessInspector.micPassthroughBundleIDs(
-                excluding: Set(excludedAudioAppIDs + [Bundle.main.bundleIdentifier ?? ""])
-            )
-            if !unexcludedPassthrough.isEmpty {
-                diagLog("[SYS-CAPTURE] mic-passthrough processes NOT excluded from capture: \(unexcludedPassthrough.joined(separator: ", ")) — if one is an audio router, own voice may appear as Them (Settings ▸ Audio ▸ System Audio)")
-            }
-            do {
-                sysStreams = try await systemCapture.bufferStream(
-                    recordingContext: recordingContext,
-                    excludedBundleIDs: excludedAudioAppIDs
-                )
-                currentBufferURL = sysStreams?.bufferURL
-                diagLog("[ENGINE-5] system audio capture started OK")
-            } catch {
-                let msg = "Failed to start system audio: \(error.localizedDescription)"
-                diagLog("[ENGINE-5-FAIL] \(msg)")
-                lastError = msg
-                sysStreams = nil
-            }
+            sysStream = await bringUpSystemLeg(recordingContext: recordingContext)
         } else {
             diagLog("[ENGINE-4] system audio capture skipped (mic-only session)")
-            sysStreams = nil
+            sysStream = nil
             currentBufferURL = nil
         }
 
@@ -309,6 +362,7 @@ final class TranscriptionEngine {
         guard isRunning else {
             diagLog("[ENGINE-4-ABORT] stopped during capture bring-up — unwinding")
             micCapture.stop()
+            systemDeviceCapture.stop()
             await systemCapture.stop()
             assetStatus = "Ready"
             return
@@ -345,7 +399,7 @@ final class TranscriptionEngine {
         }
 
         // 5. Start system audio transcription
-        if let sysStream = sysStreams?.systemAudio {
+        if let sysStream {
             spinUpSystemTranscription(stream: sysStream, vadManager: vadManager)
         }
 
@@ -355,7 +409,7 @@ final class TranscriptionEngine {
         //     ONE rebuild of the system leg if no sample lands within the window,
         //     collapsing the wait before the 15s stall watchdog would alarm. Only
         //     armed when we actually brought the leg up.
-        if sysStreams != nil {
+        if sysStream != nil {
             armSystemStartupDeliveryGate()
         }
 
@@ -363,7 +417,7 @@ final class TranscriptionEngine {
         // delivering (device pulled, HAL wedge) is silent loss of the user's own
         // side, and flowing system audio masks it from the level-based silence
         // detection entirely.
-        startCaptureWatchdog(systemLegActive: sysStreams != nil)
+        startCaptureWatchdog(systemLegActive: sysStream != nil)
 
         let modelName = await asrCoordinator.activeModel?.displayName ?? "ASR"
         assetStatus = "Transcribing (\(modelName))"
@@ -386,6 +440,25 @@ final class TranscriptionEngine {
     /// `start()`: rebuild the system leg once if it never delivers a sample.
     private var sysStartupGateTask: Task<Void, Never>?
     private var sysStartupGateFired = false
+
+    /// "Has the system leg delivered a buffer since its CURRENT bind?" — the
+    /// signal both delivery gates need, expressed per source because the two
+    /// captures reset different fields:
+    ///
+    /// - SCK resets `firstSampleTime` on `stop()`, and seeds `lastSampleTime` at
+    ///   bring-up, so `firstSampleTime` is the honest one.
+    /// - `MicCapture` deliberately PRESERVES `firstSampleTime` across a rebuild
+    ///   (it anchors the retained WAV to the session start, not to the restart,
+    ///   which is what makes append-reopen correct) and instead nils
+    ///   `lastSampleTime` on `stop()`, writing it only from the tap. So there
+    ///   `lastSampleTime` is the honest one — using `firstSampleTime` would make
+    ///   the post-rebuild grace check permanently inert in device mode.
+    ///
+    /// Distinct from `systemFirstSampleTime`, which is the session-anchor the
+    /// post-session mixer consumes and must keep its cross-rebuild semantics.
+    private var systemLegSampleSinceBind: Date? {
+        systemSourceMode.isDevice ? systemDeviceCapture.lastSampleTime : systemCapture.firstSampleTime
+    }
 
     /// One-shot grace check armed after each successful system-leg rebuild. A
     /// rebuild re-seeds the stall watchdog's clock (`bufferStream` seeds
@@ -431,6 +504,321 @@ final class TranscriptionEngine {
         }
     }
 
+    // MARK: - System leg bring-up (SCK vs. device)
+
+    /// Pure resolution of the session's call-audio source, shared by `start()`
+    /// and every rebuild. Extracted (injected resolvers, like
+    /// `AppSettings.migratedInputSelection`) so the four outcomes are testable
+    /// without audio hardware.
+    ///
+    /// The same-as-mic guard is the load-bearing one: capturing one device on
+    /// BOTH legs transcribes every utterance twice — the exact defect device
+    /// mode exists to prevent. Settings warns at selection time too, but a
+    /// settings race (mic changed after the source was picked) must not be able
+    /// to produce a double-capture session, so the engine refuses it outright.
+    nonisolated static func resolveSystemSource(
+        uid: String,
+        resolvedDeviceID: AudioDeviceID?,
+        micDeviceID: AudioDeviceID
+    ) -> SystemSourceResolution {
+        guard !uid.isEmpty else { return .sck }
+        guard let resolvedDeviceID else { return .sckFallback(.deviceUnavailable) }
+        guard resolvedDeviceID != micDeviceID else { return .sckFallback(.sameAsMic) }
+        return .device(resolvedDeviceID)
+    }
+
+    /// User-facing text for a system leg that carried no audible content — the
+    /// watchdog's 60s warning (`atStop: false`) and ContentView's end-of-session
+    /// note (`atStop: true`). Mode-aware: in device mode the exclusion list is
+    /// inert, so pointing the user at it would be a dead end; what they can
+    /// actually fix is the mixer's mix routing.
+    nonisolated static func systemAudioSilentDetail(deviceMode: Bool, atStop: Bool) -> String {
+        switch (deviceMode, atStop) {
+        case (true, false):
+            return "No call audio detected yet. If the other side is talking, check your mixer's mix routing — the mix Tome captures may be empty."
+        case (true, true):
+            return "This recording captured no call audio — the transcript contains only your side. Check that your mixer was running and that the mix Tome captures carries the call's audio."
+        case (false, false):
+            return "No system audio detected yet. If the other side is talking, check the call audio source in Settings \u{25B8} Audio."
+        case (false, true):
+            return "This recording captured no system audio — the transcript contains only your side. If the other side was routed through an audio router, review the call audio source in Settings \u{25B8} Audio."
+        }
+    }
+
+    /// User-facing text for each fallback reason. Pure so the wording is
+    /// unit-testable and identical between the banner and the notification.
+    nonisolated static func systemSourceFallbackText(
+        reason: SystemSourceFallbackReason,
+        deviceName: String?
+    ) -> String {
+        let name = deviceName.map { "\u{201C}\($0)\u{201D}" } ?? "The selected call audio device"
+        switch reason {
+        case .deviceUnavailable:
+            return "\(name) is unavailable — capturing system audio automatically instead. Your Settings choice is unchanged."
+        case .sameAsMic:
+            return "The call audio source is the same device as your microphone — capturing system audio automatically instead, so you aren't transcribed twice."
+        case .bindFailed:
+            return "\(name) couldn't be opened — capturing system audio automatically instead. Your Settings choice is unchanged."
+        }
+    }
+
+    /// Bring the system ("Them") leg up for the current session and return its
+    /// buffer stream, or nil if no leg could be established. Used by both
+    /// `start()` and `restartSystemAudioLeg`, so a rebuild re-resolves the source
+    /// from scratch: a device absent at start is adopted the moment it returns,
+    /// and a device that vanishes mid-session falls back to SCK — both surfaced.
+    @MainActor
+    private func bringUpSystemLeg(recordingContext: SessionRecordingContext?) async -> AsyncStream<AVAudioPCMBuffer>? {
+        let resolution = Self.resolveSystemSource(
+            uid: activeSystemSourceUID,
+            resolvedDeviceID: MicCapture.deviceID(forUID: activeSystemSourceUID),
+            micDeviceID: currentMicDeviceID
+        )
+        switch resolution {
+        case .device(let deviceID):
+            if let stream = startDeviceSystemLeg(deviceID: deviceID, recordingContext: recordingContext) {
+                return stream
+            }
+            // A bind failure fails the LEG, not the session (same as an SCK
+            // bring-up failure today): report it and try automatic mode so the
+            // far end is still captured.
+            reportSystemSourceFallback(reason: .bindFailed, deviceID: deviceID)
+            return await startSCKSystemLeg(recordingContext: recordingContext)
+        case .sckFallback(let reason):
+            reportSystemSourceFallback(reason: reason, deviceID: nil)
+            return await startSCKSystemLeg(recordingContext: recordingContext)
+        case .sck:
+            return await startSCKSystemLeg(recordingContext: recordingContext)
+        }
+    }
+
+    /// Device-backed system leg: bind the mixer's virtual input device through
+    /// `systemDeviceCapture`. Synchronous — `MicCapture.bufferStream` runs its
+    /// setup inline, so a bind failure is already in `captureError` on return.
+    @MainActor
+    private func startDeviceSystemLeg(
+        deviceID: AudioDeviceID,
+        recordingContext: SessionRecordingContext?
+    ) -> AsyncStream<AVAudioPCMBuffer>? {
+        let name = MicCapture.deviceName(for: deviceID) ?? "?"
+        diagLog("[ENGINE-4] starting call-audio capture from input device \(deviceID) \"\(name)\"")
+
+        // Same path the SCK leg writes, so PostProcessingJob, retention mixing,
+        // stem-pairing and cleanupBufferFile are all unchanged by this mode.
+        let bufferURL: URL
+        if let ctx = recordingContext, let dir = try? SystemAudioCapture.sessionsDirectory() {
+            bufferURL = dir.appendingPathComponent("\(ctx.sessionId).wav")
+            // The SCK path emits its crash-recovery sidecar inside
+            // SystemAudioCapture.bufferStream; device mode has no equivalent hook,
+            // so emit here — before the first audio byte — mirroring the mic-only
+            // emission in start(). Nominal rate; recovery reads the WAV header.
+            SessionSidecar.emit(forWAV: bufferURL, context: ctx, sampleRate: 48_000)
+        } else {
+            bufferURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
+        }
+
+        // A virtual device disappearing (mixer app quit/relaunch) produces exactly
+        // the route/graph change this notification reports.
+        systemDeviceCapture.onConfigurationChange = { [weak self] in
+            Task { @MainActor in self?.scheduleSystemDeviceRebuild(reason: "engine configuration change") }
+        }
+
+        let stream = systemDeviceCapture.bufferStream(deviceID: deviceID, recordOutputURL: bufferURL)
+        if let error = systemDeviceCapture.captureError {
+            let msg = "Call audio device failed: \(error)"
+            diagLog("[ENGINE-5-FAIL] \(msg)")
+            lastError = msg
+            systemDeviceCapture.stop()
+            return nil
+        }
+
+        systemSourceMode = .device(deviceID)
+        currentBufferURL = bufferURL
+        // A rebuild that landed back on the device retires the fallback banner.
+        clearSystemSourceFallback()
+        armSystemDeviceDigitalSilenceCheck(deviceID: deviceID)
+        diagLog("[ENGINE-5] call-audio device capture started OK (\(bufferURL.lastPathComponent))")
+        return stream
+    }
+
+    /// Automatic (ScreenCaptureKit) system leg — today's default path, unchanged.
+    ///
+    /// NOTE on the WAV: `SystemAudioCapture` always (re)creates its writer, so an
+    /// SCK bring-up truncates whatever is at `<sessionId>.wav`. That is the
+    /// pre-existing behavior of every SCK rebuild; it also means a device-mode
+    /// session that loses its device entirely and falls back here starts the WAV
+    /// over. The live transcript is unaffected (it is written per-utterance), and
+    /// the far more common device failure — the mixer app quitting while its
+    /// device stays registered — keeps resolving to the device and appends.
+    @MainActor
+    private func startSCKSystemLeg(recordingContext: SessionRecordingContext?) async -> AsyncStream<AVAudioPCMBuffer>? {
+        diagLog("[ENGINE-4] starting system audio capture (automatic / ScreenCaptureKit)...")
+        // Warn-only router-signature diagnostic: a process running mic input
+        // AND audio output that is NOT excluded may be an audio router about
+        // to bleed the user's own voice onto this leg. Never auto-excluded —
+        // a conferencing app in a live call has the identical signature.
+        // Deliberately skipped in device mode (where this never runs): there a
+        // running router is not a hazard, it IS the source.
+        let unexcludedPassthrough = AudioProcessInspector.micPassthroughBundleIDs(
+            excluding: Set(activeExcludedAudioAppIDs + [Bundle.main.bundleIdentifier ?? ""])
+        )
+        if !unexcludedPassthrough.isEmpty {
+            diagLog("[SYS-CAPTURE] mic-passthrough processes NOT excluded from capture: \(unexcludedPassthrough.joined(separator: ", ")) — if one is an audio router, own voice may appear as Them (fix: point the call audio source at one of its mixes, Settings ▸ Audio ▸ System Audio)")
+        }
+        do {
+            let streams = try await systemCapture.bufferStream(
+                recordingContext: recordingContext,
+                excludedBundleIDs: activeExcludedAudioAppIDs
+            )
+            systemSourceMode = .sck
+            currentBufferURL = streams.bufferURL
+            // Any device-leg warnings describe a source we're no longer using.
+            systemDeviceSilenceCheckTask?.cancel()
+            systemDeviceSilenceCheckTask = nil
+            clearSystemDeviceSilenceWarning()
+            diagLog("[ENGINE-5] system audio capture started OK")
+            return streams.systemAudio
+        } catch {
+            let msg = "Failed to start system audio: \(error.localizedDescription)"
+            diagLog("[ENGINE-5-FAIL] \(msg)")
+            lastError = msg
+            return nil
+        }
+    }
+
+    /// Surface a call-audio source fallback: the session is configured for a
+    /// device but is recording via SCK. Banner + one notification per session,
+    /// same discipline as `reportMicFallback` — a session recording from the
+    /// "wrong" source must never be silent (the 2026-07-24 Part D lesson).
+    @MainActor
+    private func reportSystemSourceFallback(reason: SystemSourceFallbackReason, deviceID: AudioDeviceID?) {
+        let name = deviceID.flatMap(MicCapture.deviceName(for:))
+            ?? MicCapture.deviceID(forUID: activeSystemSourceUID).flatMap(MicCapture.deviceName(for:))
+        let msg = Self.systemSourceFallbackText(reason: reason, deviceName: name)
+        guard systemSourceFallbackMessage != msg else { return }
+        let isFirst = systemSourceFallbackMessage == nil
+        systemSourceFallbackMessage = msg
+        diagLog("[SYS-SOURCE-FALLBACK] \(msg)")
+        guard isFirst else { return }
+        Task { await NotificationPresenter.shared.postSystemSourceFallback(detail: msg) }
+    }
+
+    @MainActor
+    private func clearSystemSourceFallback() {
+        guard systemSourceFallbackMessage != nil else { return }
+        systemSourceFallbackMessage = nil
+        NotificationPresenter.shared.clearSystemSourceFallback()
+        diagLog("[SYS-SOURCE-FALLBACK] cleared — the call audio device is in use")
+    }
+
+    /// The exact digital-silence message posted for the device leg, so the clear
+    /// path only wipes `lastError` while it still shows OUR warning.
+    private var systemDeviceSilenceMessage: String?
+
+    /// One-shot handle for the device leg's digital-silence check.
+    private var systemDeviceSilenceCheckTask: Task<Void, Never>?
+
+    /// Device-mode analogue of `armMicDigitalSilenceCheck`, and this mode's
+    /// PRIMARY failure detector: a mixer's virtual device stays registered in
+    /// CoreAudio while its app is closed and then delivers pure digital zeros, so
+    /// nothing else — not the delivery gates, not the stall watchdog — can tell
+    /// "unfed mix" from "quiet call". Any live channel on a mix bus has a
+    /// non-zero noise floor; exact zeros mean unfed. 5s (vs. the mic's 8s)
+    /// because an empty mix is a configuration error the user should hear about
+    /// immediately, not a transient.
+    private func armSystemDeviceDigitalSilenceCheck(deviceID: AudioDeviceID) {
+        systemDeviceSilenceCheckTask?.cancel()
+        let generation = sessionGeneration
+        systemDeviceSilenceCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration, self.isRunning else { return }
+            guard self.systemSourceMode.isDevice else { return }
+            guard self.systemDeviceCapture.firstSampleTime != nil,
+                  !self.systemDeviceCapture.sawNonzeroSample else {
+                // Healthy, or not delivering at all (the delivery gates own that).
+                self.clearSystemDeviceSilenceWarning()
+                return
+            }
+            let name = MicCapture.deviceName(for: deviceID) ?? "The selected call audio device"
+            let msg = "Call audio device \u{201C}\(name)\u{201D} is delivering silence. The app that provides it (e.g. Wave Link) may not be running, or the mix may be empty."
+            diagLog("[SYS-DEVICE-SILENCE] \(msg)")
+            self.systemDeviceSilenceMessage = msg
+            self.lastError = msg
+            Task { await NotificationPresenter.shared.postSystemSourceSilence(detail: msg) }
+            // Monitor for recovery so the banner doesn't outlive the condition
+            // (the user launches Wave Link, or unmutes the mix's channels).
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard generation == self.sessionGeneration, self.isRunning else { return }
+                // A rebuild may have fallen back to SCK since we armed; the
+                // warning is about a device that is no longer the source.
+                guard self.systemSourceMode.isDevice else {
+                    self.clearSystemDeviceSilenceWarning()
+                    return
+                }
+                if self.systemDeviceCapture.sawNonzeroSample {
+                    diagLog("[SYS-DEVICE-SILENCE] real audio arrived — clearing the silence warning")
+                    self.clearSystemDeviceSilenceWarning()
+                    return
+                }
+            }
+        }
+    }
+
+    private func clearSystemDeviceSilenceWarning() {
+        guard let msg = systemDeviceSilenceMessage else { return }
+        systemDeviceSilenceMessage = nil
+        if lastError == msg { lastError = nil }
+        NotificationPresenter.shared.clearSystemSourceSilence()
+    }
+
+    /// Timestamps of recent config-driven device-leg rebuilds — loop suppression.
+    private var recentSystemDeviceRebuilds: [Date] = []
+
+    /// Debounced rebuild of the DEVICE-backed system leg, fired by that capture's
+    /// `AVAudioEngineConfigurationChange` / HAL fast path. Mirrors
+    /// `scheduleMicRebuild` gate for gate — ground truth (a tap that delivered
+    /// within 2s is alive, the notification was informational), first-delivery
+    /// grace (our own rebuild's HAL echo must not trigger a second one), and the
+    /// 4-per-minute storm cap that hands recovery back to the stall watchdog.
+    private func scheduleSystemDeviceRebuild(reason: String) {
+        guard isRunning, systemSourceMode.isDevice else { return }
+        systemDeviceRebuildTask?.cancel()
+        systemDeviceRebuildTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            guard let self, self.isRunning, self.systemSourceMode.isDevice else { return }
+
+            if let last = self.systemDeviceCapture.lastSampleTime,
+               Date().timeIntervalSince(last) < 2.0 {
+                diagLog("[ENGINE-SYSDEV-REBUILD] skipped (\(reason)) — tap is delivering")
+                return
+            }
+            if self.systemDeviceCapture.firstSampleTime == nil,
+               let started = self.systemDeviceCapture.captureStartTime {
+                let age = Date().timeIntervalSince(started)
+                if age < 2.0 {
+                    diagLog("[ENGINE-SYSDEV-REBUILD] skipped — capture just (re)started \(age)s ago, giving the tap time to first-deliver")
+                    return
+                }
+            }
+            let now = Date()
+            self.recentSystemDeviceRebuilds.removeAll { now.timeIntervalSince($0) > 60 }
+            guard self.recentSystemDeviceRebuilds.count < 4 else {
+                diagLog("[ENGINE-SYSDEV-REBUILD] suppressed (\(reason)) — \(self.recentSystemDeviceRebuilds.count) rebuilds in 60s; deferring to the watchdog")
+                return
+            }
+            self.recentSystemDeviceRebuilds.append(now)
+
+            diagLog("[ENGINE-SYSDEV-REBUILD] \(reason) — rebuilding the call-audio device leg")
+            await self.restartSystemAudioLeg()
+        }
+    }
+
+    private var systemDeviceRebuildTask: Task<Void, Never>?
+
     /// Arm the one-shot system-audio startup-delivery gate. Mirrors
     /// `armStartupDeliveryGate` (the mic side) but for the SCStream leg: if no
     /// sample arrives within the window, rebuild the leg ONCE. The window is longer
@@ -456,7 +844,7 @@ final class TranscriptionEngine {
     @MainActor
     private func handleSystemStartupGate() async {
         guard Self.shouldForceStartupRestart(
-                  firstSampleAt: systemCapture.firstSampleTime,
+                  firstSampleAt: systemLegSampleSinceBind,
                   isRunning: isRunning,
                   alreadyFired: sysStartupGateFired,
                   rebuildInFlight: sysRebuildInFlight
@@ -491,31 +879,36 @@ final class TranscriptionEngine {
         let generation = sessionGeneration
         sysTask?.cancel()
         sysTask = nil
+        // Tear both sources down: the rebuild re-resolves the source from
+        // scratch, so it may come back up on the OTHER one (device gone → SCK,
+        // device returned → device). Stopping an already-stopped capture is a
+        // cheap no-op.
         await systemCapture.stop()
+        systemDeviceCapture.stop()
         guard generation == sessionGeneration, isRunning else { return }
-        do {
-            let streams = try await systemCapture.bufferStream(
-                recordingContext: activeRecordingContext,
-                excludedBundleIDs: activeExcludedAudioAppIDs
-            )
-            guard generation == sessionGeneration, isRunning else {
-                // Stale: a stop (or a new session's start) raced the bring-up.
-                // Unwind the capture we just started so it can't leak an SCStream
-                // and an orphaned $TMPDIR WAV into whatever session runs next.
-                await systemCapture.stop()
-                return
-            }
-            currentBufferURL = streams.bufferURL
-            spinUpSystemTranscription(stream: streams.systemAudio, vadManager: vadManager)
-            diagLog("[SYS-STARTGATE] system leg rebuilt")
-            armSystemRebuildGraceCheck(generation: generation)
-        } catch {
-            guard generation == sessionGeneration, isRunning else { return }
+
+        // Device-mode rebuilds re-enter `bufferStream` with the SAME
+        // recordOutputURL, so MicCapture's append-reopen keeps the session WAV —
+        // and everything captured before the interruption — intact.
+        let stream = await bringUpSystemLeg(recordingContext: activeRecordingContext)
+        guard generation == sessionGeneration, isRunning else {
+            // Stale: a stop (or a new session's start) raced the bring-up.
+            // Unwind the capture we just started so it can't leak an SCStream
+            // and an orphaned $TMPDIR WAV into whatever session runs next.
+            await systemCapture.stop()
+            systemDeviceCapture.stop()
+            return
+        }
+        guard let stream else {
             let msg = "System audio isn't being captured — recording mic only."
-            diagLog("[SYS-STARTGATE] rebuild failed: \(error.localizedDescription)")
+            diagLog("[SYS-STARTGATE] rebuild failed to bring up any system source")
             lastError = msg
             Task { await NotificationPresenter.shared.postCaptureStall(leg: "System audio", detail: msg) }
+            return
         }
+        spinUpSystemTranscription(stream: stream, vadManager: vadManager)
+        diagLog("[SYS-STARTGATE] system leg rebuilt")
+        armSystemRebuildGraceCheck(generation: generation)
     }
 
     /// Arm the +5s post-rebuild grace check: if the just-rebuilt system leg never
@@ -530,7 +923,7 @@ final class TranscriptionEngine {
             try? await Task.sleep(for: .seconds(5))
             guard !Task.isCancelled, let self else { return }
             guard generation == self.sessionGeneration, self.isRunning else { return }
-            guard self.systemCapture.firstSampleTime == nil else { return }  // delivered — healthy
+            guard self.systemLegSampleSinceBind == nil else { return }  // delivered — healthy
             let msg = "System audio isn't being captured — recording mic only."
             diagLog("[SYS-STARTGATE] rebuilt system leg still silent after 5s — alerting")
             self.lastError = msg
@@ -966,14 +1359,25 @@ final class TranscriptionEngine {
         micSilenceCheckTask = nil
         micSilenceMessage = nil
         micFallbackMessage = nil
+        systemDeviceSilenceCheckTask?.cancel()
+        systemDeviceSilenceCheckTask = nil
+        systemDeviceSilenceMessage = nil
+        systemSourceFallbackMessage = nil
         NotificationPresenter.shared.clearMicDigitalSilence()
         NotificationPresenter.shared.clearMicFallback()
+        NotificationPresenter.shared.clearSystemSourceSilence()
+        NotificationPresenter.shared.clearSystemSourceFallback()
         activeRecordingContext = nil
         activeExcludedAudioAppIDs = []
+        activeSystemSourceUID = ""
         micRebuildTask?.cancel()
         micRebuildTask = nil
         micCapture.onConfigurationChange = nil
+        systemDeviceRebuildTask?.cancel()
+        systemDeviceRebuildTask = nil
+        systemDeviceCapture.onConfigurationChange = nil
         recentMicRebuilds = []
+        recentSystemDeviceRebuilds = []
         sysWatchdogTask?.cancel()
         sysWatchdogTask = nil
         // Stop the captures FIRST — each finishes its buffer stream, so the
@@ -985,7 +1389,13 @@ final class TranscriptionEngine {
         // dropped the tail of every recording that was mid-speech at stop
         // (task-13 smoke test, 2026-07-09: "ASR error" at stop, truncated or
         // empty transcripts with the speech intact in the retained audio).
+        // Stop whichever system source is active — stopping both is harmless and
+        // simpler than branching. `systemSourceMode` is deliberately NOT reset
+        // here: the stop-time telemetry accessors below (and ContentView's
+        // snapshot) still need to know which leg's counters to read. The next
+        // `start()` resets it.
         await systemCapture.stop()
+        systemDeviceCapture.stop()
         micCapture.stop()
         await drainTranscriberTasks()
         micTask = nil
@@ -1047,6 +1457,10 @@ final class TranscriptionEngine {
     private func startCaptureWatchdog(systemLegActive: Bool) {
         sysWatchdogTask?.cancel()
         let sysCapture = systemCapture
+        let sysDeviceCapture = systemDeviceCapture
+        // The watchdog polls off the main actor, so it reads the active source
+        // through the lock rather than the MainActor-isolated property.
+        let sourceMode = _systemSourceMode
         let mic = micCapture
         sysWatchdogTask = Task { [weak self] in
             var sysDetector = CaptureStallDetector(threshold: 15)
@@ -1075,23 +1489,25 @@ final class TranscriptionEngine {
                 }
                 lastTick = now
 
+                // Which capture object owns the system leg right now. Re-read
+                // every tick: a rebuild can move the leg between SCK and the
+                // configured device mid-session.
+                let deviceMode = sourceMode.withLock { $0 }.isDevice
+
                 // Content-aware empty-leg check: SCStream delivers buffers
                 // continuously even for pure digital silence (verified
                 // 2026-07-24), so the stall detectors below can never see an
-                // EMPTY system leg — only a stopped one. One warning per
-                // session at +60s with zero audible buffers; deliberately not
-                // the 8s startup-gate window, where a quiet meeting join would
-                // false-alarm every time.
+                // EMPTY system leg — only a stopped one. The same holds for an
+                // unfed mixer device. One warning per session at +60s with zero
+                // audible buffers; deliberately not the 8s startup-gate window,
+                // where a quiet meeting join would false-alarm every time.
                 if systemLegActive, !postedSystemSilent,
                    now.timeIntervalSince(watchdogStart) >= 60,
-                   sysCapture.audibleBufferCount == 0 {
+                   (deviceMode ? sysDeviceCapture.audibleBufferCount : sysCapture.audibleBufferCount) == 0 {
                     postedSystemSilent = true
                     diagLog("[WATCHDOG] no audible system audio 60s into the session — warning once")
-                    Task {
-                        await NotificationPresenter.shared.postSystemAudioSilent(
-                            detail: "No system audio detected yet. If the other side is talking, check the excluded apps in Settings \u{25B8} Audio."
-                        )
-                    }
+                    let detail = Self.systemAudioSilentDetail(deviceMode: deviceMode, atStop: false)
+                    Task { await NotificationPresenter.shared.postSystemAudioSilent(detail: detail) }
                 }
 
                 // The mic's tap-written timestamp is authoritative; the start
@@ -1103,11 +1519,17 @@ final class TranscriptionEngine {
                 // bufferStream start, and a system-leg rebuild re-seeds it — only
                 // a real delivered buffer (firstSampleTime set) may clear the
                 // stall latch, or every rebuild would phantom-resume the alarm.
+                // In device mode the leg follows the MIC shape instead: MicCapture
+                // writes `lastSampleTime` only from the tap, so the start seed is
+                // `captureStartTime` (a device that never delivers still alarms one
+                // threshold after start, and can never clear).
+                let sysTapSample = deviceMode ? sysDeviceCapture.lastSampleTime : sysCapture.lastSampleTime
+                let sysFirstSample = deviceMode ? sysDeviceCapture.firstSampleTime : sysCapture.firstSampleTime
                 let sysEvent = systemLegActive
                     ? sysDetector.evaluate(
-                        lastSample: sysCapture.lastSampleTime,
+                        lastSample: deviceMode ? (sysTapSample ?? sysDeviceCapture.captureStartTime) : sysTapSample,
                         now: now,
-                        canResume: sysCapture.firstSampleTime != nil
+                        canResume: deviceMode ? sysTapSample != nil : sysFirstSample != nil
                     )
                     : nil
                 let micEvent = micDetector.evaluate(
@@ -1351,15 +1773,32 @@ final class TranscriptionEngine {
     /// Wall-clock of the first mic / system sample for the current capture. Used by
     /// the post-session mixer to align each track to the session start.
     var micFirstSampleTime: Date? { micCapture.firstSampleTime }
-    var systemFirstSampleTime: Date? { systemCapture.firstSampleTime }
+
+    // The three system-leg telemetry accessors below route to whichever source
+    // the session actually bound, so every downstream consumer — the startup
+    // gate, the rebuild grace check, the watchdog, SessionHandle, the
+    // end-of-session note — works identically in both modes.
+    var systemFirstSampleTime: Date? {
+        systemSourceMode.isDevice ? systemDeviceCapture.firstSampleTime : systemCapture.firstSampleTime
+    }
 
     /// Count of write failures on the system-audio WAV during the active capture.
     /// Snapshot at stop time, before `stop()` resets the capture's internal counter.
-    var systemAudioWriteErrorCount: Int { systemCapture.writeErrorCount }
+    var systemAudioWriteErrorCount: Int {
+        systemSourceMode.isDevice ? systemDeviceCapture.writeErrorCount : systemCapture.writeErrorCount
+    }
 
     /// Buffers with audible content delivered on the system leg this session.
     /// ContentView snapshots this at stop (before `stop()` frees the capture for
     /// reuse) to append the "no system audio was captured" note for call
     /// captures that stayed at zero.
-    var systemAudioAudibleBufferCount: Int { systemCapture.audibleBufferCount }
+    var systemAudioAudibleBufferCount: Int {
+        systemSourceMode.isDevice ? systemDeviceCapture.audibleBufferCount : systemCapture.audibleBufferCount
+    }
+
+    /// True when the system leg is (or, at stop time, was) captured from a
+    /// user-selected input device rather than ScreenCaptureKit. Read by
+    /// ContentView so the "no system audio" note points at the mixer's mix
+    /// routing instead of the (inert in this mode) exclusion settings.
+    var systemAudioSourceIsDevice: Bool { systemSourceMode.isDevice }
 }

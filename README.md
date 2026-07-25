@@ -62,6 +62,7 @@ Tome does the first three. Your agent does the rest — or install [WhisperCal](
 
 - **Local transcription** on Apple Silicon, nothing hits the network. Pick your model in Settings ▸ Transcription: **Parakeet-TDT v3** ([FluidAudio](https://github.com/FluidInference/FluidAudio), default, fastest) or **Whisper Large v3 Turbo** ([WhisperKit](https://github.com/argmaxinc/WhisperKit), higher accuracy, larger download, fetched lazily the first time you select it).
 - **Call Capture** grabs mic + system audio. Detects which conferencing app you're in (Teams, Zoom, Slack, etc.) and filters audio to just that app. Your Spotify and notification sounds stay out of the transcript.
+- **Capture call audio from your mixer (opt-in).** If you run an audio mixer (Elgato Wave Link, Loopback, RØDE UNIFY), Settings ▸ Audio ▸ System Audio lets you point the "Them" leg at one of its mixes instead of at system-wide capture. Build a mix with the call apps in it and your own mic channel muted, select its device, and your voice can't bleed into "Them" *by construction* — no exclusion list, no music or notification audio in the transcript, and no Screen Recording permission for the session. Everything downstream (diarization, retention, voiceprints) is unchanged. Off by default; system-wide capture stays correct for everyone else.
 - **Meeting autodetection.** Before you record, Tome spots an active Teams or Google Meet meeting by reading on-screen window titles — over the Screen Recording permission it already holds, with no new prompt and no network — and offers the meeting's name as a one-tap title for the recording. It's a dismissible suggestion, on by default, with a global off-switch in Settings. See [`docs/meeting-detection.md`](docs/meeting-detection.md).
 - **Voice Memo** is mic only — for quick thoughts and verbal notes, but also **in-person meetings**: when more than one person is talking, post-session diarization splits the single mic stream into Speaker 1, Speaker 2, … just like a call. A solo memo stays one "You" block. Saves to a separate folder so it doesn't clutter your meeting transcripts.
 - **Speaker diarization** runs after the session ends. For a call, pyannote splits the remote audio into Speaker 2, Speaker 3, …; for an in-person voice memo it splits the mic itself into Speaker 1, Speaker 2, …. Not perfect, but way better than one wall of unattributed text.
@@ -197,8 +198,8 @@ swift build
 
 | Permission | When | Why |
 |---|---|---|
-| **Microphone** | All modes | Captures your voice |
-| **Screen Recording** | Call Capture only | ScreenCaptureKit needs this for system audio from conferencing apps |
+| **Microphone** | All modes | Captures your voice (and, in mixer mode, the call audio device) |
+| **Screen Recording** | Call Capture, automatic source only | ScreenCaptureKit needs this for system audio from conferencing apps. Not needed for a session whose call audio source is a mixer device — that rides the microphone grant. |
 
 macOS re-prompts for Screen Recording permission roughly monthly. That's an OS thing, not Tome.
 
@@ -210,8 +211,9 @@ Tome/Sources/Tome/
 │   ├── TomeApp.swift               # App entry point
 │   └── AppUpdaterController.swift  # Sparkle update controller
 ├── Audio/
-│   ├── SystemAudioCapture.swift    # ScreenCaptureKit + per-app filtering
-│   └── MicCapture.swift            # AVAudioEngine mic input
+│   ├── SystemAudioCapture.swift    # ScreenCaptureKit + per-app exclusion (automatic source)
+│   ├── MicCapture.swift            # AVAudioEngine input — mic leg, and the mixer-device call-audio leg
+│   └── MixerLeanInPrompt.swift     # One-time invitation to capture a mixer's mix directly
 ├── Models/
 │   ├── Models.swift                # Domain types (Utterance, Speaker, etc.)
 │   └── TranscriptStore.swift       # Observable transcript state
@@ -272,6 +274,9 @@ Tome has grown well beyond its open-source starting point. Here's what's built i
 - **Fresh TDT decoder state per transcribe call** — eliminates cross-utterance state bleed that produced empty/duplicated outputs on FluidAudio 0.14.
 - **`<unk>` token sanitization** — Parakeet v3's SentencePiece vocab has no token for a range of printable symbols (`& @ # ( ) + …`), so the decoder emits a literal `<unk>` where it hears one (field-observed as `P<unk>L` for "P&L"). `ASRTextSanitizer`, applied centrally in `ASRCoordinator` so live and batch paths both pass through it, renders `<unk>` tightly wrapped by letters/digits as `&` (the dominant case — P&L, R&D, AT&T, S&P) and drops the rest with whitespace re-collapsed, so an unrecoverable symbol degrades to a clean omission instead of leaking markup into the vault.
 - **Tracks current FluidAudio** — pinned to 0.15.1+, picking up ~8% faster Parakeet v3 transcription (GPU encoder placement, WER-neutral), the French accent-drift token blocklist, and Greek script support.
+
+- **Mixer-device call audio ("lean-in" mode)** — Settings ▸ Audio ▸ System Audio picks the source for the "Them" leg: **System audio (automatic)** (ScreenCaptureKit display-wide, minus known media players and audio routers — the default) or **any input device**, which is how professional mixers publish their mixes. Subscribing to a mix whose mic channel is muted makes own-voice bleed impossible by construction rather than by filtering, curates per-channel what reaches VAD+ASR, and skips the Screen Recording permission for the session. The source is resolved by device UID at every bind, so a device that's absent falls back to automatic capture (with a banner and a notification) and is re-adopted the moment it returns; selecting your own microphone as the source is refused outright so nothing is ever transcribed twice. An unfed mix — the mixer app closed, its virtual devices still listed and delivering pure digital zeros — is caught within ~5s by an exact-zero detector, and the retained WAV survives a mid-session mixer restart via append-reopen. A one-time banner invites mixer users in when a known mix-publishing app is running; it never gates or delays recording. See [`docs/superpowers/specs/2026-07-25-mixer-device-system-audio-capture.md`](docs/superpowers/specs/2026-07-25-mixer-device-system-audio-capture.md).
+- **Audio-router exclusion (automatic mode)** — routers like Wave Link re-render your microphone as their own app audio, which ScreenCaptureKit attributes to them per-process and would transcribe as a phantom "Them". Automatic capture excludes known routers by bundle ID (`AppSettings.excludedAudioAppIDs`, seeded once, user removals stick). Exclusion never drops the far end — that audio belongs to the meeting app's own process. No Settings UI as of the mixer-device work (mixer owners have the source picker instead); `defaults write com.dloomis.tome excludedAudioAppIDs -array …` remains the escape hatch.
 
 ### Reliability & durability
 

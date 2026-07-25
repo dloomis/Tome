@@ -48,6 +48,32 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(inputDeviceName, forKey: "inputDeviceName") }
     }
 
+    // MARK: - Call Audio Source ("Them" leg)
+
+    /// Persisted CoreAudio device UID the call-audio ("Them") leg captures from.
+    /// Empty string = "System audio (automatic)", i.e. ScreenCaptureKit over the
+    /// whole display minus the exclusions below — the default and the correct
+    /// choice for installs with no audio mixer.
+    ///
+    /// A non-empty UID selects **lean-in mode**: the user runs a mixer (Elgato
+    /// Wave Link, Loopback, RØDE UNIFY) that publishes each mix as a virtual
+    /// input device, and hands Tome a mix containing the call audio with their
+    /// own mic channel muted. Own-voice bleed then cannot happen by construction
+    /// rather than by exclusion, and no Screen Recording permission is needed.
+    /// UID (not AudioDeviceID) for the same reason as `inputDeviceUID`: mixer
+    /// drivers reassign numeric IDs across reloads. Call captures only — voice
+    /// memos have no system leg. Applies at the next session start.
+    var systemAudioSourceUID: String {
+        didSet { UserDefaults.standard.set(systemAudioSourceUID, forKey: "systemAudioSourceUID") }
+    }
+
+    /// Last-known display name of the selected call-audio device, so the picker
+    /// can show "<name> (unavailable)" while the device is absent instead of
+    /// going blank. Maintained alongside `systemAudioSourceUID` by the picker.
+    var systemAudioSourceName: String {
+        didSet { UserDefaults.standard.set(systemAudioSourceName, forKey: "systemAudioSourceName") }
+    }
+
     // MARK: - System-Audio Exclusions (audio routers)
 
     /// Bundle IDs of audio-router apps excluded from system-audio capture.
@@ -57,6 +83,14 @@ final class AppSettings {
     /// 2026-07-24; see docs/superpowers/specs/2026-07-24-own-voice-bleed-*.md).
     /// Exclusion never drops far-end call audio: SCK attributes that to the
     /// conferencing app's own process.
+    ///
+    /// No Settings UI as of the 2026-07-25 mixer-device spec: exclusion is an
+    /// internal detail of automatic mode (it is inert when
+    /// `systemAudioSourceUID` selects a device), and it needs no per-user
+    /// decisions now that mixer owners have the source picker instead. Storage,
+    /// seeding, and migration are unchanged — prior user additions keep working,
+    /// and `defaults write com.dloomis.tome excludedAudioAppIDs -array …`
+    /// remains the power-user escape hatch.
     var excludedAudioAppIDs: [String] {
         didSet { UserDefaults.standard.set(excludedAudioAppIDs, forKey: "excludedAudioAppIDs") }
     }
@@ -200,6 +234,10 @@ final class AppSettings {
         defaults.set(migratedSelection.uid, forKey: "inputDeviceUID")
         defaults.set(migratedSelection.name, forKey: "inputDeviceName")
         defaults.removeObject(forKey: "inputDeviceID")
+
+        // Call-audio source: "" (automatic / SCK) on a fresh install.
+        self.systemAudioSourceUID = defaults.string(forKey: "systemAudioSourceUID") ?? ""
+        self.systemAudioSourceName = defaults.string(forKey: "systemAudioSourceName") ?? ""
 
         // System-audio exclusions: seed built-ins exactly once each. Removals
         // stick — a deleted default stays in the seen list, so a later release
