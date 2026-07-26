@@ -189,6 +189,23 @@ final class TranscriptionEngine {
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
+    /// Listens for changes to the system-wide DEVICE LIST while a session runs
+    /// with a configured call-audio source — the re-adoption trigger the
+    /// 2026-07-25 field test showed was missing. Wave Link republishes its
+    /// virtual devices when its own output device changes (a Bluetooth HFP flip
+    /// does exactly that), so a mid-flip rebuild finds the configured UID
+    /// unresolvable and falls back to SCK — correct — but a healthy SCK leg
+    /// never rebuilds, so the session stayed on SCK even after the device
+    /// returned seconds later. A device-list change is the precise "it may be
+    /// back" signal; the handler re-resolves and rebuilds only when the source
+    /// is actually adoptable again.
+    private var deviceListListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// Debounced re-adoption check scheduled by the device-list listener.
+    /// Device-list changes arrive in storms during the exact transitions that
+    /// make mixers republish devices; each new change supersedes the pending one.
+    private var deviceReadoptionTask: Task<Void, Never>?
+
     /// Debounced mic rebuild scheduled by `AVAudioEngineConfigurationChange`.
     /// Bluetooth transitions (AirPods connect, HFP↔A2DP renegotiation) fire the
     /// notification in flurries and kill the tap each time; the debounce lets the
@@ -456,6 +473,13 @@ final class TranscriptionEngine {
 
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
+
+        // Re-adoption trigger for the configured call-audio source: a mixer
+        // that republishes its devices mid-session (BT-flip storm) must be
+        // re-adopted when the device returns — see `deviceListListenerBlock`.
+        if !activeSystemSourceUID.isEmpty {
+            installDeviceListListener()
+        }
     }
 
     /// One-shot handle for the startup-delivery gate armed in `start()`. See
@@ -556,6 +580,24 @@ final class TranscriptionEngine {
         guard let resolvedDeviceID else { return .sckFallback(.deviceUnavailable) }
         guard resolvedDeviceID != micDeviceID else { return .sckFallback(.sameAsMic) }
         return .device(resolvedDeviceID)
+    }
+
+    /// Pure decision for the device-list re-adoption trigger: rebuild the
+    /// system leg only when a session is live, configured for a device source,
+    /// currently running the leg on SCK (a fallback), and the source now
+    /// resolves to an adoptable device. `.sckFallback` resolutions must NOT
+    /// rebuild — the leg would only land back on SCK, and the pointless
+    /// teardown/bring-up rotates the session WAV for nothing (same-as-mic
+    /// configs would do that on every device-list change).
+    nonisolated static func shouldReadoptDeviceSource(
+        isRunning: Bool,
+        configuredUID: String,
+        legIsOnDevice: Bool,
+        resolution: SystemSourceResolution
+    ) -> Bool {
+        guard isRunning, !configuredUID.isEmpty, !legIsOnDevice else { return false }
+        if case .device = resolution { return true }
+        return false
     }
 
     /// User-facing text for a system leg that carried no audible content — the
@@ -680,8 +722,9 @@ final class TranscriptionEngine {
     /// Bring the system ("Them") leg up for the current session and return its
     /// buffer stream, or nil if no leg could be established. Used by both
     /// `start()` and `restartSystemAudioLeg`, so a rebuild re-resolves the source
-    /// from scratch: a device absent at start is adopted at the next rebuild,
-    /// and a device that vanishes mid-session falls back to SCK — both surfaced.
+    /// from scratch: a device absent at start is adopted at the next rebuild
+    /// (the device-list listener fires one when the device reappears), and a
+    /// device that vanishes mid-session falls back to SCK — both surfaced.
     ///
     /// `isRebuild` marks a mid-session re-entry: a WAV already at the session
     /// path is THIS session's earlier audio (possibly the other source's), so a
@@ -1674,6 +1717,76 @@ final class TranscriptionEngine {
         defaultDeviceListenerBlock = nil
     }
 
+    // MARK: - Device-list listener (call-audio source re-adoption)
+
+    private static var deviceListAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    /// Installed per session, only when a call-audio source is configured (the
+    /// default "" source never needs re-adoption). Registering a listener is a
+    /// non-blocking CoreAudio call — same pattern as the default-device
+    /// listener and the Settings picker's `InputDeviceList`.
+    private func installDeviceListListener() {
+        guard deviceListListenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            Task { @MainActor in self.scheduleDeviceSourceReadoption() }
+        }
+        deviceListListenerBlock = block
+        var address = Self.deviceListAddress
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+    }
+
+    private func removeDeviceListListener() {
+        guard let block = deviceListListenerBlock else { return }
+        var address = Self.deviceListAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        deviceListListenerBlock = nil
+    }
+
+    /// Debounced (2s) so the device-list storm a Bluetooth transition produces
+    /// collapses into one check after the graph settles. The rebuild itself
+    /// re-resolves from scratch and is generation-guarded, so the checks here
+    /// are gates against pointless work, not correctness guards.
+    private func scheduleDeviceSourceReadoption() {
+        guard isRunning, !activeSystemSourceUID.isEmpty, !systemSourceMode.isDevice else { return }
+        deviceReadoptionTask?.cancel()
+        let generation = sessionGeneration
+        deviceReadoptionTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration else { return }
+            let resolution = Self.resolveSystemSource(
+                uid: self.activeSystemSourceUID,
+                resolvedDeviceID: await MicCapture.deviceID(forUID: self.activeSystemSourceUID),
+                micDeviceID: self.currentMicDeviceID
+            )
+            guard generation == self.sessionGeneration,
+                  Self.shouldReadoptDeviceSource(
+                      isRunning: self.isRunning,
+                      configuredUID: self.activeSystemSourceUID,
+                      legIsOnDevice: self.systemSourceMode.isDevice,
+                      resolution: resolution
+                  )
+            else { return }
+            diagLog("[SYS-READOPT] configured call-audio device is present again — rebuilding the system leg to adopt it")
+            await self.restartSystemAudioLeg()
+        }
+    }
+
     private func ensureMicrophonePermission() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -1704,6 +1817,9 @@ final class TranscriptionEngine {
         sessionGeneration += 1
         lastError = nil
         removeDefaultDeviceListener()
+        removeDeviceListListener()
+        deviceReadoptionTask?.cancel()
+        deviceReadoptionTask = nil
         startupGateTask?.cancel()
         startupGateTask = nil
         sysStartupGateTask?.cancel()

@@ -60,6 +60,46 @@ struct SystemSourceResolutionTests {
     }
 }
 
+@Suite("Device source re-adoption trigger")
+struct DeviceSourceReadoptionTests {
+    @Test func readoptsWhenTheConfiguredDeviceResolvesAgain() {
+        // The 2026-07-25 field case: Wave Link republished its devices during a
+        // BT flip, the leg fell back to SCK, the device returned — rebuild.
+        #expect(TranscriptionEngine.shouldReadoptDeviceSource(
+            isRunning: true, configuredUID: "wavelink-transcriber",
+            legIsOnDevice: false, resolution: .device(100)
+        ))
+    }
+
+    @Test func neverReadoptsIntoAFallbackResolution() {
+        // A rebuild that would land back on SCK is pure churn — the teardown/
+        // bring-up rotates the session WAV for nothing. Same-as-mic configs
+        // would otherwise do that on EVERY device-list change.
+        for resolution: TranscriptionEngine.SystemSourceResolution in
+            [.sckFallback(.deviceUnavailable), .sckFallback(.sameAsMic), .sck] {
+            #expect(!TranscriptionEngine.shouldReadoptDeviceSource(
+                isRunning: true, configuredUID: "wavelink-transcriber",
+                legIsOnDevice: false, resolution: resolution
+            ))
+        }
+    }
+
+    @Test func inertWhenAlreadyOnTheDeviceOrNotConfiguredOrStopped() {
+        #expect(!TranscriptionEngine.shouldReadoptDeviceSource(
+            isRunning: true, configuredUID: "wavelink-transcriber",
+            legIsOnDevice: true, resolution: .device(100)
+        ))
+        #expect(!TranscriptionEngine.shouldReadoptDeviceSource(
+            isRunning: true, configuredUID: "",
+            legIsOnDevice: false, resolution: .device(100)
+        ))
+        #expect(!TranscriptionEngine.shouldReadoptDeviceSource(
+            isRunning: false, configuredUID: "wavelink-transcriber",
+            legIsOnDevice: false, resolution: .device(100)
+        ))
+    }
+}
+
 @Suite("Call audio source fallback messaging")
 struct SystemSourceFallbackTextTests {
     @Test func namedDeviceAppearsInTheMessage() {
