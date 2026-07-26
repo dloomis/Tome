@@ -53,8 +53,8 @@ struct ContentView: View {
 
     /// A running mix-publishing mixer the user hasn't been told about yet
     /// (`MixerLeanInPrompt`). Drives the one-time lean-in invitation banner.
-    /// Nil in every other case — including while recording, since the banner is
-    /// only evaluated at boot.
+    /// Evaluated at boot and again when a known mixer launches while Tome is
+    /// idle; never set while recording (starting a session clears it).
     @State private var leanInMixer: (bundleID: String, name: String)?
 
     /// Single-consumer channel that serializes utterance writes to the markdown
@@ -91,7 +91,8 @@ struct ContentView: View {
             }
 
             // One-time invitation to point the call-audio source at a mixer mix.
-            // Idle-only (it's evaluated at boot) and never blocks recording.
+            // Idle-only (evaluated at boot and on mixer launch) and never blocks
+            // recording.
             if let mixer = leanInMixer, activeSessionType == nil {
                 mixerLeanInBanner(bundleID: mixer.bundleID, name: mixer.name)
             }
@@ -333,6 +334,24 @@ struct ContentView: View {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
+        // Lean-in prompt, launch-driven: the boot evaluation misses the common
+        // ordering where Tome (a login item) is up before the mixer starts, so
+        // re-evaluate when a known mixer launches. Idle-only, and the same
+        // one-shot guards apply (already prompted / source already configured),
+        // so repeat launches are no-ops.
+        .task {
+            let launches = NSWorkspace.shared.notificationCenter
+                .notifications(named: NSWorkspace.didLaunchApplicationNotification)
+                .compactMap { note in
+                    (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                        .bundleIdentifier
+                }
+            for await bundleID in launches {
+                guard MixerLeanInPrompt.isMixPublishingMixer(bundleID),
+                      activeSessionType == nil else { continue }
+                evaluateMixerLeanInPrompt()
+            }
+        }
         .onChange(of: settings.inputDeviceUID) {
             if isRunning {
                 Task { await transcriptionEngine?.restartMic(inputDeviceUID: settings.inputDeviceUID) }
@@ -542,9 +561,10 @@ struct ContentView: View {
 
     // MARK: - Mixer lean-in prompt
 
-    /// Decide, once per launch, whether to invite the user into device-backed
-    /// call-audio capture. Invitation only — it never gates or delays recording,
-    /// and automatic mode stays fully correct for anyone who dismisses it.
+    /// Decide whether to invite the user into device-backed call-audio capture.
+    /// Runs at boot and again when a known mixer launches while idle. Invitation
+    /// only — it never gates or delays recording, and automatic mode stays fully
+    /// correct for anyone who dismisses it.
     private func evaluateMixerLeanInPrompt() {
         guard let bundleID = MixerLeanInPrompt.mixerToPromptFor(
             runningBundleIDs: MixerLeanInPrompt.runningApplicationBundleIDs(),

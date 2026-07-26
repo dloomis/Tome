@@ -98,6 +98,25 @@ struct SystemSourceFallbackTextTests {
             #expect(msg.contains("capturing system audio automatically instead"))
         }
     }
+
+    @Test func warnsAboutTheScreenRecordingPromptOnlyWhenUngranted() {
+        // Device mode exists partly to avoid the Screen Recording permission, so
+        // an SCK fallback on a never-granted machine will raise the system
+        // dialog — the message must anticipate it. On granted machines the
+        // clause is noise and must be absent.
+        let all: [TranscriptionEngine.SystemSourceFallbackReason] = [.deviceUnavailable, .sameAsMic, .bindFailed]
+        for reason in all {
+            let warned = TranscriptionEngine.systemSourceFallbackText(
+                reason: reason, deviceName: "Mix", mayPromptForScreenRecording: true
+            )
+            let quiet = TranscriptionEngine.systemSourceFallbackText(
+                reason: reason, deviceName: "Mix", mayPromptForScreenRecording: false
+            )
+            #expect(warned.contains("Screen Recording permission"))
+            #expect(!quiet.contains("Screen Recording permission"))
+            #expect(warned.hasPrefix(quiet))  // the clause appends; the base story is unchanged
+        }
+    }
 }
 
 @Suite("Silent system-leg notification text")
@@ -251,6 +270,15 @@ struct MixerLeanInPromptTests {
         // Ship-only-verified rule (2026-07-24): an unverified ID is a silent
         // no-op, i.e. a user who never sees the invitation.
         #expect(MixerLeanInPrompt.mixPublishingMixerBundleIDs.contains("com.elgato.WaveLink3"))
+    }
+
+    @Test func launchListenerFilterMatchesKnownMixersCaseInsensitively() {
+        // The app-launch listener re-evaluates the prompt only for known
+        // mixers — an arbitrary app launching must never trigger it.
+        #expect(MixerLeanInPrompt.isMixPublishingMixer("COM.ELGATO.WAVELINK3", knownMixers: mixers))
+        #expect(MixerLeanInPrompt.isMixPublishingMixer("com.example.Loopback", knownMixers: mixers))
+        #expect(!MixerLeanInPrompt.isMixPublishingMixer("com.apple.finder", knownMixers: mixers))
+        #expect(!MixerLeanInPrompt.isMixPublishingMixer("", knownMixers: mixers))
     }
 }
 

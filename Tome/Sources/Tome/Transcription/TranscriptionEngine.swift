@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreAudio
+import CoreGraphics
 import FluidAudio
 import Observation
 import os
@@ -572,19 +573,29 @@ final class TranscriptionEngine {
 
     /// User-facing text for each fallback reason. Pure so the wording is
     /// unit-testable and identical between the banner and the notification.
+    ///
+    /// `mayPromptForScreenRecording`: pass true when Screen Recording permission
+    /// has never been granted (`!CGPreflightScreenCaptureAccess()`) — automatic
+    /// capture will raise the system permission dialog, and for a device-mode
+    /// user (the mode exists partly to avoid that permission) it would otherwise
+    /// appear out of nowhere, possibly mid-call.
     nonisolated static func systemSourceFallbackText(
         reason: SystemSourceFallbackReason,
-        deviceName: String?
+        deviceName: String?,
+        mayPromptForScreenRecording: Bool = false
     ) -> String {
         let name = deviceName.map { "\u{201C}\($0)\u{201D}" } ?? "The selected call audio device"
+        let base: String
         switch reason {
         case .deviceUnavailable:
-            return "\(name) is unavailable — capturing system audio automatically instead. Your Settings choice is unchanged."
+            base = "\(name) is unavailable — capturing system audio automatically instead. Your Settings choice is unchanged."
         case .sameAsMic:
-            return "The call audio source is the same device as your microphone — capturing system audio automatically instead, so you aren't transcribed twice."
+            base = "The call audio source is the same device as your microphone — capturing system audio automatically instead, so you aren't transcribed twice."
         case .bindFailed:
-            return "\(name) couldn't be opened — capturing system audio automatically instead. Your Settings choice is unchanged."
+            base = "\(name) couldn't be opened — capturing system audio automatically instead. Your Settings choice is unchanged."
         }
+        guard mayPromptForScreenRecording else { return base }
+        return base + " macOS may ask for Screen Recording permission to allow this."
     }
 
     /// User-facing text for a failed mic bind. The timed-out/wedged cases are
@@ -808,7 +819,13 @@ final class TranscriptionEngine {
         if name == nil, let resolved = await MicCapture.deviceID(forUID: activeSystemSourceUID) {
             name = await MicCapture.deviceName(for: resolved)
         }
-        let msg = Self.systemSourceFallbackText(reason: reason, deviceName: name)
+        // Preflight never prompts (same guard MeetingDetector uses); it only
+        // decides whether to warn that the SCK fallback will.
+        let msg = Self.systemSourceFallbackText(
+            reason: reason,
+            deviceName: name,
+            mayPromptForScreenRecording: !CGPreflightScreenCaptureAccess()
+        )
         guard systemSourceFallbackMessage != msg else { return }
         let isFirst = systemSourceFallbackMessage == nil
         systemSourceFallbackMessage = msg

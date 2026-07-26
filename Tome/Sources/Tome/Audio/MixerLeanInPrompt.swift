@@ -55,6 +55,16 @@ enum MixerLeanInPrompt {
         }
     }
 
+    /// Whether `bundleID` is a known mix-publishing mixer — the filter the
+    /// app-launch listener applies before re-evaluating the prompt, so an
+    /// arbitrary app launching never triggers an evaluation (or a log line).
+    static func isMixPublishingMixer(
+        _ bundleID: String,
+        knownMixers: [String] = mixPublishingMixerBundleIDs
+    ) -> Bool {
+        knownMixers.contains { $0.caseInsensitiveCompare(bundleID) == .orderedSame }
+    }
+
     /// Bundle IDs of currently-running apps. `NSWorkspace` only — no new
     /// permissions, and no audio-device enumeration.
     @MainActor
