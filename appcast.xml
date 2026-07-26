@@ -7,13 +7,13 @@
     <language>en</language>
     <item>
       <title>Version 1.6.1</title>
-      <pubDate>Sun, 26 Jul 2026 14:15:57 +0000</pubDate>
+      <pubDate>Sun, 26 Jul 2026 18:36:58 +0000</pubDate>
       <sparkle:version>1.6.1</sparkle:version>
       <sparkle:shortVersionString>1.6.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
       <enclosure url="https://github.com/dloomis/Tome/releases/download/v1.6.1/Tome.dmg"
-                 sparkle:edSignature="8wXPZOOzT364wyyxDwkyl3cBm3GxPcfkuHG8V1RUvtt/34HvtvNxA1qK0ZH1J/wdHsLXRn+5CpfaYZUVA6w6Ag=="
-                 length="7636286"
+                 sparkle:edSignature="ek0qFVol2EC9prJROUAeZyYF5KJuB55gF8/rOWz5pyZXhbsATtFs/zUbkO5pTEaJd9BQD/hmeb7Z76sJwVT+Cw=="
+                 length="7637300"
                  type="application/octet-stream" />
     </item>
       <item>
