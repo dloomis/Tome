@@ -114,4 +114,39 @@ import Testing
         let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         #expect(names == ["fresh.wav"], "no stray rotation artifacts on first use, got \(names)")
     }
+
+    // MARK: - Header probe (SCK→device WAV adoption)
+
+    @Test func headerProbeReadsTheRateOurWritersRecord() throws {
+        // The adoption path appends at the ON-DISK rate, which may differ from
+        // the adopting device's tap rate (SCK always writes 48 kHz).
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        for rate in [44_100.0, 48_000.0] {
+            let url = dir.appendingPathComponent("probe-\(Int(rate)).wav")
+            let writer = try WAVStreamWriter(url: url, sampleRate: rate)
+            try writer.write(TestSupport.makeBuffer(seconds: 0.1, sampleRate: rate))
+            writer.close()
+            #expect(WAVStreamWriter.headerSampleRate(at: url) == rate)
+        }
+    }
+
+    @Test func headerProbeRefusesNonWAVContent() throws {
+        // MicCapture falls back to `.create` (rotate) when the probe returns
+        // nil — a garbage or torn file must never be appended to.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let missing = dir.appendingPathComponent("missing.wav")
+        #expect(WAVStreamWriter.headerSampleRate(at: missing) == nil)
+
+        let short = dir.appendingPathComponent("short.wav")
+        try Data("RIFF".utf8).write(to: short)
+        #expect(WAVStreamWriter.headerSampleRate(at: short) == nil)
+
+        let garbage = dir.appendingPathComponent("garbage.wav")
+        try Data(repeating: 0x41, count: 200).write(to: garbage)
+        #expect(WAVStreamWriter.headerSampleRate(at: garbage) == nil)
+    }
 }

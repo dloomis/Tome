@@ -16,9 +16,9 @@ enum CaptureBindError: Error, Equatable {
 }
 
 final class MicCapture: @unchecked Sendable {
-    /// Crash-resilient WAV writer retaining the mic track, plus (when a
-    /// mid-session mic restart attached a device with a different native
-    /// sample rate) a converter resampling to `_establishedFormat`'s rate
+    /// Crash-resilient WAV writer retaining the mic track, plus (when an
+    /// adopted recording's on-disk rate differs from the newly-attached
+    /// device's native rate) a converter resampling to the file's rate
     /// before each write.
     private struct RetentionWriter {
         let writer: WAVStreamWriter
@@ -41,23 +41,23 @@ final class MicCapture: @unchecked Sendable {
     /// callback, closed in `stop()`.
     private let _retentionWriter = OSAllocatedUnfairLock<RetentionWriter?>(uncheckedState: nil)
 
-    /// The URL + sample rate the retention WAV was most recently created fresh
-    /// at. Unlike `_retentionWriter`, this deliberately survives `stop()` — a
-    /// mid-session mic device restart calls `stop()` (to tear down the old
-    /// device's tap) immediately before calling `bufferStream` again with the
-    /// SAME `recordOutputURL`, and that next call needs to recognize "this URL
-    /// already holds a real recording" to reopen it in `.append` mode instead
-    /// of recreating it, which would reset it to a bare 44-byte header and
-    /// discard everything captured before the swap. A genuinely new session
-    /// always gets a distinct URL, so comparing by URL naturally invalidates
-    /// stale entries from a prior session without needing explicit clearing.
-    private let _establishedFormat = OSAllocatedUnfairLock<(url: URL, sampleRate: Double)?>(uncheckedState: nil)
-
     /// Wall-clock time of the first buffer delivered by the tap. Used by the
     /// post-session mixer to align the mic track to the session start. Persisted
     /// across `stop()` so the engine can snapshot it at teardown.
     private let _firstSampleTime = OSAllocatedUnfairLock<Date?>(uncheckedState: nil)
     var firstSampleTime: Date? { _firstSampleTime.withLock { $0 } }
+
+    /// Back-date the session-start anchor to `anchor` when this capture adopted
+    /// a WAV another source began (SCK→device adoption): the post-session mixer
+    /// aligns the track at `firstSampleTime`, and an adopted file's audio starts
+    /// at the ORIGINAL source's first sample, not this bind's. Only ever moves
+    /// the anchor EARLIER — the tap's own first buffer must never be overwritten
+    /// with a later date.
+    func seedFirstSampleTime(_ anchor: Date) {
+        _firstSampleTime.withLock { current in
+            if current == nil || anchor < current! { current = anchor }
+        }
+    }
 
     /// Wall-clock time of the most recent buffer delivered by the TAP while
     /// capture is active; `nil` when not capturing or before the first buffer.
@@ -246,6 +246,14 @@ final class MicCapture: @unchecked Sendable {
     ///   WAV at this path (float32 mono) for post-session retention. Multi-channel
     ///   devices are downmixed to mono (all channels averaged) so the live mic
     ///   survives regardless of which channel it lands on.
+    /// - Parameter adoptExistingRecording: when true, a valid WAV already at
+    ///   `recordOutputURL` is reopened in `.append` mode at its on-disk header
+    ///   rate instead of being rotated aside — the caller vouches that the file
+    ///   is THIS session's earlier audio (a pre-restart capture by this
+    ///   instance, or the SCK leg's when a rebuild moves the system leg onto a
+    ///   device). Engine-directed, never inferred from file existence: session
+    ///   ids are second-resolution timestamps, so a colliding NEW session must
+    ///   rotate the old file aside (the `.create` path), not append to it.
     ///
     /// The bring-up runs on the HAL queue with a deadline (2026-07-25 hang
     /// fix): a driver that wedges `engine.start()` costs the caller a
@@ -255,12 +263,13 @@ final class MicCapture: @unchecked Sendable {
     /// call fails fast with `.halWedged`.
     func bufferStream(
         deviceID: AudioDeviceID? = nil,
-        recordOutputURL: URL? = nil
+        recordOutputURL: URL? = nil,
+        adoptExistingRecording: Bool = false
     ) async -> Result<AsyncStream<AVAudioPCMBuffer>, CaptureBindError> {
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         let outcome = await HALQueue.run(
             label: "capture-bind",
-            work: { self.performBind(continuation: continuation, deviceID: deviceID, recordOutputURL: recordOutputURL) },
+            work: { self.performBind(continuation: continuation, deviceID: deviceID, recordOutputURL: recordOutputURL, adoptExistingRecording: adoptExistingRecording) },
             onAbandoned: { setupError in
                 self.teardownAbandonedBind(continuation: continuation, setupError: setupError)
             }
@@ -283,7 +292,8 @@ final class MicCapture: @unchecked Sendable {
     private func performBind(
         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
         deviceID: AudioDeviceID?,
-        recordOutputURL: URL?
+        recordOutputURL: URL?,
+        adoptExistingRecording: Bool
     ) -> String? {
         let level = _audioLevel
         let errorHolder = _error
@@ -415,23 +425,24 @@ final class MicCapture: @unchecked Sendable {
                 state = nil
             }
 
-            // Open the retention WAV writer (mono float32) before the tap fires. A
-            // mid-session mic restart (e.g. a Bluetooth headset connecting) calls
-            // back into here with the SAME `recordOutputURL` — reopen that file in
-            // `.append` mode and keep going rather than recreating it, which would
-            // reset it to a bare 44-byte header and discard everything captured
-            // before the swap. The file's sample rate is fixed at first open; if the
-            // newly-attached device's native rate differs, resample to match.
-            let established = self._establishedFormat.withLock { $0 }
+            // Open the retention WAV writer (mono float32) before the tap fires.
+            // When the caller marked this bind as adopting an existing recording
+            // (mid-session mic restart, device-leg rebuild, SCK→device adoption),
+            // reopen the file in `.append` mode at its ON-DISK header rate and
+            // keep going rather than rotating it aside — the audio already there
+            // is this session's earlier capture, and diarization must see one
+            // continuous file. The header rate (not the tap's, not any remembered
+            // rate) is authoritative: the file may have been created by the SCK
+            // writer at 48 kHz while this device's native rate differs.
             var newRetention: RetentionWriter?
             var isFreshRecording = true
 
             if let url = recordOutputURL {
-                if let established, established.url == url {
+                if adoptExistingRecording, let onDiskRate = WAVStreamWriter.headerSampleRate(at: url) {
                     do {
                         let writer = try WAVStreamWriter(
                             url: url,
-                            sampleRate: established.sampleRate,
+                            sampleRate: onDiskRate,
                             channels: 1,
                             mode: .append
                         )
@@ -440,13 +451,13 @@ final class MicCapture: @unchecked Sendable {
                         // tapFormat.channelCount, which for a multi-channel device
                         // (AirPods HFP, aggregates) would mismatch the actual buffers.
                         var converter: AVAudioConverter?
-                        if tapFormat.sampleRate != established.sampleRate,
+                        if tapFormat.sampleRate != onDiskRate,
                            let tapMono = AVAudioFormat(
                                standardFormatWithSampleRate: tapFormat.sampleRate,
                                channels: 1
                            ),
                            let writerFormat = AVAudioFormat(
-                               standardFormatWithSampleRate: established.sampleRate,
+                               standardFormatWithSampleRate: onDiskRate,
                                channels: 1
                            ) {
                             converter = AVAudioConverter(from: tapMono, to: writerFormat)
@@ -462,7 +473,6 @@ final class MicCapture: @unchecked Sendable {
                     do {
                         let writer = try WAVStreamWriter(url: url, sampleRate: tapFormat.sampleRate, channels: 1, mode: .create)
                         newRetention = RetentionWriter(writer: writer, converter: nil)
-                        self._establishedFormat.withLock { $0 = (url: url, sampleRate: tapFormat.sampleRate) }
                     } catch {
                         diagLog("[MIC-WAV-FAIL] could not open writer at \(url.path): \(error)")
                     }

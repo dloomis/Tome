@@ -175,6 +175,24 @@ final class WAVStreamWriter: @unchecked Sendable {
         try fileHandle.seek(toOffset: currentPos)
     }
 
+    /// Sample rate recorded in the WAV header at `url`, or nil when the file is
+    /// missing, shorter than the canonical 44-byte header, or not RIFF/WAVE with
+    /// "fmt " as its first chunk. Reads only the fixed layout both Tome writers
+    /// produce (rate at byte 24) — an append decision on our own files, not a
+    /// general WAV parser. Callers append at THIS rate, not their tap's: the
+    /// file may have been created by the other leg's writer (SCK at 48 kHz).
+    static func headerSampleRate(at url: URL) -> Double? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 44), header.count == 44 else { return nil }
+        guard header[0..<4].elementsEqual("RIFF".utf8),
+              header[8..<12].elementsEqual("WAVE".utf8),
+              header[12..<16].elementsEqual("fmt ".utf8) else { return nil }
+        let raw = header.subdata(in: 24..<28).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+        let rate = UInt32(littleEndian: raw)
+        return rate > 0 ? Double(rate) : nil
+    }
+
     /// Sibling path an existing file is moved to before this writer claims `url`.
     /// Keeps the `.mic.wav` tail intact (`<sid>.pre-<ts>.mic.wav`) so the orphan
     /// scanner continues to treat mic segments as companions, never as diarization

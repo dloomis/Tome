@@ -332,6 +332,11 @@ final class TranscriptionEngine {
             let msg = Self.micBindFailureText(error: bindError, deviceName: name)
             diagLog("[ENGINE-3-FAIL] mic capture failed at start: \(msg)")
             lastError = msg
+            // The unresolvable-UID path above may have already posted the
+            // "recording from <default>" fallback banner + notification — but
+            // this start is failing, so nothing records. Retract it rather than
+            // leave a notification claiming a live recording that isn't.
+            clearMicFallback()
             // A timed-out/wedged bind must NOT be touched — the abandoned-op
             // handler owns its teardown, and a fallback retry against another
             // device would only queue behind the same wedge (the system
@@ -675,10 +680,21 @@ final class TranscriptionEngine {
     /// Bring the system ("Them") leg up for the current session and return its
     /// buffer stream, or nil if no leg could be established. Used by both
     /// `start()` and `restartSystemAudioLeg`, so a rebuild re-resolves the source
-    /// from scratch: a device absent at start is adopted the moment it returns,
+    /// from scratch: a device absent at start is adopted at the next rebuild,
     /// and a device that vanishes mid-session falls back to SCK — both surfaced.
+    ///
+    /// `isRebuild` marks a mid-session re-entry: a WAV already at the session
+    /// path is THIS session's earlier audio (possibly the other source's), so a
+    /// device bind appends to it instead of rotating it aside. `inheritedAnchor`
+    /// is the pre-teardown `systemFirstSampleTime` — an adopted WAV still starts
+    /// at the original source's first sample, and the post-session mixer must
+    /// keep aligning it there.
     @MainActor
-    private func bringUpSystemLeg(recordingContext: SessionRecordingContext?) async -> AsyncStream<AVAudioPCMBuffer>? {
+    private func bringUpSystemLeg(
+        recordingContext: SessionRecordingContext?,
+        isRebuild: Bool = false,
+        inheritedAnchor: Date? = nil
+    ) async -> AsyncStream<AVAudioPCMBuffer>? {
         let resolution = Self.resolveSystemSource(
             uid: activeSystemSourceUID,
             resolvedDeviceID: await MicCapture.deviceID(forUID: activeSystemSourceUID),
@@ -686,7 +702,12 @@ final class TranscriptionEngine {
         )
         switch resolution {
         case .device(let deviceID):
-            if let stream = await startDeviceSystemLeg(deviceID: deviceID, recordingContext: recordingContext) {
+            if let stream = await startDeviceSystemLeg(
+                deviceID: deviceID,
+                recordingContext: recordingContext,
+                adoptExistingRecording: isRebuild,
+                inheritedAnchor: inheritedAnchor
+            ) {
                 return stream
             }
             // A bind failure fails the LEG, not the session (same as an SCK
@@ -694,7 +715,15 @@ final class TranscriptionEngine {
             // far end is still captured. This holds for a timed-out bind too —
             // SCK touches no HAL input device, so it is unaffected by a wedge.
             await reportSystemSourceFallback(reason: .bindFailed, deviceID: deviceID)
-            return await startSCKSystemLeg(recordingContext: recordingContext)
+            let stream = await startSCKSystemLeg(recordingContext: recordingContext)
+            // The fallback SUCCEEDED: the red bind-failure error would sit next
+            // to the fallback banner all session implying nothing is recording.
+            // Only our own message is wiped — a newer, unrelated error stays.
+            if stream != nil, let failMsg = systemDeviceBindFailureMessage, lastError == failMsg {
+                lastError = nil
+            }
+            systemDeviceBindFailureMessage = nil
+            return stream
         case .sckFallback(let reason):
             await reportSystemSourceFallback(reason: reason, deviceID: nil)
             return await startSCKSystemLeg(recordingContext: recordingContext)
@@ -706,10 +735,16 @@ final class TranscriptionEngine {
     /// Device-backed system leg: bind the mixer's virtual input device through
     /// `systemDeviceCapture`. Synchronous — `MicCapture.bufferStream` runs its
     /// setup inline, so a bind failure is already in `captureError` on return.
+    ///
+    /// `adoptExistingRecording` / `inheritedAnchor`: see `bringUpSystemLeg` —
+    /// a rebuild appends to the session WAV (even one the SCK leg started) and
+    /// back-dates the mixer-alignment anchor to the original first sample.
     @MainActor
     private func startDeviceSystemLeg(
         deviceID: AudioDeviceID,
-        recordingContext: SessionRecordingContext?
+        recordingContext: SessionRecordingContext?,
+        adoptExistingRecording: Bool = false,
+        inheritedAnchor: Date? = nil
     ) async -> AsyncStream<AVAudioPCMBuffer>? {
         let name = await MicCapture.deviceName(for: deviceID) ?? "?"
         diagLog("[ENGINE-4] starting call-audio capture from input device \(deviceID) \"\(name)\"")
@@ -728,6 +763,10 @@ final class TranscriptionEngine {
             bufferURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("tome_sys_audio_\(UUID().uuidString).wav")
         }
+        // Snapshot before the bind creates the file: on a failed bind this
+        // decides whether the artifacts are junk from THIS attempt (safe to
+        // remove) or a file holding earlier session audio (must stay).
+        let wavPreExisted = FileManager.default.fileExists(atPath: bufferURL.path)
 
         // A virtual device disappearing (mixer app quit/relaunch) produces exactly
         // the route/graph change this notification reports.
@@ -735,7 +774,11 @@ final class TranscriptionEngine {
             Task { @MainActor in self?.scheduleSystemDeviceRebuild(reason: "engine configuration change") }
         }
 
-        let bind = await systemDeviceCapture.bufferStream(deviceID: deviceID, recordOutputURL: bufferURL)
+        let bind = await systemDeviceCapture.bufferStream(
+            deviceID: deviceID,
+            recordOutputURL: bufferURL,
+            adoptExistingRecording: adoptExistingRecording
+        )
         let stream: AsyncStream<AVAudioPCMBuffer>
         switch bind {
         case .success(let boundStream):
@@ -744,32 +787,62 @@ final class TranscriptionEngine {
             let msg = "Call audio device failed: \(Self.bindFailureDetail(bindError))"
             diagLog("[ENGINE-5-FAIL] \(msg)")
             lastError = msg
+            // Remembered so a SUCCESSFUL SCK fallback can retire this error —
+            // and only this error — instead of leaving a red banner up all
+            // session next to a fallback banner saying capture is fine.
+            systemDeviceBindFailureMessage = msg
             // Timed-out/wedged binds belong to the abandoned-op handler; only
             // a clean setup failure gets the normal teardown.
             if case .setupFailed = bindError {
                 await systemDeviceCapture.stop()
+            }
+            // No audio was ever delivered — remove the just-provisioned
+            // artifacts (header-only WAV + sidecar) so they don't accumulate as
+            // sub-threshold junk, mirroring the mic-leg start failure. Only when
+            // the WAV didn't pre-exist: a pre-existing file holds this session's
+            // earlier audio (deleting an unlinked file a wedged bind still has
+            // open is safe — its late writes land in the unlinked inode).
+            if !wavPreExisted {
+                try? FileManager.default.removeItem(at: bufferURL)
+                SessionSidecar.deleteIfExists(forWAV: bufferURL)
             }
             return nil
         }
 
         systemSourceMode = .device(deviceID)
         currentBufferURL = bufferURL
+        // An adopted WAV starts at the ORIGINAL source's first sample; keep the
+        // post-session mixer aligned there (no-op for device→device rebuilds,
+        // where the preserved anchor is already the earlier one).
+        if adoptExistingRecording, wavPreExisted, let inheritedAnchor {
+            systemDeviceCapture.seedFirstSampleTime(inheritedAnchor)
+        }
         // A rebuild that landed back on the device retires the fallback banner.
         clearSystemSourceFallback()
+        systemDeviceBindFailureMessage = nil
         armSystemDeviceDigitalSilenceCheck(deviceID: deviceID)
         diagLog("[ENGINE-5] call-audio device capture started OK (\(bufferURL.lastPathComponent))")
         return stream
     }
 
+    /// The exact `lastError` posted by the most recent failed device-leg bind,
+    /// so the SCK-fallback success path can retire it without touching a newer,
+    /// unrelated error (same pattern as `micSilenceMessage`).
+    private var systemDeviceBindFailureMessage: String?
+
     /// Automatic (ScreenCaptureKit) system leg — today's default path, unchanged.
     ///
     /// NOTE on the WAV: `SystemAudioCapture` always (re)creates its writer, so an
-    /// SCK bring-up truncates whatever is at `<sessionId>.wav`. That is the
-    /// pre-existing behavior of every SCK rebuild; it also means a device-mode
-    /// session that loses its device entirely and falls back here starts the WAV
-    /// over. The live transcript is unaffected (it is written per-utterance), and
-    /// the far more common device failure — the mixer app quitting while its
-    /// device stays registered — keeps resolving to the device and appends.
+    /// SCK bring-up rotates whatever is at `<sessionId>.wav` aside (`.pre-<ts>.wav`
+    /// — preserved on disk but outside diarization and the retained mix). That is
+    /// the pre-existing behavior of every SCK rebuild, including a device-mode
+    /// session that loses its device entirely and falls back here. The reverse
+    /// direction does better: a rebuild that moves the leg from SCK onto the
+    /// device APPENDS to the SCK-written WAV (`adoptExistingRecording`), so an
+    /// adoption loses nothing. The live transcript is unaffected either way (it
+    /// is written per-utterance), and the most common device failure — the mixer
+    /// app quitting while its device stays registered — keeps resolving to the
+    /// device and appends.
     @MainActor
     private func startSCKSystemLeg(recordingContext: SessionRecordingContext?) async -> AsyncStream<AVAudioPCMBuffer>? {
         diagLog("[ENGINE-4] starting system audio capture (automatic / ScreenCaptureKit)...")
@@ -1058,6 +1131,12 @@ final class TranscriptionEngine {
         let generation = sessionGeneration
         sysTask?.cancel()
         sysTask = nil
+        // Snapshot the session's system-track anchor BEFORE teardown: SCK
+        // resets `firstSampleTime` on stop(), and if this rebuild adopts the
+        // configured device (SCK→device), the appended WAV still starts at the
+        // original source's first sample — the post-session mixer must keep
+        // aligning it there, not at the adoption moment.
+        let previousAnchor = systemFirstSampleTime
         // Tear both sources down: the rebuild re-resolves the source from
         // scratch, so it may come back up on the OTHER one (device gone → SCK,
         // device returned → device). Stopping an already-stopped capture is a
@@ -1066,10 +1145,14 @@ final class TranscriptionEngine {
         await systemDeviceCapture.stop()
         guard generation == sessionGeneration, isRunning else { return }
 
-        // Device-mode rebuilds re-enter `bufferStream` with the SAME
-        // recordOutputURL, so MicCapture's append-reopen keeps the session WAV —
-        // and everything captured before the interruption — intact.
-        let stream = await bringUpSystemLeg(recordingContext: activeRecordingContext)
+        // Rebuilds re-enter with the SAME recordOutputURL and `isRebuild: true`,
+        // so a device bind appends to the session WAV — everything captured
+        // before the interruption (by either source) stays in the file.
+        let stream = await bringUpSystemLeg(
+            recordingContext: activeRecordingContext,
+            isRebuild: true,
+            inheritedAnchor: previousAnchor
+        )
         guard generation == sessionGeneration, isRunning else {
             // Stale: a stop (or a new session's start) raced the bring-up.
             // Unwind the capture we just started so it can't leak an SCStream
@@ -1442,9 +1525,14 @@ final class TranscriptionEngine {
 
         currentMicDeviceID = targetMicID
 
-        // Start new mic stream. The retention writer reopens in `.append` mode at
-        // the same path, so the pre-swap audio is preserved (see MicCapture).
-        let micBind = await micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
+        // Start new mic stream. `adoptExistingRecording` reopens the retention
+        // WAV in `.append` mode at the same path, so the pre-swap audio is
+        // preserved (see MicCapture) — this URL is the active session's own file.
+        let micBind = await micCapture.bufferStream(
+            deviceID: targetMicID,
+            recordOutputURL: currentMicBufferURL,
+            adoptExistingRecording: true
+        )
 
         guard generation == sessionGeneration, isRunning else {
             diagLog("[ENGINE-MIC-SWAP-ABORT] session changed during mic bind — unwinding")
@@ -1527,6 +1615,18 @@ final class TranscriptionEngine {
         }
         // The new device must prove it delivers real audio, same as at start.
         armMicDigitalSilenceCheck()
+
+        // The same-as-mic refusal (`resolveSystemSource`) only runs when the
+        // SYSTEM leg binds — a mic restart can land on the very device serving
+        // the device-backed system leg (the watchdog's surrender-to-default when
+        // the OS default IS the mix device, or a live Settings change), which is
+        // the exact double-transcription device mode exists to prevent. Rebuild
+        // the system leg so the resolver re-runs and refuses the collision,
+        // falling back to SCK with the standard banner.
+        if systemSourceMode == .device(targetMicID) {
+            diagLog("[ENGINE-MIC-SWAP] mic is now on the call-audio source device — rebuilding the system leg to resolve the collision")
+            await restartSystemAudioLeg()
+        }
     }
 
     // MARK: - Default Device Listener
@@ -1618,6 +1718,7 @@ final class TranscriptionEngine {
         systemDeviceSilenceCheckTask?.cancel()
         systemDeviceSilenceCheckTask = nil
         systemDeviceSilenceMessage = nil
+        systemDeviceBindFailureMessage = nil
         systemSourceFallbackMessage = nil
         NotificationPresenter.shared.clearMicDigitalSilence()
         NotificationPresenter.shared.clearMicFallback()
