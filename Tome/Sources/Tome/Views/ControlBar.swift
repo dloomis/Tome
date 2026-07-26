@@ -32,6 +32,11 @@ struct ControlBar: View {
     /// running, but not the way the user configured it — e.g. recording from a
     /// fallback mic because the selected device is unavailable.
     let warningMessage: String?
+    /// Neutral, non-fault status hint (gray, below the warning line): capture
+    /// is healthy and configured as intended; the audio content just has
+    /// something worth knowing — e.g. "Microphone is muted or silent." Faults
+    /// use the error/warning lines above.
+    let hintMessage: String?
     /// Provisioning status ("DOWNLOADING MODEL… 42%") — rendered like
     /// statusMessage but sourced from ModelProvisioner, NOT assetStatus
     /// (the API string-matches assetStatus; provisioning must not leak in).
@@ -65,6 +70,15 @@ struct ControlBar: View {
                 Text(warning)
                     .font(.system(size: 10))
                     .foregroundStyle(Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+            }
+
+            if let hint = hintMessage {
+                Text(hint)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.fg2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 4)

@@ -178,6 +178,13 @@ final class TranscriptionEngine {
     /// input). Armed per start(), cancelled in stop().
     private var micSilenceCheckTask: Task<Void, Never>?
 
+    /// Neutral "mic is muted or silent" line — posted instead of a red error
+    /// when the mic delivers digital zeros but its feeder app is running
+    /// (2026-07-25 false-positive fix: a Wave Link mute renders exact zeros
+    /// into a fed mix, and that's user intent, not a fault). Rendered as a
+    /// gray ControlBar line, never routed to `lastError`.
+    private(set) var micSilenceHintMessage: String?
+
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
@@ -276,16 +283,16 @@ final class TranscriptionEngine {
         systemSourceFallbackMessage = nil
         let targetMicID: AudioDeviceID?
         if inputDeviceUID.isEmpty {
-            targetMicID = MicCapture.defaultInputDeviceID()
-        } else if let resolved = MicCapture.deviceID(forUID: inputDeviceUID) {
+            targetMicID = await MicCapture.defaultInputDeviceID()
+        } else if let resolved = await MicCapture.deviceID(forUID: inputDeviceUID) {
             targetMicID = resolved
         } else {
             // The persisted UID resolves to no present device. Fall back to the
             // system default FOR THIS SESSION and say so — the old behavior
             // recorded a whole meeting off the built-in mic with no indication.
             // The selection is preserved; watchdog rebuilds keep aiming at it.
-            targetMicID = MicCapture.defaultInputDeviceID()
-            reportMicFallback(boundDeviceID: targetMicID)
+            targetMicID = await MicCapture.defaultInputDeviceID()
+            await reportMicFallback(boundDeviceID: targetMicID)
         }
         currentMicDeviceID = targetMicID ?? 0
         currentMicBufferURL = recordingContext.flatMap { ctx in
@@ -301,19 +308,37 @@ final class TranscriptionEngine {
             SessionSidecar.emit(forWAV: micURL, context: ctx, sampleRate: 48_000)
         }
 
-        let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
+        let micBind = await micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
-        // The stream-setup closure runs synchronously inside `bufferStream`, so any
-        // setup failure (no HAL input, device-set failure, tap format exception,
-        // engine-start throw) is already in `captureError` here. A session with no
-        // working mic must not pretend to record — fail the start and let
-        // ContentView's rollback unwind the bookkeeping. (`captureError` previously
-        // had no readers at all: a wedged input device produced a session that
-        // looked live and recorded nothing.)
-        if let micError = micCapture.captureError {
-            diagLog("[ENGINE-3-FAIL] mic capture failed at start: \(micError)")
-            lastError = micError
-            micCapture.stop()
+        // The bind now suspends (HAL queue + 5s deadline — 2026-07-25 hang
+        // fix); a stop() could have run while it was in flight.
+        guard isRunning else {
+            diagLog("[ENGINE-3-ABORT] stopped during mic bind — unwinding")
+            await micCapture.stop()
+            assetStatus = "Ready"
+            return
+        }
+
+        // A session with no working mic must not pretend to record — fail the
+        // start and let ContentView's rollback unwind the bookkeeping.
+        let micStream: AsyncStream<AVAudioPCMBuffer>
+        switch micBind {
+        case .success(let stream):
+            micStream = stream
+        case .failure(let bindError):
+            var name: String?
+            if let targetMicID { name = await MicCapture.deviceName(for: targetMicID) }
+            let msg = Self.micBindFailureText(error: bindError, deviceName: name)
+            diagLog("[ENGINE-3-FAIL] mic capture failed at start: \(msg)")
+            lastError = msg
+            // A timed-out/wedged bind must NOT be touched — the abandoned-op
+            // handler owns its teardown, and a fallback retry against another
+            // device would only queue behind the same wedge (the system
+            // default usually IS the wedged device). Only a clean setup
+            // failure gets the normal stop.
+            if case .setupFailed = bindError {
+                await micCapture.stop()
+            }
             // No audio was ever delivered — remove the just-provisioned mic
             // artifacts (header-only WAV + sidecar) so they don't accumulate as
             // sub-threshold junk the orphan scanner can never surface.
@@ -361,8 +386,8 @@ final class TranscriptionEngine {
         // just started instead of leaving a headless recording.
         guard isRunning else {
             diagLog("[ENGINE-4-ABORT] stopped during capture bring-up — unwinding")
-            micCapture.stop()
-            systemDeviceCapture.stop()
+            await micCapture.stop()
+            await systemDeviceCapture.stop()
             await systemCapture.stop()
             assetStatus = "Ready"
             return
@@ -562,6 +587,80 @@ final class TranscriptionEngine {
         }
     }
 
+    /// User-facing text for a failed mic bind. The timed-out/wedged cases are
+    /// the 2026-07-25 hang fix: specific and actionable, because the failure
+    /// is almost always a driver still starting up — and deliberately NOT
+    /// retried against the system default (Part C of the spec): when the
+    /// wedge is driver-wide, the default IS the wedged device.
+    nonisolated static func micBindFailureText(error: CaptureBindError, deviceName: String?) -> String {
+        switch error {
+        case .setupFailed(let message):
+            return message
+        case .timedOut, .halWedged:
+            let name = deviceName.map { "\u{201C}\($0)\u{201D}" } ?? "The selected microphone"
+            return "\(name) isn't responding — its driver may still be starting up. Try again in a few seconds."
+        }
+    }
+
+    /// Pure policy (2026-07-25 hang spec, Part C): after a failed mic bind,
+    /// may we retry once against the system default? Only for a clean setup
+    /// failure. A timed-out or wedged bind means the HAL itself is stuck —
+    /// the system default is usually the SAME wedged device, and a retry
+    /// would just queue behind the block and time out too.
+    nonisolated static func shouldAttemptDefaultFallback(after error: CaptureBindError) -> Bool {
+        if case .setupFailed = error { return true }
+        return false
+    }
+
+    /// Diagnostic detail for a failed device-leg bind (the user-facing story
+    /// there is the SCK fallback banner, so this only feeds `lastError`/logs).
+    nonisolated static func bindFailureDetail(_ error: CaptureBindError) -> String {
+        switch error {
+        case .setupFailed(let message):
+            return message
+        case .timedOut:
+            return "the device didn't respond within the bind deadline (its driver may still be starting up)"
+        case .halWedged:
+            return "the audio system is still waiting on an earlier unresponsive device call"
+        }
+    }
+
+    /// User-facing text for a mic that is delivering exact digital zeros,
+    /// routed on the feeder verdict. Unfed is a certainty (known mixer device,
+    /// mixer not running) and says exactly what to do; anything else keeps the
+    /// hedged wording. Pure so the wording is unit-testable.
+    nonisolated static func micSilenceText(deviceName: String?, verdict: FeederVerdict) -> String {
+        let name = deviceName ?? "The selected microphone"
+        switch verdict {
+        case .unfed(let mixer):
+            return "\(mixer) isn't running — your microphone \u{201C}\(name)\u{201D} is one of its devices and has nothing feeding it. Launch \(mixer), or pick a different microphone in Settings."
+        case .fed, .unknown:
+            return "\(name) is delivering silence — it may be muted, or the app that provides it (e.g. Wave Link) may not be running."
+        }
+    }
+
+    /// The neutral hint for a muted-but-fed mic. Never routed to `lastError`.
+    nonisolated static let micSilenceHintText = "Microphone is muted or silent."
+
+    /// Device-leg counterpart of `micSilenceText`, same routing rule.
+    nonisolated static func systemDeviceSilenceText(deviceName: String?, verdict: FeederVerdict) -> String {
+        let name = deviceName.map { "\u{201C}\($0)\u{201D}" } ?? "The selected call audio device"
+        switch verdict {
+        case .unfed(let mixer):
+            return "\(mixer) isn't running — call audio device \(name) is registered but unfed. Launch \(mixer) to capture the call."
+        case .fed, .unknown:
+            return "Call audio device \(name) is delivering silence. The app that provides it (e.g. Wave Link) may not be running, or the mix may be empty."
+        }
+    }
+
+    /// Feeder verdict for a device, judged against the live process table.
+    private func feederVerdict(forDeviceName name: String?) -> FeederVerdict {
+        FeederDetection.verdict(
+            deviceName: name,
+            runningBundleIDs: MixerLeanInPrompt.runningApplicationBundleIDs()
+        )
+    }
+
     /// Bring the system ("Them") leg up for the current session and return its
     /// buffer stream, or nil if no leg could be established. Used by both
     /// `start()` and `restartSystemAudioLeg`, so a rebuild re-resolves the source
@@ -571,21 +670,22 @@ final class TranscriptionEngine {
     private func bringUpSystemLeg(recordingContext: SessionRecordingContext?) async -> AsyncStream<AVAudioPCMBuffer>? {
         let resolution = Self.resolveSystemSource(
             uid: activeSystemSourceUID,
-            resolvedDeviceID: MicCapture.deviceID(forUID: activeSystemSourceUID),
+            resolvedDeviceID: await MicCapture.deviceID(forUID: activeSystemSourceUID),
             micDeviceID: currentMicDeviceID
         )
         switch resolution {
         case .device(let deviceID):
-            if let stream = startDeviceSystemLeg(deviceID: deviceID, recordingContext: recordingContext) {
+            if let stream = await startDeviceSystemLeg(deviceID: deviceID, recordingContext: recordingContext) {
                 return stream
             }
             // A bind failure fails the LEG, not the session (same as an SCK
             // bring-up failure today): report it and try automatic mode so the
-            // far end is still captured.
-            reportSystemSourceFallback(reason: .bindFailed, deviceID: deviceID)
+            // far end is still captured. This holds for a timed-out bind too —
+            // SCK touches no HAL input device, so it is unaffected by a wedge.
+            await reportSystemSourceFallback(reason: .bindFailed, deviceID: deviceID)
             return await startSCKSystemLeg(recordingContext: recordingContext)
         case .sckFallback(let reason):
-            reportSystemSourceFallback(reason: reason, deviceID: nil)
+            await reportSystemSourceFallback(reason: reason, deviceID: nil)
             return await startSCKSystemLeg(recordingContext: recordingContext)
         case .sck:
             return await startSCKSystemLeg(recordingContext: recordingContext)
@@ -599,8 +699,8 @@ final class TranscriptionEngine {
     private func startDeviceSystemLeg(
         deviceID: AudioDeviceID,
         recordingContext: SessionRecordingContext?
-    ) -> AsyncStream<AVAudioPCMBuffer>? {
-        let name = MicCapture.deviceName(for: deviceID) ?? "?"
+    ) async -> AsyncStream<AVAudioPCMBuffer>? {
+        let name = await MicCapture.deviceName(for: deviceID) ?? "?"
         diagLog("[ENGINE-4] starting call-audio capture from input device \(deviceID) \"\(name)\"")
 
         // Same path the SCK leg writes, so PostProcessingJob, retention mixing,
@@ -624,12 +724,20 @@ final class TranscriptionEngine {
             Task { @MainActor in self?.scheduleSystemDeviceRebuild(reason: "engine configuration change") }
         }
 
-        let stream = systemDeviceCapture.bufferStream(deviceID: deviceID, recordOutputURL: bufferURL)
-        if let error = systemDeviceCapture.captureError {
-            let msg = "Call audio device failed: \(error)"
+        let bind = await systemDeviceCapture.bufferStream(deviceID: deviceID, recordOutputURL: bufferURL)
+        let stream: AsyncStream<AVAudioPCMBuffer>
+        switch bind {
+        case .success(let boundStream):
+            stream = boundStream
+        case .failure(let bindError):
+            let msg = "Call audio device failed: \(Self.bindFailureDetail(bindError))"
             diagLog("[ENGINE-5-FAIL] \(msg)")
             lastError = msg
-            systemDeviceCapture.stop()
+            // Timed-out/wedged binds belong to the abandoned-op handler; only
+            // a clean setup failure gets the normal teardown.
+            if case .setupFailed = bindError {
+                await systemDeviceCapture.stop()
+            }
             return nil
         }
 
@@ -692,9 +800,14 @@ final class TranscriptionEngine {
     /// same discipline as `reportMicFallback` — a session recording from the
     /// "wrong" source must never be silent (the 2026-07-24 Part D lesson).
     @MainActor
-    private func reportSystemSourceFallback(reason: SystemSourceFallbackReason, deviceID: AudioDeviceID?) {
-        let name = deviceID.flatMap(MicCapture.deviceName(for:))
-            ?? MicCapture.deviceID(forUID: activeSystemSourceUID).flatMap(MicCapture.deviceName(for:))
+    private func reportSystemSourceFallback(reason: SystemSourceFallbackReason, deviceID: AudioDeviceID?) async {
+        var name: String?
+        if let deviceID {
+            name = await MicCapture.deviceName(for: deviceID)
+        }
+        if name == nil, let resolved = await MicCapture.deviceID(forUID: activeSystemSourceUID) {
+            name = await MicCapture.deviceName(for: resolved)
+        }
         let msg = Self.systemSourceFallbackText(reason: reason, deviceName: name)
         guard systemSourceFallbackMessage != msg else { return }
         let isFirst = systemSourceFallbackMessage == nil
@@ -723,32 +836,51 @@ final class TranscriptionEngine {
     /// PRIMARY failure detector: a mixer's virtual device stays registered in
     /// CoreAudio while its app is closed and then delivers pure digital zeros, so
     /// nothing else — not the delivery gates, not the stall watchdog — can tell
-    /// "unfed mix" from "quiet call". Any live channel on a mix bus has a
-    /// non-zero noise floor; exact zeros mean unfed. 5s (vs. the mic's 8s)
-    /// because an empty mix is a configuration error the user should hear about
-    /// immediately, not a transient.
+    /// "unfed mix" from "quiet call". Sample content can't either: a mix
+    /// carrying only app channels (the recommended Transcriber setup) is exact
+    /// zeros until the far end speaks, so every pre-join session used to warn
+    /// at +5s (2026-07-25 false positive). The verdict now comes from the
+    /// process table (`FeederDetection`): known-mixer device with the mixer
+    /// not running = unfed, warned at bind time (0s) with certainty; a fed
+    /// device's zeros are a quiet call and never warn; only devices we can't
+    /// attribute wait out the 5s deadline and keep the hedged wording.
     private func armSystemDeviceDigitalSilenceCheck(deviceID: AudioDeviceID) {
         systemDeviceSilenceCheckTask?.cancel()
+        systemDeviceQuietLogged = false
         let generation = sessionGeneration
         systemDeviceSilenceCheckTask = Task { [weak self] in
+            // Bind-time feeder check: an unfed device is detectable NOW,
+            // before any audio arrives. Fed/unknown must wait for the
+            // deadline — silence isn't evidence yet.
+            if let self {
+                let name = await MicCapture.deviceName(for: deviceID)
+                if case .unfed = self.feederVerdict(forDeviceName: name) {
+                    await self.routeSystemDeviceSilence(deviceID: deviceID)
+                }
+            }
             try? await Task.sleep(for: .seconds(5))
             guard !Task.isCancelled, let self else { return }
             guard generation == self.sessionGeneration, self.isRunning else { return }
-            guard self.systemSourceMode.isDevice else { return }
-            guard self.systemDeviceCapture.firstSampleTime != nil,
-                  !self.systemDeviceCapture.sawNonzeroSample else {
-                // Healthy, or not delivering at all (the delivery gates own that).
+            guard self.systemSourceMode.isDevice else {
                 self.clearSystemDeviceSilenceWarning()
                 return
             }
-            let name = MicCapture.deviceName(for: deviceID) ?? "The selected call audio device"
-            let msg = "Call audio device \u{201C}\(name)\u{201D} is delivering silence. The app that provides it (e.g. Wave Link) may not be running, or the mix may be empty."
-            diagLog("[SYS-DEVICE-SILENCE] \(msg)")
-            self.systemDeviceSilenceMessage = msg
-            self.lastError = msg
-            Task { await NotificationPresenter.shared.postSystemSourceSilence(detail: msg) }
-            // Monitor for recovery so the banner doesn't outlive the condition
-            // (the user launches Wave Link, or unmutes the mix's channels).
+            if self.systemDeviceCapture.sawNonzeroSample {
+                // Healthy — also retires a bind-time unfed warning that healed
+                // (the mixer launched inside the window).
+                self.clearSystemDeviceSilenceWarning()
+                return
+            }
+            if self.systemDeviceCapture.firstSampleTime == nil, self.systemDeviceSilenceMessage == nil {
+                // Not delivering at all — the delivery gates own that. (With an
+                // unfed warning posted, keep it: it explains WHY nothing flows.)
+                self.clearSystemDeviceSilenceWarning()
+                return
+            }
+            await self.routeSystemDeviceSilence(deviceID: deviceID)
+            // Monitor: real audio clears everything; otherwise re-evaluate the
+            // feeder each tick, so a mixer quitting mid-call warns within ~5s
+            // and a relaunch retires the warning.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 guard generation == self.sessionGeneration, self.isRunning else { return }
@@ -763,7 +895,37 @@ final class TranscriptionEngine {
                     self.clearSystemDeviceSilenceWarning()
                     return
                 }
+                await self.routeSystemDeviceSilence(deviceID: deviceID)
             }
+        }
+    }
+
+    /// True once the fed-but-quiet state has been diag-logged this arming —
+    /// the monitor re-routes every 5s and must not spam the log store.
+    private var systemDeviceQuietLogged = false
+
+    /// Post whatever the current feeder verdict calls for, idempotently.
+    /// `.fed` + zeros is a quiet call — normal, never a banner; it also
+    /// retires an unfed warning whose mixer has come back.
+    private func routeSystemDeviceSilence(deviceID: AudioDeviceID) async {
+        let name = await MicCapture.deviceName(for: deviceID)
+        let verdict = feederVerdict(forDeviceName: name)
+        switch verdict {
+        case .fed:
+            if systemDeviceSilenceMessage != nil {
+                diagLog("[SYS-DEVICE-SILENCE] feeder is running again — retiring the unfed warning")
+                clearSystemDeviceSilenceWarning()
+            } else if !systemDeviceQuietLogged {
+                systemDeviceQuietLogged = true
+                diagLog("[SYS-DEVICE-SILENCE] digital zeros with the mixer running — quiet call, no warning")
+            }
+        case .unfed, .unknown:
+            let msg = Self.systemDeviceSilenceText(deviceName: name, verdict: verdict)
+            guard systemDeviceSilenceMessage != msg else { return }
+            diagLog("[SYS-DEVICE-SILENCE] \(msg)")
+            systemDeviceSilenceMessage = msg
+            lastError = msg
+            Task { await NotificationPresenter.shared.postSystemSourceSilence(detail: msg) }
         }
     }
 
@@ -884,7 +1046,7 @@ final class TranscriptionEngine {
         // device returned → device). Stopping an already-stopped capture is a
         // cheap no-op.
         await systemCapture.stop()
-        systemDeviceCapture.stop()
+        await systemDeviceCapture.stop()
         guard generation == sessionGeneration, isRunning else { return }
 
         // Device-mode rebuilds re-enter `bufferStream` with the SAME
@@ -896,7 +1058,7 @@ final class TranscriptionEngine {
             // Unwind the capture we just started so it can't leak an SCStream
             // and an orphaned $TMPDIR WAV into whatever session runs next.
             await systemCapture.stop()
-            systemDeviceCapture.stop()
+            await systemDeviceCapture.stop()
             return
         }
         guard let stream else {
@@ -1003,7 +1165,7 @@ final class TranscriptionEngine {
                 // `silent: true` also suppresses the bind-failure fallback's
                 // postCaptureStall/lastError — a failed silent retry leaves the
                 // rescue to the stall watchdog rather than alarming the user.
-                self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true, silent: true)
+                Task { await self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true, silent: true) }
             }
         }
     }
@@ -1012,9 +1174,11 @@ final class TranscriptionEngine {
     /// the user's selection. Banner (via `micFallbackMessage`) + one notification
     /// — the Tome window is typically hidden behind the meeting app when this
     /// matters. Guarded against re-posting on every watchdog retry.
-    private func reportMicFallback(boundDeviceID: AudioDeviceID?) {
+    private func reportMicFallback(boundDeviceID: AudioDeviceID?) async {
         guard micFallbackMessage == nil else { return }
-        let actual = boundDeviceID.flatMap(MicCapture.deviceName(for:)) ?? "the system default microphone"
+        var boundName: String?
+        if let boundDeviceID { boundName = await MicCapture.deviceName(for: boundDeviceID) }
+        let actual = boundName ?? "the system default microphone"
         let msg = "Selected mic unavailable — recording from \(actual). Your Settings choice is unchanged."
         micFallbackMessage = msg
         diagLog("[MIC-FALLBACK] \(msg)")
@@ -1030,33 +1194,47 @@ final class TranscriptionEngine {
         diagLog("[MIC-FALLBACK] cleared — capture is back on the selected device")
     }
 
-    /// One-shot at +8s, then a monitor: if the mic tap is DELIVERING buffers but
-    /// every sample so far is exactly zero, warn — a real mic's noise floor is
-    /// never exact zeros, so this is an unfed virtual device (its router app not
-    /// running; the device stays enumerable regardless) or a hard-muted input.
-    /// Distinct from the delivery gates/watchdog, which cannot see this: the
-    /// stream is alive, its content is empty. The monitor clears the warning if
-    /// real audio arrives later (user unmutes, router app launches).
+    /// One-shot at +8s, then a monitor: if the mic tap is DELIVERING buffers
+    /// but every sample so far is exactly zero, decide what that means — and
+    /// exact zeros alone are NOT a fault (2026-07-25 false positive: a Wave
+    /// Link mute renders exact zeros into a fed mic mix, so "muted at the top
+    /// of a call" red-bannered a healthy session at +8s). Routing is by
+    /// feeder verdict: a known mixer's device with the mixer not running is
+    /// unfed — warned at bind time (0s), no zeros needed as proof; a fed
+    /// device's zeros are a muted mic — neutral hint, never `lastError`;
+    /// only unattributable devices keep the old hedged warning at the
+    /// deadline. The monitor clears everything when real audio arrives, and
+    /// re-evaluates the feeder each tick so a mixer quitting mid-session
+    /// escalates the hint to a warning (and a relaunch softens it back).
     private func armMicDigitalSilenceCheck() {
         micSilenceCheckTask?.cancel()
         let generation = sessionGeneration
         micSilenceCheckTask = Task { [weak self] in
+            // Bind-time feeder check: unfed is knowable NOW, from the process
+            // table. Fed/unknown wait — silence isn't evidence yet.
+            if let self {
+                let name = await MicCapture.deviceName(for: self.currentMicDeviceID)
+                let verdict = self.feederVerdict(forDeviceName: name)
+                if case .unfed = verdict {
+                    self.postMicSilenceWarning(Self.micSilenceText(deviceName: name, verdict: verdict))
+                }
+            }
             try? await Task.sleep(for: .seconds(8))
             guard !Task.isCancelled, let self else { return }
             guard generation == self.sessionGeneration, self.isRunning else { return }
-            guard self.micCapture.firstSampleTime != nil, !self.micCapture.sawNonzeroSample else {
-                // Healthy (or not yet delivering — the delivery gates own that).
-                // A previous device's still-posted warning is stale now.
+            if self.micCapture.sawNonzeroSample {
+                // Healthy — retires a bind-time unfed warning that healed, and
+                // a previous device's still-posted warning is stale now too.
                 self.clearMicSilenceWarning()
                 return
             }
-            let name = MicCapture.deviceName(for: self.currentMicDeviceID) ?? "The selected microphone"
-            let msg = "\(name) is delivering silence — it may be muted, or the app that provides it (e.g. Wave Link) may not be running."
-            diagLog("[MIC-SILENCE] \(msg)")
-            self.micSilenceMessage = msg
-            self.lastError = msg
-            Task { await NotificationPresenter.shared.postMicDigitalSilence(detail: msg) }
-            // Monitor for recovery so the banner doesn't outlive the condition.
+            if self.micCapture.firstSampleTime == nil, self.micSilenceMessage == nil {
+                // Not delivering at all — the delivery gates own that. (With an
+                // unfed warning posted, keep it: it explains WHY nothing flows.)
+                self.clearMicSilenceWarning()
+                return
+            }
+            await self.routeMicSilence()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 guard generation == self.sessionGeneration, self.isRunning else { return }
@@ -1065,8 +1243,45 @@ final class TranscriptionEngine {
                     self.clearMicSilenceWarning()
                     return
                 }
+                await self.routeMicSilence()
             }
         }
+    }
+
+    /// Post whatever the current feeder verdict calls for, idempotently —
+    /// called at the deadline and on every monitor tick while zeros persist.
+    private func routeMicSilence() async {
+        let name = await MicCapture.deviceName(for: currentMicDeviceID)
+        let verdict = feederVerdict(forDeviceName: name)
+        switch verdict {
+        case .fed:
+            postMicSilenceHint()
+        case .unfed, .unknown:
+            postMicSilenceWarning(Self.micSilenceText(deviceName: name, verdict: verdict))
+        }
+    }
+
+    private func postMicSilenceWarning(_ msg: String) {
+        micSilenceHintMessage = nil
+        guard micSilenceMessage != msg else { return }
+        diagLog("[MIC-SILENCE] \(msg)")
+        micSilenceMessage = msg
+        lastError = msg
+        Task { await NotificationPresenter.shared.postMicDigitalSilence(detail: msg) }
+    }
+
+    /// The fed-but-zeros state: the mic is muted, which is user intent, not a
+    /// fault. Neutral gray line, no `lastError`, no notification. Softens a
+    /// prior unfed warning whose mixer has come back but stays muted.
+    private func postMicSilenceHint() {
+        if let msg = micSilenceMessage {
+            micSilenceMessage = nil
+            if lastError == msg { lastError = nil }
+            NotificationPresenter.shared.clearMicDigitalSilence()
+        }
+        guard micSilenceHintMessage == nil else { return }
+        micSilenceHintMessage = Self.micSilenceHintText
+        diagLog("[MIC-SILENCE] digital zeros with the mic's feeder running — muted mic, neutral hint only")
     }
 
     /// The exact message posted by the digital-silence check, so the clear path
@@ -1075,6 +1290,7 @@ final class TranscriptionEngine {
     private var micSilenceMessage: String?
 
     private func clearMicSilenceWarning() {
+        micSilenceHintMessage = nil
         guard let msg = micSilenceMessage else { return }
         micSilenceMessage = nil
         if lastError == msg { lastError = nil }
@@ -1144,7 +1360,7 @@ final class TranscriptionEngine {
             self.recentMicRebuilds.append(now)
 
             diagLog("[ENGINE-MIC-REBUILD] \(reason) — restarting mic on current selection")
-            self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true)
+            await self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true)
         }
     }
 
@@ -1163,7 +1379,7 @@ final class TranscriptionEngine {
     /// recursive fallback restart inside a silent attempt stays silent. The
     /// RESULTING fallback state (recording off a non-selected device) is surfaced
     /// even for silent attempts — only the attempt error is quiet, never the outcome.
-    func restartMic(inputDeviceUID: String, force: Bool = false, updateSelection: Bool = true, silent: Bool = false) {
+    func restartMic(inputDeviceUID: String, force: Bool = false, updateSelection: Bool = true, silent: Bool = false) async {
         guard isRunning, let vadManager else { return }
 
         // Only update user selection when explicitly changed (not from OS listener,
@@ -1173,14 +1389,14 @@ final class TranscriptionEngine {
         }
         let targetMicID: AudioDeviceID
         if inputDeviceUID.isEmpty {
-            targetMicID = MicCapture.defaultInputDeviceID() ?? 0
-        } else if let resolved = MicCapture.deviceID(forUID: inputDeviceUID) {
+            targetMicID = await MicCapture.defaultInputDeviceID() ?? 0
+        } else if let resolved = await MicCapture.deviceID(forUID: inputDeviceUID) {
             targetMicID = resolved
         } else {
             // Selected device absent right now: bind the default for this
             // attempt. The fallback banner is raised by the reconciliation at
             // the end of the successful bind below.
-            targetMicID = MicCapture.defaultInputDeviceID() ?? 0
+            targetMicID = await MicCapture.defaultInputDeviceID() ?? 0
         }
         guard force || targetMicID != currentMicDeviceID else {
             diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
@@ -1196,22 +1412,43 @@ final class TranscriptionEngine {
         // Tear down old mic
         micTask?.cancel()
         micTask = nil
-        micCapture.stop()
+        // Staleness token for the awaits below (stop + bind both suspend now):
+        // a session stop, or a stop-then-quick-restart, must not let this
+        // restart resurrect capture for a session that no longer exists.
+        let generation = sessionGeneration
+        await micCapture.stop()
+
+        guard generation == sessionGeneration, isRunning else {
+            diagLog("[ENGINE-MIC-SWAP-ABORT] session changed during mic teardown — abandoning restart")
+            return
+        }
 
         currentMicDeviceID = targetMicID
 
         // Start new mic stream. The retention writer reopens in `.append` mode at
         // the same path, so the pre-swap audio is preserved (see MicCapture).
-        let micStream = micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
+        let micBind = await micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
-        // Setup failures are synchronous (see start()) — a failed restart means the
-        // user's side is NOT being recorded. Surface loudly, and try ONE fallback
-        // to the system default before giving up: a specific device refusing to
+        guard generation == sessionGeneration, isRunning else {
+            diagLog("[ENGINE-MIC-SWAP-ABORT] session changed during mic bind — unwinding")
+            await micCapture.stop()
+            return
+        }
+
+        // A failed restart means the user's side is NOT being recorded.
+        // Surface loudly, and for a clean setup failure try ONE fallback to
+        // the system default before giving up: a specific device refusing to
         // bind (HAL 'nope' during a Bluetooth transition, a stale id) shouldn't
-        // leave the mic dead when another input would work. The watchdog keeps
-        // monitoring either way.
-        if let micError = micCapture.captureError {
-            let msg = "Mic restart failed: \(micError)"
+        // leave the mic dead when another input would work. A timed-out or
+        // wedged bind gets NO fallback (2026-07-25 spec, Part C): the default
+        // is usually the same wedged device, and the retry would only queue
+        // behind the block. The watchdog keeps monitoring either way.
+        let micStream: AsyncStream<AVAudioPCMBuffer>
+        switch micBind {
+        case .success(let stream):
+            micStream = stream
+        case .failure(let bindError):
+            let msg = "Mic restart failed: \(Self.bindFailureDetail(bindError))"
             if silent {
                 // Startup-gate fast retry: no user-facing alarm for this attempt.
                 // If the mic truly never binds, the stall watchdog owns the rescue.
@@ -1221,10 +1458,11 @@ final class TranscriptionEngine {
                 diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
                 Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
             }
-            if targetMicID != 0,
-               let fallback = MicCapture.defaultInputDeviceID(), fallback != targetMicID {
+            if Self.shouldAttemptDefaultFallback(after: bindError),
+               targetMicID != 0,
+               let fallback = await MicCapture.defaultInputDeviceID(), fallback != targetMicID {
                 diagLog("[ENGINE-MIC-SWAP] falling back to system default input (\(fallback)) — user selection preserved")
-                restartMic(inputDeviceUID: "", force: true, updateSelection: false, silent: silent)
+                await restartMic(inputDeviceUID: "", force: true, updateSelection: false, silent: silent)
             }
             return
         }
@@ -1263,10 +1501,10 @@ final class TranscriptionEngine {
         // the SUCCESS path only — a failed bind changed nothing.
         if Self.isMicFallbackActive(
             selectedUID: userSelectedDeviceUID,
-            selectionResolvesTo: MicCapture.deviceID(forUID: userSelectedDeviceUID),
+            selectionResolvesTo: await MicCapture.deviceID(forUID: userSelectedDeviceUID),
             boundDeviceID: targetMicID
         ) {
-            reportMicFallback(boundDeviceID: targetMicID)
+            await reportMicFallback(boundDeviceID: targetMicID)
         } else {
             clearMicFallback()
         }
@@ -1290,7 +1528,7 @@ final class TranscriptionEngine {
             Task { @MainActor in
                 guard self.isRunning, self.userSelectedDeviceUID.isEmpty else { return }
                 // User has "System Default" selected — follow the OS default
-                self.restartMic(inputDeviceUID: "")
+                await self.restartMic(inputDeviceUID: "")
             }
         }
         defaultDeviceListenerBlock = block
@@ -1358,6 +1596,7 @@ final class TranscriptionEngine {
         micSilenceCheckTask?.cancel()
         micSilenceCheckTask = nil
         micSilenceMessage = nil
+        micSilenceHintMessage = nil
         micFallbackMessage = nil
         systemDeviceSilenceCheckTask?.cancel()
         systemDeviceSilenceCheckTask = nil
@@ -1395,8 +1634,8 @@ final class TranscriptionEngine {
         // snapshot) still need to know which leg's counters to read. The next
         // `start()` resets it.
         await systemCapture.stop()
-        systemDeviceCapture.stop()
-        micCapture.stop()
+        await systemDeviceCapture.stop()
+        await micCapture.stop()
         await drainTranscriberTasks()
         micTask = nil
         // A startup-gate rebuild racing this stop could have swapped in a NEW
@@ -1630,10 +1869,10 @@ final class TranscriptionEngine {
                         self.lastError = msg
                         Task { await NotificationPresenter.shared.postCaptureStall(leg: "Microphone", detail: msg) }
                         self.userSelectedDeviceUID = ""
-                        self.restartMic(inputDeviceUID: "", force: true)
+                        Task { await self.restartMic(inputDeviceUID: "", force: true) }
                     } else if restart {
                         diagLog("[WATCHDOG] attempting automatic mic restart")
-                        self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true)
+                        Task { await self.restartMic(inputDeviceUID: self.userSelectedDeviceUID, force: true) }
                     }
                 }
             }

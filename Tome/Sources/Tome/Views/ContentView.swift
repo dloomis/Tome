@@ -120,6 +120,7 @@ struct ContentView: View {
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
                 warningMessage: captureWarningMessage,
+                hintMessage: transcriptionEngine?.micSilenceHintMessage,
                 modelStatus: modelStatusText,
                 canStartRecording: services.modelProvisioner.canStartRecording,
                 onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
@@ -334,7 +335,7 @@ struct ContentView: View {
         }
         .onChange(of: settings.inputDeviceUID) {
             if isRunning {
-                transcriptionEngine?.restartMic(inputDeviceUID: settings.inputDeviceUID)
+                Task { await transcriptionEngine?.restartMic(inputDeviceUID: settings.inputDeviceUID) }
             }
         }
         .onChange(of: transcriptStore.utterances.count as Int) {

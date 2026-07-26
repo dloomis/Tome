@@ -222,18 +222,22 @@ final class AppSettings {
         // legacy raw-AudioDeviceID key (resolvable only if that device happens
         // to be present right now — otherwise fall back to system default,
         // which is what the old boot sanitizer would have done anyway).
-        let migratedSelection = Self.migratedInputSelection(
-            storedUID: defaults.string(forKey: "inputDeviceUID"),
-            storedName: defaults.string(forKey: "inputDeviceName"),
-            legacyID: AudioDeviceID(defaults.integer(forKey: "inputDeviceID")),
-            resolveUID: MicCapture.deviceUID(for:),
-            resolveName: MicCapture.deviceName(for:)
-        )
-        self.inputDeviceUID = migratedSelection.uid
-        self.inputDeviceName = migratedSelection.name
-        defaults.set(migratedSelection.uid, forKey: "inputDeviceUID")
-        defaults.set(migratedSelection.name, forKey: "inputDeviceName")
-        defaults.removeObject(forKey: "inputDeviceID")
+        //
+        // The stored-UID path touches no HAL. The legacy resolution DOES
+        // (device UID/name property reads), and this init runs during app
+        // launch, before any window exists — a wedged audio driver here used
+        // to block launch entirely (2026-07-25 hang spec, Part D). Resolve the
+        // legacy ID after launch, on the HAL queue, and persist then.
+        let pendingLegacyMicID: AudioDeviceID?
+        if let storedUID = defaults.string(forKey: "inputDeviceUID") {
+            self.inputDeviceUID = storedUID
+            self.inputDeviceName = defaults.string(forKey: "inputDeviceName") ?? ""
+            pendingLegacyMicID = nil
+        } else {
+            self.inputDeviceUID = ""
+            self.inputDeviceName = ""
+            pendingLegacyMicID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
+        }
 
         // Call-audio source: "" (automatic / SCK) on a fresh install.
         self.systemAudioSourceUID = defaults.string(forKey: "systemAudioSourceUID") ?? ""
@@ -276,6 +280,32 @@ final class AppSettings {
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")
+
+        // Legacy mic migration, deferred past init (see the mic-selection
+        // comment above): resolve on the HAL queue, then persist.
+        if let legacyID = pendingLegacyMicID {
+            Task { @MainActor [weak self] in
+                let uid = legacyID != 0 ? await MicCapture.deviceUID(for: legacyID) : nil
+                let name = legacyID != 0 ? await MicCapture.deviceName(for: legacyID) : nil
+                let migrated = Self.migratedInputSelection(
+                    storedUID: nil,
+                    storedName: nil,
+                    legacyID: legacyID,
+                    resolveUID: { _ in uid },
+                    resolveName: { _ in name }
+                )
+                let defaults = UserDefaults.standard
+                if let self {
+                    // didSet persists both keys.
+                    self.inputDeviceUID = migrated.uid
+                    self.inputDeviceName = migrated.name
+                } else {
+                    defaults.set(migrated.uid, forKey: "inputDeviceUID")
+                    defaults.set(migrated.name, forKey: "inputDeviceName")
+                }
+                defaults.removeObject(forKey: "inputDeviceID")
+            }
+        }
     }
 
     // MARK: - Legacy Key Migration

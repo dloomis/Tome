@@ -82,11 +82,15 @@ private final class InputDeviceList {
         mElement: kAudioObjectPropertyElementMain
     )
 
+    /// In-flight (possibly debounced) enumeration. One at a time — a newer
+    /// trigger supersedes an older pending one.
+    private var refreshTask: Task<Void, Never>?
+
     func start() {
-        refresh()
+        refresh(debounced: false)
         guard listenerBlock == nil else { return }
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in self?.refresh(debounced: true) }
         }
         listenerBlock = block
         AudioObjectAddPropertyListenerBlock(
@@ -95,6 +99,8 @@ private final class InputDeviceList {
     }
 
     func stop() {
+        refreshTask?.cancel()
+        refreshTask = nil
         guard let block = listenerBlock else { return }
         AudioObjectRemovePropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &devicesAddress, DispatchQueue.main, block
@@ -102,8 +108,22 @@ private final class InputDeviceList {
         listenerBlock = nil
     }
 
-    private func refresh() {
-        devices = MicCapture.availableInputDevices()
+    /// Enumerate off the main actor (the async overload hops to the HAL queue
+    /// with a deadline — a wedged driver must not freeze the Settings window),
+    /// debounced when triggered by a device-set change notification: a driver
+    /// initializing emits a storm of those, and enumerating on each one both
+    /// hammers the HAL and churns the picker (2026-07-25 hang spec, Part D).
+    private func refresh(debounced: Bool) {
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            if debounced {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+            }
+            let enumerated = await MicCapture.availableInputDevices()
+            guard !Task.isCancelled else { return }
+            self?.devices = enumerated
+        }
     }
 }
 

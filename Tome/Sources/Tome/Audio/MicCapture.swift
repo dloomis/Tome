@@ -4,6 +4,17 @@ import Foundation
 import ObjCExceptionGuard
 import os
 
+/// How a capture bind failed. `setupFailed` is the classic synchronous
+/// failure (no HAL input, device-set error, tap format exception, start
+/// throw); the other two are the 2026-07-25 hang fix — the bind never
+/// returned within the deadline, or wasn't attempted because an earlier
+/// HAL call is still stuck.
+enum CaptureBindError: Error, Equatable {
+    case setupFailed(String)
+    case timedOut
+    case halWedged
+}
+
 final class MicCapture: @unchecked Sendable {
     /// Crash-resilient WAV writer retaining the mic track, plus (when a
     /// mid-session mic restart attached a device with a different native
@@ -19,8 +30,8 @@ final class MicCapture: @unchecked Sendable {
     /// device reporting the previous device's format (observed: all inputs stuck at
     /// AirPods-HFP 24 kHz / 3 ch after one AirPods session, so no device could
     /// record until app relaunch). A fresh engine re-reads the real format each
-    /// time. Only touched from the main actor (TranscriptionEngine), like the rest
-    /// of this class's mutable state.
+    /// time. Only touched from the HAL queue (2026-07-25 hang fix — bind and
+    /// teardown both run there; the main actor must never wait on a HAL call).
     private var engine = AVAudioEngine()
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
@@ -102,6 +113,21 @@ final class MicCapture: @unchecked Sendable {
         }
     }
 
+    /// Engines whose HAL call timed out are parked for the PROCESS LIFETIME —
+    /// no 15s release. There is no upper bound on when a wedged driver lets go
+    /// of its references, so deallocating one of these risks the same
+    /// use-after-free `retire(_:)` guards against, with unbounded exposure.
+    /// The cost is one dead AVAudioEngine per wedge incident — negligible.
+    private static let permanentlyRetired = OSAllocatedUnfairLock<[AVAudioEngine]>(uncheckedState: [])
+
+    private static func retireForever(_ old: AVAudioEngine) {
+        let count = permanentlyRetired.withLock { retired -> Int in
+            retired.append(old)
+            return retired.count
+        }
+        diagLog("[MIC-RETIRE] parked a timed-out engine for the process lifetime (\(count) total)")
+    }
+
     /// Fired when the running engine posts `AVAudioEngineConfigurationChange` —
     /// Apple's contract is that the engine STOPS on audio-route/graph changes
     /// (Bluetooth connect, HFP↔A2DP renegotiation, device unplug) and the app
@@ -139,10 +165,10 @@ final class MicCapture: @unchecked Sendable {
     /// Stored so we can remove it in `stop()` and before re-registering on a
     /// rebuild (bufferStream is re-entered on rebuild). Mirrors the
     /// default-device-listener add/remove pattern in TranscriptionEngine. Held as
-    /// a plain property (not a lock) because — like the rest of this class's
-    /// mutable state — it is only touched from the main actor (register in
-    /// `bufferStream`, remove in `stop()`), and `AudioObjectPropertyListenerBlock`
-    /// is non-Sendable so it can't cross a lock's `@Sendable` closure boundary.
+    /// a plain property (not a lock) because — like `engine` — it is only
+    /// touched from the HAL queue (register in the bind, remove in the stop
+    /// teardown), and `AudioObjectPropertyListenerBlock` is non-Sendable so it
+    /// can't cross a lock's `@Sendable` closure boundary.
     private var _halListener: (block: AudioObjectPropertyListenerBlock, deviceID: AudioDeviceID)?
 
     /// The property selectors we watch on the resolved device. NominalSampleRate
@@ -220,12 +246,48 @@ final class MicCapture: @unchecked Sendable {
     ///   WAV at this path (float32 mono) for post-session retention. Multi-channel
     ///   devices are downmixed to mono (all channels averaged) so the live mic
     ///   survives regardless of which channel it lands on.
-    func bufferStream(deviceID: AudioDeviceID? = nil, recordOutputURL: URL? = nil) -> AsyncStream<AVAudioPCMBuffer> {
+    ///
+    /// The bring-up runs on the HAL queue with a deadline (2026-07-25 hang
+    /// fix): a driver that wedges `engine.start()` costs the caller a
+    /// `.timedOut` after ~5s instead of freezing its actor forever. A
+    /// timed-out bind is torn down and its engine parked the moment the driver
+    /// releases it (`teardownAbandonedBind`); until then every further HAL
+    /// call fails fast with `.halWedged`.
+    func bufferStream(
+        deviceID: AudioDeviceID? = nil,
+        recordOutputURL: URL? = nil
+    ) async -> Result<AsyncStream<AVAudioPCMBuffer>, CaptureBindError> {
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let outcome = await HALQueue.run(
+            label: "capture-bind",
+            work: { self.performBind(continuation: continuation, deviceID: deviceID, recordOutputURL: recordOutputURL) },
+            onAbandoned: { setupError in
+                self.teardownAbandonedBind(continuation: continuation, setupError: setupError)
+            }
+        )
+        switch outcome {
+        case .completed(nil):
+            return .success(stream)
+        case .completed(let message?):
+            return .failure(.setupFailed(message))
+        case .timedOut:
+            return .failure(.timedOut)
+        case .wedged:
+            return .failure(.halWedged)
+        }
+    }
+
+    /// The entire HAL bring-up. HAL-queue only. Returns nil on success, or the
+    /// failure message (which is also in `captureError`, with the continuation
+    /// already finished — the pre-async contract, unchanged).
+    private func performBind(
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
+        deviceID: AudioDeviceID?,
+        recordOutputURL: URL?
+    ) -> String? {
         let level = _audioLevel
         let errorHolder = _error
-
-        return AsyncStream { continuation in
-            errorHolder.value = nil
+        errorHolder.value = nil
             // Each (re)bind proves itself anew: a mid-session swap onto an unfed
             // virtual device must not inherit the previous device's non-zero flag.
             self._sawNonzeroSample.withLock { $0 = false }
@@ -290,7 +352,7 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-2-FAIL] \(msg)")
                     errorHolder.value = msg
                     continuation.finish()
-                    return
+                    return msg
                 }
                 var devID = id
                 let status = AudioUnitSetProperty(
@@ -310,7 +372,7 @@ final class MicCapture: @unchecked Sendable {
                     diagLog("[MIC-2-FAIL] \(msg)")
                     errorHolder.value = msg
                     continuation.finish()
-                    return
+                    return msg
                 }
             } else {
                 let defID = Self.defaultInputDeviceID()
@@ -332,7 +394,7 @@ final class MicCapture: @unchecked Sendable {
                 diagLog("[MIC-3-FAIL] \(msg)")
                 errorHolder.value = msg
                 continuation.finish()
-                return
+                return msg
             }
 
             guard let tapFormat = Self.makeTapFormat(from: format) else {
@@ -340,7 +402,7 @@ final class MicCapture: @unchecked Sendable {
                 diagLog("[MIC-4-FAIL] \(msg)")
                 errorHolder.value = msg
                 continuation.finish()
-                return
+                return msg
             }
 
             diagLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
@@ -482,7 +544,7 @@ final class MicCapture: @unchecked Sendable {
                     state = nil
                 }
                 continuation.finish()
-                return
+                return msg
             }
 
             diagLog("[MIC-5] tap installed, preparing engine...")
@@ -529,11 +591,23 @@ final class MicCapture: @unchecked Sendable {
                     state = nil
                 }
                 continuation.finish()
+                return msg
             }
-        }
+            return nil
     }
 
-    func stop() {
+    /// Runs on the HAL queue when the driver finally releases a bind whose
+    /// caller stopped waiting. Whatever the bind built must not keep capturing
+    /// into a stream nobody consumes — tear it down NOW (safe: the wedged call
+    /// has returned and this block is serialized behind it), then park the
+    /// engine for the process lifetime. By the time this runs, `HALQueue` has
+    /// already cleared the wedge latch, and any queued bind runs after us on a
+    /// fresh engine.
+    private func teardownAbandonedBind(
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
+        setupError: String?
+    ) {
+        diagLog("[MIC-ABANDON] timed-out bind released by the driver (setup error: \(setupError ?? "none")) — tearing down the abandoned capture")
         removeConfigObserver()
         removeHALListener()
         let teardownException = TomeCatchObjCException {
@@ -541,12 +615,59 @@ final class MicCapture: @unchecked Sendable {
             self.engine.stop()
         }
         if let teardownException {
-            diagLog("[MIC-STOP-WARN] engine teardown raised \(teardownException)")
+            diagLog("[MIC-ABANDON-WARN] teardown raised \(teardownException)")
         }
-        // The tap is gone (no more yields) — finish the stream so the consumer
-        // drains what's buffered and runs its end-of-stream flush. The engine's
-        // stop path awaits that drain; without the finish it would have to
-        // cancel, which drops the tail utterance.
+        Self.retireForever(self.engine)
+        self.engine = AVAudioEngine()
+        continuation.finish()
+        _retentionWriter.withLock { state in
+            state?.writer.close()
+            state = nil
+        }
+        _audioLevel.value = 0
+    }
+
+    func stop() async {
+        // Engine/HAL teardown belongs to the HAL queue: `engine.stop()` on a
+        // wedged device blocks exactly like `engine.start()` does, and it used
+        // to run on the main actor (9 call sites).
+        let outcome = await HALQueue.run(
+            label: "capture-stop",
+            work: {
+                self.removeConfigObserver()
+                self.removeHALListener()
+                let teardownException = TomeCatchObjCException {
+                    self.engine.inputNode.removeTap(onBus: 0)
+                    self.engine.stop()
+                }
+                if let teardownException {
+                    diagLog("[MIC-STOP-WARN] engine teardown raised \(teardownException)")
+                }
+            },
+            onAbandoned: { _ in
+                // The wedged teardown finally finished — the engine object is
+                // stopped, but nothing waited for it. Park it and give the
+                // instance a fresh engine for the next bind.
+                Self.retireForever(self.engine)
+                self.engine = AVAudioEngine()
+            }
+        )
+        switch outcome {
+        case .timedOut:
+            diagLog("[MIC-STOP] teardown wedged past the deadline — stream finish and writer close proceed anyway")
+        case .wedged:
+            // An earlier bind/stop is still stuck; the engine can't be touched.
+            // Its abandonment handler owns the eventual teardown.
+            diagLog("[MIC-STOP] HAL wedged — skipping engine teardown; abandoned-op handler owns it")
+        case .completed:
+            break
+        }
+        // The tap is gone (or its yields land in a finished stream) — finish
+        // the stream so the consumer drains what's buffered and runs its
+        // end-of-stream flush. The engine's stop path awaits that drain;
+        // without the finish it would have to cancel, which drops the tail
+        // utterance. Lock-protected state is safe from any thread — run it
+        // even when the HAL teardown is stuck so the WAV finalizes.
         _streamContinuation.withLock { $0?.finish(); $0 = nil }
         _audioLevel.value = 0
         _lastSampleTime.withLock { $0 = nil }
@@ -730,6 +851,36 @@ final class MicCapture: @unchecked Sendable {
 
         let sampleCount = Float(frameLength * channelCount)
         return sampleCount > 0 ? sqrt(sum / sampleCount) : 0
+    }
+
+    // MARK: - Off-main device enumeration (HAL-queue hopped)
+
+    // Async overloads of the enumeration statics below. Every
+    // `AudioObjectGetPropertyData` can block on a wedged driver, so an actor
+    // context must never call the sync versions directly — these hop onto the
+    // HAL queue with the standard deadline and degrade to nil/[] instead of
+    // freezing the caller. Swift's overload resolution picks these
+    // automatically in async contexts (and requires the `await`); the sync
+    // versions remain for the HAL queue itself (`performBind`) and tests.
+
+    static func availableInputDevices() async -> [(id: AudioDeviceID, uid: String, name: String)] {
+        await HALQueue.enumerate(label: "enumerate-input-devices", fallback: []) { availableInputDevices() }
+    }
+
+    static func deviceName(for deviceID: AudioDeviceID) async -> String? {
+        await HALQueue.enumerate(label: "device-name", fallback: nil) { deviceName(for: deviceID) }
+    }
+
+    static func deviceID(forUID uid: String) async -> AudioDeviceID? {
+        await HALQueue.enumerate(label: "device-for-uid", fallback: nil) { deviceID(forUID: uid) }
+    }
+
+    static func deviceUID(for deviceID: AudioDeviceID) async -> String? {
+        await HALQueue.enumerate(label: "device-uid", fallback: nil) { deviceUID(for: deviceID) }
+    }
+
+    static func defaultInputDeviceID() async -> AudioDeviceID? {
+        await HALQueue.enumerate(label: "default-input-device", fallback: nil) { defaultInputDeviceID() }
     }
 
     // MARK: - List available input devices
