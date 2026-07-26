@@ -51,6 +51,12 @@ final class StreamingTranscriber: @unchecked Sendable {
     /// Flush speech for transcription every ~30 seconds (480,000 samples at 16kHz).
     /// Longer chunks give Parakeet-TDT more context for better accuracy.
     private static let flushInterval = 480_000
+    /// Chunks of lead-in audio kept from before the VAD's speechStart event and
+    /// prepended to the segment. Silero confirms speech only after its onset
+    /// window, so the event chunk begins mid-phoneme — and Parakeet's decode can
+    /// collapse to empty text on a hard-truncated onset (2026-07-26: "Testing
+    /// again." → "" live, → 0.89 confidence with 0.3s of lead-in restored).
+    private static let preRollChunks = 2
 
     /// Main loop: reads audio buffers, runs VAD, transcribes speech segments.
     /// Returns `true` if the loop exited due to fatal (repeated) errors.
@@ -69,6 +75,14 @@ final class StreamingTranscriber: @unchecked Sendable {
         var isSpeaking = false
         var bufferCount = 0
         var consecutiveErrors = 0
+
+        // Ring of the most recent idle chunks, seeded into the segment on
+        // speechStart so the utterance onset the VAD spent confirming isn't
+        // lost. `preRollSeeded` tracks how many seeded samples the current
+        // segment carries, so the ≥8000-sample garbage gate keeps measuring
+        // *speech*, not speech + lead-in.
+        var preRoll: [[Float]] = []
+        var preRollSeeded = 0
 
         // Audio clock for per-line offsets. `baseTime` is the wall-clock of the first
         // received sample (≈ capture start, the same anchor the recording mixer pads
@@ -113,14 +127,18 @@ final class StreamingTranscriber: @unchecked Sendable {
                         case .speechStart:
                             isSpeaking = true
                             speechSamples.removeAll(keepingCapacity: true)
-                            // Speech began somewhere in the chunk just consumed.
-                            segmentStartSample = max(0, consumedSamples - Self.vadChunkSize)
-                            diagLog("[\(self.speaker.rawValue)] speech start")
+                            for lead in preRoll { speechSamples.append(contentsOf: lead) }
+                            preRollSeeded = speechSamples.count
+                            preRoll.removeAll(keepingCapacity: true)
+                            // Speech began somewhere in the chunk just consumed —
+                            // or earlier, inside the retained lead-in.
+                            segmentStartSample = max(0, consumedSamples - Self.vadChunkSize - preRollSeeded)
+                            diagLog("[\(self.speaker.rawValue)] speech start (pre-roll \(preRollSeeded) samples)")
 
                         case .speechEnd:
                             isSpeaking = false
                             diagLog("[\(self.speaker.rawValue)] speech end, samples=\(speechSamples.count)")
-                            if speechSamples.count > 8000 {
+                            if speechSamples.count - preRollSeeded > 8000 {
                                 let segment = speechSamples
                                 let segStart = segmentStartSample
                                 speechSamples.removeAll(keepingCapacity: true)
@@ -131,7 +149,7 @@ final class StreamingTranscriber: @unchecked Sendable {
                                     consecutiveErrors = 0
                                 }
                             } else {
-                                diagLog("[\(self.speaker.rawValue)] dropping short speech-end segment: samples=\(speechSamples.count) (<8000 ≈ 0.5s, Parakeet emits garbage below this threshold)")
+                                diagLog("[\(self.speaker.rawValue)] dropping short speech-end segment: speech samples=\(speechSamples.count - preRollSeeded) (<8000 ≈ 0.5s, Parakeet emits garbage below this threshold)")
                                 speechSamples.removeAll(keepingCapacity: true)
                             }
                         }
@@ -145,6 +163,7 @@ final class StreamingTranscriber: @unchecked Sendable {
                             let segment = speechSamples
                             let segStart = segmentStartSample
                             speechSamples.removeAll(keepingCapacity: true)
+                            preRollSeeded = 0
                             // Next segment of this continuous run starts where this one ended.
                             segmentStartSample = consumedSamples
                             if await !transcribeSegment(segment, startTime: startDate(forSample: segStart)) {
@@ -153,6 +172,11 @@ final class StreamingTranscriber: @unchecked Sendable {
                             } else {
                                 consecutiveErrors = 0
                             }
+                        }
+                    } else {
+                        preRoll.append(chunk)
+                        if preRoll.count > Self.preRollChunks {
+                            preRoll.removeFirst()
                         }
                     }
                 } catch {
@@ -171,11 +195,11 @@ final class StreamingTranscriber: @unchecked Sendable {
         if isSpeaking && !vadBuffer.isEmpty {
             speechSamples.append(contentsOf: vadBuffer)
         }
-        if speechSamples.count > 8000 {
+        if speechSamples.count - preRollSeeded > 8000 {
             diagLog("[\(self.speaker.rawValue)] flushing end-of-stream segment: samples=\(speechSamples.count)")
             _ = await transcribeSegment(speechSamples, startTime: startDate(forSample: segmentStartSample))
         } else if !speechSamples.isEmpty {
-            diagLog("[\(self.speaker.rawValue)] dropping short end-of-stream remnant: samples=\(speechSamples.count) (<8000 ≈ 0.5s)")
+            diagLog("[\(self.speaker.rawValue)] dropping short end-of-stream remnant: speech samples=\(speechSamples.count - preRollSeeded) (<8000 ≈ 0.5s)")
         }
 
         return consecutiveErrors > 10
@@ -186,7 +210,12 @@ final class StreamingTranscriber: @unchecked Sendable {
         do {
             let result = try await asrCoordinator.transcribe(samples: samples, source: audioSource)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return true }
+            guard !text.isEmpty else {
+                // Not an error path, but it IS a dropped utterance — without this
+                // line the segment vanishes with zero trace (2026-07-26 incident).
+                diagLog("[\(self.speaker.rawValue)] ASR returned empty text for \(samples.count)-sample segment (confidence \(result.confidence)) — nothing committed")
+                return true
+            }
             log.info("[\(self.speaker.rawValue)] transcribed: \(text.prefix(80))")
             await onFinal(text, startTime)
             return true

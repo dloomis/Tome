@@ -37,6 +37,9 @@ final actor FakeBackend: @preconcurrency ASRBackend {
     private var unloadGate: CheckedContinuation<Void, Never>?
     private(set) var transcribesStarted = 0
     private(set) var transcribesFinished = 0
+    /// Sample count of every `transcribe(samples:)` call, in order — lets
+    /// segmentation tests assert exactly what audio reached the backend.
+    private(set) var transcribedSampleCounts: [Int] = []
     /// Incremented when unload() begins (before any hang), so a test can poll
     /// for an install being suspended inside this backend's unload().
     private(set) var unloadStarted = 0
@@ -104,6 +107,7 @@ final actor FakeBackend: @preconcurrency ASRBackend {
 
     func transcribe(samples: [Float], language: Language) async throws -> ASRResult {
         transcribesStarted += 1
+        transcribedSampleCounts.append(samples.count)
         if hangTranscribe {
             await withCheckedContinuation { transcribeGate = $0 }
         }

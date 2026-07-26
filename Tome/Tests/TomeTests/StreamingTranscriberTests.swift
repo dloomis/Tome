@@ -126,6 +126,55 @@ private final class UtteranceCollector: @unchecked Sendable {
         #expect(collector.texts.isEmpty)
     }
 
+    /// Silero's speechStart fires only after its onset-confirmation window, so
+    /// the event chunk starts mid-phoneme. The two chunks preceding the event
+    /// must be seeded into the segment — Parakeet can decode a hard-truncated
+    /// onset to empty text (2026-07-26: live "Testing again." lost; the same
+    /// buffer with lead-in restored transcribed at 0.89 confidence).
+    @Test func preRollChunksBeforeSpeechStartAreSeededIntoSegment() async throws {
+        let collector = UtteranceCollector()
+        let backend = FakeBackend(model: .parakeetTDTv3)
+        let coordinator = ASRCoordinator()
+        await coordinator.install(backend: backend, token: 1)
+        let transcriber = StreamingTranscriber(
+            asrCoordinator: coordinator,
+            vad: ScriptedVAD(events: [4: .speechStart]),
+            speaker: .you,
+            audioSource: .microphone,
+            onPartial: { _ in },
+            onFinal: { text, _ in collector.append(text) }
+        )
+
+        let (stream, continuation) = AsyncStream.makeStream(of: AVAudioPCMBuffer.self)
+        for _ in 0..<9 { continuation.yield(makeBuffer(frames: 4096)) }
+        continuation.finish()
+
+        let hadFatalError = await transcriber.run(stream: stream)
+        #expect(hadFatalError == false)
+        #expect(collector.texts == ["fake:parakeet-tdt-v3"])
+        // Chunks 2+3 (pre-roll ring, capacity 2) + chunks 4-8 (speech) = 7 × 4096.
+        #expect(await backend.transcribedSampleCounts == [7 * 4096])
+    }
+
+    /// The seeded lead-in must not count toward the ≥8000-sample garbage gate:
+    /// a one-chunk speech blip is still dropped even though pre-roll lifts the
+    /// raw buffer past the threshold.
+    @Test func preRollDoesNotDefeatShortGarbageGate() async throws {
+        let collector = UtteranceCollector()
+        let transcriber = await makeTranscriber(
+            events: [2: .speechStart, 3: .speechEnd],
+            collector: collector
+        )
+
+        let (stream, continuation) = AsyncStream.makeStream(of: AVAudioPCMBuffer.self)
+        for _ in 0..<6 { continuation.yield(makeBuffer(frames: 4096)) }
+        continuation.finish()
+
+        let hadFatalError = await transcriber.run(stream: stream)
+        #expect(hadFatalError == false)
+        #expect(collector.texts.isEmpty, "pre-roll padding must not promote a sub-0.5s blip: \(collector.texts)")
+    }
+
     /// Silence-only stream: nothing to flush, nothing committed.
     @Test func silenceOnlyStreamCommitsNothing() async throws {
         let collector = UtteranceCollector()
