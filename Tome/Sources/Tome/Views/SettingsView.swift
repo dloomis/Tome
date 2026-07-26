@@ -67,7 +67,11 @@ private struct GeneralTab: View {
 // MARK: - Audio
 
 /// Live input-device list: enumerates on start and re-enumerates whenever
-/// CoreAudio's device set changes (AirPods connecting, USB mic plugged in).
+/// CoreAudio's device set changes (AirPods connecting, USB mic plugged in)
+/// or the HAL wedge latch clears (an enumeration attempted during a wedge is
+/// refused and must be retried once the driver recovers — the clear is not a
+/// device-set change, so the CoreAudio listener alone would leave the pickers
+/// stuck on "(unavailable)" forever; 2026-07-26 incident).
 /// The previous enumerate-once-in-onAppear left newly attached devices
 /// invisible until the user bounced between Settings tabs.
 @Observable
@@ -75,6 +79,7 @@ private struct GeneralTab: View {
 private final class InputDeviceList {
     private(set) var devices: [(id: AudioDeviceID, uid: String, name: String)] = []
     private var listenerBlock: AudioObjectPropertyListenerBlock?
+    private var wedgeObserver: (any NSObjectProtocol)?
 
     private var devicesAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
@@ -88,6 +93,13 @@ private final class InputDeviceList {
 
     func start() {
         refresh(debounced: false)
+        if wedgeObserver == nil {
+            wedgeObserver = NotificationCenter.default.addObserver(
+                forName: HALQueue.wedgeClearedNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.refresh(debounced: false) }
+            }
+        }
         guard listenerBlock == nil else { return }
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor in self?.refresh(debounced: true) }
@@ -101,6 +113,8 @@ private final class InputDeviceList {
     func stop() {
         refreshTask?.cancel()
         refreshTask = nil
+        if let wedgeObserver { NotificationCenter.default.removeObserver(wedgeObserver) }
+        wedgeObserver = nil
         guard let block = listenerBlock else { return }
         AudioObjectRemovePropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &devicesAddress, DispatchQueue.main, block
@@ -122,6 +136,12 @@ private final class InputDeviceList {
             }
             let enumerated = await MicCapture.availableInputDevices()
             guard !Task.isCancelled else { return }
+            // A wedged HAL degrades enumeration to [] (refused at admission,
+            // or this very call timing out and raising the latch). Keep the
+            // current list instead of rendering every selection
+            // "(unavailable)" — the wedge-cleared notification re-runs this
+            // refresh once the driver recovers.
+            if enumerated.isEmpty && HALQueue.isWedged { return }
             self?.devices = enumerated
         }
     }

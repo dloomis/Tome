@@ -84,6 +84,39 @@ struct HALQueueTests {
         #expect(!HALQueue.isWedged)
     }
 
+    @Test func wedgeClearPostsTheRecoveryNotification() async throws {
+        // The 2026-07-26 stale-pickers regression guard: consumers that
+        // degraded while wedged (Settings device enumeration) have no other
+        // signal to retry on — the clear is not a device-set change.
+        let posted = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
+        let observer = NotificationCenter.default.addObserver(
+            forName: HALQueue.wedgeClearedNotification, object: nil, queue: nil
+        ) { _ in posted.withLock { $0 += 1 } }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let outcome = await HALQueue.run(
+            label: "test-notify",
+            deadline: .milliseconds(80)
+        ) { () -> Int in
+            Thread.sleep(forTimeInterval: 0.4)
+            return 1
+        }
+        guard case .timedOut = outcome else {
+            Issue.record("expected .timedOut, got \(outcome)")
+            return
+        }
+        // Still stuck: no notification while the latch is up.
+        #expect(posted.withLock { $0 } == 0)
+
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(!HALQueue.isWedged)
+        #expect(posted.withLock { $0 } == 1)
+
+        // A healthy run that never wedged must not post.
+        _ = await HALQueue.run(label: "test-notify-clean", deadline: .seconds(5)) { 2 }
+        #expect(posted.withLock { $0 } == 1)
+    }
+
     @Test func decideOutcomeMatchesTheLatchAndDeadlineRules() {
         guard case .wedged = HALQueue.decideOutcome(wedgedAtSubmit: true, finishedWithinDeadline: true) else {
             Issue.record("wedged at submit must refuse regardless of speed")

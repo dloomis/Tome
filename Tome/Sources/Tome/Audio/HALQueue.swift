@@ -44,6 +44,14 @@ enum HALQueue {
     private static let wedgedOps = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
     static var isWedged: Bool { wedgedOps.withLock { $0 > 0 } }
 
+    /// Posted (from the HAL queue) when the last wedged operation finally
+    /// returns and the latch clears. Consumers that degraded while wedged —
+    /// the Settings device list enumerating to empty — recover on this signal;
+    /// nothing else re-triggers them, because the wedge clearing is not a
+    /// device-set change and CoreAudio listeners never fire for it
+    /// (2026-07-26 stale "(unavailable)" pickers).
+    static let wedgeClearedNotification = Notification.Name("com.dloomis.tome.hal-wedge-cleared")
+
     /// Pure admission/outcome decision, extracted for unit tests: what a run
     /// resolves to given the wedge latch at submit time and whether the work
     /// finished inside the deadline.
@@ -93,9 +101,15 @@ enum HALQueue {
                 if firstToResume {
                     continuation.resume(returning: .completed(result))
                 } else {
-                    wedgedOps.withLock { $0 -= 1 }
+                    let latchCleared = wedgedOps.withLock { count -> Bool in
+                        count -= 1
+                        return count == 0
+                    }
                     diagLog("[HAL] abandoned \(label) returned after \(ContinuousClock.now - start) — wedge cleared")
                     onAbandoned?(result)
+                    if latchCleared {
+                        NotificationCenter.default.post(name: wedgeClearedNotification, object: nil)
+                    }
                 }
             }
         }
