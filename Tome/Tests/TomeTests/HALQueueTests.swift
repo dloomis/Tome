@@ -117,6 +117,89 @@ struct HALQueueTests {
         #expect(posted.withLock { $0 } == 1)
     }
 
+    @Test func aWedgedBindDoesNotDisableDeviceQueries() async throws {
+        // The 2026-07-27 cascade: one stuck AVAudioEngine.start() used to take
+        // enumeration down with it (queries queued behind the bind, timed out,
+        // and re-latched), so the Settings pickers went stale exactly when the
+        // user needed them to switch off the offending device. The lanes are
+        // independent now.
+        let outcome = await HALQueue.run(
+            label: "test-wedged-bind",
+            lane: .bind,
+            deadline: .milliseconds(80)
+        ) { () -> Int in
+            Thread.sleep(forTimeInterval: 0.5)
+            return 1
+        }
+        guard case .timedOut = outcome else {
+            Issue.record("expected .timedOut, got \(outcome)")
+            return
+        }
+        #expect(HALQueue.isWedged(.bind))
+        #expect(!HALQueue.isWedged(.query))
+
+        // A query issued while the bind lane is wedged still gets a real answer.
+        let query = await HALQueue.query(label: "test-query-during-bind-wedge") { [4, 5, 6] }
+        guard case .answered(let devices) = query else {
+            Issue.record("query must not be refused because the BIND lane is wedged, got \(query)")
+            return
+        }
+        #expect(devices == [4, 5, 6])
+
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(!HALQueue.isWedged)
+    }
+
+    @Test func aWedgedQueryDoesNotDisableBinds() async throws {
+        // The converse, and the reason binds keep their own latch: a driver
+        // that can't answer a property read may still bind, and binding a
+        // DIFFERENT device is the user's escape route from a wedge.
+        let outcome = await HALQueue.run(
+            label: "test-wedged-query",
+            lane: .query,
+            deadline: .milliseconds(80)
+        ) { () -> Int in
+            Thread.sleep(forTimeInterval: 0.5)
+            return 1
+        }
+        guard case .timedOut = outcome else {
+            Issue.record("expected .timedOut, got \(outcome)")
+            return
+        }
+        #expect(HALQueue.isWedged(.query))
+        #expect(!HALQueue.isWedged(.bind))
+
+        let bind = await HALQueue.run(label: "test-bind-during-query-wedge", lane: .bind) { 9 }
+        guard case .completed(let value) = bind else {
+            Issue.record("bind must not be refused because the QUERY lane is wedged, got \(bind)")
+            return
+        }
+        #expect(value == 9)
+
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(!HALQueue.isWedged)
+    }
+
+    @Test func queryReportsUnavailableRatherThanAFabricatedAnswer() async throws {
+        let result: HALQueryResult<[Int]> = await HALQueue.query(
+            label: "test-query-slow",
+            deadline: .milliseconds(80)
+        ) { () -> [Int] in
+            Thread.sleep(forTimeInterval: 0.4)
+            return [1, 2, 3]
+        }
+        guard case .unavailable = result else {
+            Issue.record("expected .unavailable, got \(result)")
+            return
+        }
+        // The lossy accessor is opt-in, and only for callers that genuinely
+        // treat "no answer" as the fallback.
+        #expect(result.value(or: []).isEmpty)
+
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(!HALQueue.isWedged)
+    }
+
     @Test func decideOutcomeMatchesTheLatchAndDeadlineRules() {
         guard case .wedged = HALQueue.decideOutcome(wedgedAtSubmit: true, finishedWithinDeadline: true) else {
             Issue.record("wedged at submit must refuse regardless of speed")
@@ -163,6 +246,48 @@ struct BindTimeoutPolicyTests {
         let msg = TranscriptionEngine.micBindFailureText(error: .halWedged, deviceName: nil)
         #expect(!msg.isEmpty)
         #expect(!msg.contains("nil"))
+    }
+
+    @Test func anUnansweredLookupNeverSubstitutesADevice() {
+        // The 2026-07-27 regression guard. A refused UID lookup is not evidence
+        // that the mic is gone, and reacting to it by binding the system
+        // default aims the retry at the wedged device (on the repro machine the
+        // selection IS the default).
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "wave-link-mic-only", selectionLookup: .unavailable)
+                == .abort
+        )
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "", selectionLookup: .unavailable)
+                == .abort
+        )
+    }
+
+    @Test func anAbsentSelectionStillFallsBackToTheDefault() {
+        // The pre-existing behavior this must not break: a device that really
+        // is unplugged falls back for the session, banner and all.
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "unplugged-usb-mic", selectionLookup: .answered(nil))
+                == .useSystemDefault
+        )
+    }
+
+    @Test func aResolvedSelectionBindsThatDevice() {
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "wave-link-mic-only", selectionLookup: .answered(145))
+                == .bind(145)
+        )
+        // System Default selected: the caller passes the default lookup, and a
+        // nil answer means "no default", not "selection absent" — there is no
+        // selection to fall back FROM.
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "", selectionLookup: .answered(119))
+                == .bind(119)
+        )
+        #expect(
+            TranscriptionEngine.resolveMicTarget(selectedUID: "", selectionLookup: .answered(nil))
+                == .bind(nil)
+        )
     }
 
     @Test func deviceBindFailureDetailsAreDistinctPerCause() {

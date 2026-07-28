@@ -100,6 +100,63 @@ struct DeviceSourceReadoptionTests {
     }
 }
 
+@Suite("Mic device re-adoption trigger")
+struct MicDeviceReadoptionTests {
+    @Test func readoptsWhenThePinnedMicComesBack() {
+        // The dock-the-laptop case: the session started undocked, so `start()`
+        // fell back to the built-in mic (device 40) and raised the banner. The
+        // dock's mic enumerates mid-session as device 88 — take it back.
+        #expect(TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: true, selectedUID: "dock-usb-mic",
+            currentMicDeviceID: 40, selectionLookup: .answered(88)
+        ))
+    }
+
+    @Test func inertWhenAlreadyRecordingFromTheSelection() {
+        // Device-list changes fire constantly (a monitor waking, a USB hub
+        // enumerating). None of them may churn a mic that is already correct.
+        #expect(!TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: true, selectedUID: "dock-usb-mic",
+            currentMicDeviceID: 88, selectionLookup: .answered(88)
+        ))
+    }
+
+    @Test func inertWhileTheSelectionIsStillAbsent() {
+        // Undocked: the UID resolves to nothing. Stay on the fallback device.
+        #expect(!TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: true, selectedUID: "dock-usb-mic",
+            currentMicDeviceID: 40, selectionLookup: .answered(nil)
+        ))
+    }
+
+    @Test func systemDefaultSelectionIsNeverReadopted() {
+        // "System Default" follows the OS through the default-device listener.
+        // This path must not second-guess it — an empty UID has no device to
+        // return to.
+        #expect(!TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: true, selectedUID: "",
+            currentMicDeviceID: 40, selectionLookup: .answered(88)
+        ))
+    }
+
+    @Test func anUnansweredLookupNeverMovesTheMic() {
+        // Same 2026-07-27 rule as `resolveMicTarget`: a lookup the HAL never
+        // answered is not evidence about which devices exist, and tearing down a
+        // working mic on the strength of one is how a single wedge cascades.
+        #expect(!TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: true, selectedUID: "dock-usb-mic",
+            currentMicDeviceID: 40, selectionLookup: .unavailable
+        ))
+    }
+
+    @Test func inertWhenNoSessionIsRunning() {
+        #expect(!TranscriptionEngine.shouldReadoptMicDevice(
+            isRunning: false, selectedUID: "dock-usb-mic",
+            currentMicDeviceID: 40, selectionLookup: .answered(88)
+        ))
+    }
+}
+
 @Suite("Call audio source fallback messaging")
 struct SystemSourceFallbackTextTests {
     @Test func namedDeviceAppearsInTheMessage() {

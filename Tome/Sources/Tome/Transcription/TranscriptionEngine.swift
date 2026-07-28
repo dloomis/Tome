@@ -190,21 +190,31 @@ final class TranscriptionEngine {
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
     /// Listens for changes to the system-wide DEVICE LIST while a session runs
-    /// with a configured call-audio source — the re-adoption trigger the
-    /// 2026-07-25 field test showed was missing. Wave Link republishes its
-    /// virtual devices when its own output device changes (a Bluetooth HFP flip
-    /// does exactly that), so a mid-flip rebuild finds the configured UID
-    /// unresolvable and falls back to SCK — correct — but a healthy SCK leg
-    /// never rebuilds, so the session stayed on SCK even after the device
-    /// returned seconds later. A device-list change is the precise "it may be
-    /// back" signal; the handler re-resolves and rebuilds only when the source
-    /// is actually adoptable again.
+    /// with a pinned mic and/or a configured call-audio source — the re-adoption
+    /// trigger the 2026-07-25 field test showed was missing. Wave Link
+    /// republishes its virtual devices when its own output device changes (a
+    /// Bluetooth HFP flip does exactly that), so a mid-flip rebuild finds the
+    /// configured UID unresolvable and falls back to SCK — correct — but a
+    /// healthy SCK leg never rebuilds, so the session stayed on SCK even after
+    /// the device returned seconds later. The mic leg had the same hole with a
+    /// more everyday trigger: a laptop docked mid-session left capture on the
+    /// built-in mic for the rest of the recording, because the only mic-side
+    /// listener watches the OS DEFAULT device and is inert while a specific
+    /// device is pinned. A device-list change is the precise "it may be back"
+    /// signal for both legs; each handler re-resolves and rebuilds only when its
+    /// own selection is actually adoptable again.
     private var deviceListListenerBlock: AudioObjectPropertyListenerBlock?
 
     /// Debounced re-adoption check scheduled by the device-list listener.
     /// Device-list changes arrive in storms during the exact transitions that
     /// make mixers republish devices; each new change supersedes the pending one.
     private var deviceReadoptionTask: Task<Void, Never>?
+
+    /// Mic-leg counterpart of `deviceReadoptionTask`, same debounce and the same
+    /// supersede-the-pending-one rule. Separate task because the two legs
+    /// re-adopt independently — docking restores the pinned mic whether or not a
+    /// call-audio device came back with it.
+    private var micReadoptionTask: Task<Void, Never>?
 
     /// Debounced mic rebuild scheduled by `AVAudioEngineConfigurationChange`.
     /// Bluetooth transitions (AirPods connect, HFP↔A2DP renegotiation) fire the
@@ -299,18 +309,37 @@ final class TranscriptionEngine {
         systemSourceMode = .sck
         micFallbackMessage = nil
         systemSourceFallbackMessage = nil
+        // Resolve the mic device. A HAL that never answers is NOT the same as a
+        // device that isn't there: answering "unavailable" with the system
+        // default is how a single wedged bind used to poison the next start —
+        // the UID lookup was refused, the engine concluded the selected mic had
+        // vanished, posted "recording from the system default microphone", and
+        // aimed at the default, which on this machine IS the wedged device
+        // (2026-07-27). A degraded lookup fails the start instead, with the
+        // driver-not-responding wording that tells the user to wait.
+        let selectionLookup = inputDeviceUID.isEmpty
+            ? await MicCapture.defaultInputDeviceIDResult()
+            : await MicCapture.deviceIDResult(forUID: inputDeviceUID)
         let targetMicID: AudioDeviceID?
-        if inputDeviceUID.isEmpty {
-            targetMicID = await MicCapture.defaultInputDeviceID()
-        } else if let resolved = await MicCapture.deviceID(forUID: inputDeviceUID) {
+        switch Self.resolveMicTarget(selectedUID: inputDeviceUID, selectionLookup: selectionLookup) {
+        case .bind(let resolved):
             targetMicID = resolved
-        } else {
+        case .useSystemDefault:
             // The persisted UID resolves to no present device. Fall back to the
             // system default FOR THIS SESSION and say so — the old behavior
             // recorded a whole meeting off the built-in mic with no indication.
             // The selection is preserved; watchdog rebuilds keep aiming at it.
-            targetMicID = await MicCapture.defaultInputDeviceID()
-            await reportMicFallback(boundDeviceID: targetMicID)
+            switch await MicCapture.defaultInputDeviceIDResult() {
+            case .answered(let fallbackID):
+                targetMicID = fallbackID
+                await reportMicFallback(boundDeviceID: fallbackID)
+            case .unavailable:
+                failStartWithUnresponsiveHAL(deviceName: nil)
+                return
+            }
+        case .abort:
+            failStartWithUnresponsiveHAL(deviceName: nil)
+            return
         }
         currentMicDeviceID = targetMicID ?? 0
         currentMicBufferURL = recordingContext.flatMap { ctx in
@@ -474,10 +503,11 @@ final class TranscriptionEngine {
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
 
-        // Re-adoption trigger for the configured call-audio source: a mixer
-        // that republishes its devices mid-session (BT-flip storm) must be
-        // re-adopted when the device returns — see `deviceListListenerBlock`.
-        if !activeSystemSourceUID.isEmpty {
+        // Re-adoption trigger for whichever selections can go missing: a mixer
+        // that republishes its devices mid-session (BT-flip storm), or a pinned
+        // mic that comes back when the laptop is docked — both must be adopted
+        // when the device returns. See `deviceListListenerBlock`.
+        if !activeSystemSourceUID.isEmpty || !userSelectedDeviceUID.isEmpty {
             installDeviceListListener()
         }
     }
@@ -600,6 +630,31 @@ final class TranscriptionEngine {
         return false
     }
 
+    /// Mic-leg counterpart of `shouldReadoptDeviceSource`: may the device-list
+    /// listener swap capture back onto the user's pinned microphone?
+    ///
+    /// Only when a session is live, a specific device is pinned (System Default
+    /// follows the OS through `installDefaultDeviceListener` and must never be
+    /// second-guessed here), and the pinned UID now resolves to a device we are
+    /// NOT already recording from — the dock-the-laptop case, where `start()`
+    /// fell back to the built-in mic because the dock's mic was absent.
+    ///
+    /// `.unavailable` returns false, for the 2026-07-27 reason: a lookup the HAL
+    /// never answered says nothing about which devices exist, and tearing down a
+    /// working mic on the strength of one is how a single wedge cascades. The
+    /// wedge-cleared path re-fires the enumeration, and `restartMic` re-checks
+    /// everything anyway.
+    nonisolated static func shouldReadoptMicDevice(
+        isRunning: Bool,
+        selectedUID: String,
+        currentMicDeviceID: AudioDeviceID,
+        selectionLookup: HALQueryResult<AudioDeviceID?>
+    ) -> Bool {
+        guard isRunning, !selectedUID.isEmpty else { return false }
+        guard case .answered(let resolved) = selectionLookup, let resolved else { return false }
+        return resolved != currentMicDeviceID
+    }
+
     /// User-facing text for a system leg that carried no audible content — the
     /// watchdog's 60s warning (`atStop: false`) and ContentView's end-of-session
     /// note (`atStop: true`). Mode-aware: in device mode the exclusion list is
@@ -657,6 +712,45 @@ final class TranscriptionEngine {
         case .timedOut, .halWedged:
             let name = deviceName.map { "\u{201C}\($0)\u{201D}" } ?? "The selected microphone"
             return "\(name) isn't responding — its driver may still be starting up. Try again in a few seconds."
+        }
+    }
+
+    /// What a mic-device lookup means for the bind about to happen.
+    enum MicTargetDecision: Sendable, Equatable {
+        /// Bind this device (nil = let the engine take the system default).
+        case bind(AudioDeviceID?)
+        /// The selection is genuinely absent: bind the system default for this
+        /// session and say so.
+        case useSystemDefault
+        /// The HAL never answered. Substituting any device here would aim at
+        /// the wedge itself.
+        case abort
+    }
+
+    /// Pure policy for turning a mic-device lookup into an action, shared by
+    /// `start()` and `restartMic`.
+    ///
+    /// The load-bearing line is the last one: `.unavailable` (no answer from
+    /// the HAL) must never collapse into `.answered(nil)` (no such device).
+    /// They did collapse, through `deviceID(forUID:)`'s `AudioDeviceID?`
+    /// return, and that is what made one wedged bind cascade on 2026-07-27 —
+    /// the next start read the refused lookup as "your microphone is gone",
+    /// announced it was recording from the system default, and bound the
+    /// default, which was the same device that had just wedged.
+    ///
+    /// When `selectedUID` is empty the caller passes the DEFAULT-device lookup;
+    /// there is no selection to be absent, so a nil answer is just "no default".
+    nonisolated static func resolveMicTarget(
+        selectedUID: String,
+        selectionLookup: HALQueryResult<AudioDeviceID?>
+    ) -> MicTargetDecision {
+        switch selectionLookup {
+        case .unavailable:
+            return .abort
+        case .answered(let resolved):
+            if selectedUID.isEmpty { return .bind(resolved) }
+            guard let resolved else { return .useSystemDefault }
+            return .bind(resolved)
         }
     }
 
@@ -1313,6 +1407,21 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Unwind a start that never got as far as a bind because the HAL wouldn't
+    /// answer which device to bind. Same user-facing wording as a timed-out
+    /// bind — from the user's seat it is the same event, and the advice ("try
+    /// again in a few seconds") is the same. Deliberately NOT a mic-fallback:
+    /// nothing is recording, and no substitute device was chosen.
+    private func failStartWithUnresponsiveHAL(deviceName: String?) {
+        let msg = Self.micBindFailureText(error: .halWedged, deviceName: deviceName)
+        diagLog("[ENGINE-3-FAIL] mic device resolution refused — the HAL is unresponsive; not substituting a device")
+        lastError = msg
+        clearMicFallback()
+        assetStatus = "Ready"
+        isRunning = false
+        endLiveActivity()
+    }
+
     /// Surface a mic fallback: capture is running on `boundDeviceID` instead of
     /// the user's selection. Banner (via `micFallbackMessage`) + one notification
     /// — the Tome window is typically hidden behind the meeting app when this
@@ -1530,16 +1639,32 @@ final class TranscriptionEngine {
         if updateSelection {
             userSelectedDeviceUID = inputDeviceUID
         }
+        // Same degraded-vs-absent rule as `start()`: a refused lookup must not
+        // be read as "the selected device is gone". Tearing down a working mic
+        // to chase the system default on the strength of an unanswered query is
+        // strictly worse than keeping what we have — during a HAL wedge the
+        // default is usually the wedged device, so the swap trades a live mic
+        // for a dead one. Abort and leave the rescue to the stall watchdog.
+        let selectionLookup = inputDeviceUID.isEmpty
+            ? await MicCapture.defaultInputDeviceIDResult()
+            : await MicCapture.deviceIDResult(forUID: inputDeviceUID)
         let targetMicID: AudioDeviceID
-        if inputDeviceUID.isEmpty {
-            targetMicID = await MicCapture.defaultInputDeviceID() ?? 0
-        } else if let resolved = await MicCapture.deviceID(forUID: inputDeviceUID) {
-            targetMicID = resolved
-        } else {
+        switch Self.resolveMicTarget(selectedUID: inputDeviceUID, selectionLookup: selectionLookup) {
+        case .bind(let resolved):
+            targetMicID = resolved ?? 0
+        case .useSystemDefault:
             // Selected device absent right now: bind the default for this
             // attempt. The fallback banner is raised by the reconciliation at
             // the end of the successful bind below.
-            targetMicID = await MicCapture.defaultInputDeviceID() ?? 0
+            switch await MicCapture.defaultInputDeviceIDResult() {
+            case .answered(let fallbackID): targetMicID = fallbackID ?? 0
+            case .unavailable:
+                diagLog("[ENGINE-MIC-SWAP-ABORT] default-device lookup refused (HAL unresponsive) — keeping the current mic")
+                return
+            }
+        case .abort:
+            diagLog("[ENGINE-MIC-SWAP-ABORT] device lookup refused (HAL unresponsive) — keeping the current mic")
+            return
         }
         guard force || targetMicID != currentMicDeviceID else {
             diagLog("[ENGINE-MIC-SWAP] same device \(targetMicID), skipping")
@@ -1549,6 +1674,11 @@ final class TranscriptionEngine {
         diagLog("[ENGINE-MIC-SWAP] switching mic from \(currentMicDeviceID) to \(targetMicID)")
 
         // A user/watchdog-initiated restart supersedes any pending debounced rebuild.
+        // `micReadoptionTask` is deliberately NOT cancelled here: a re-adoption
+        // runs `restartMic` from inside that very task, so cancelling it would
+        // cancel the bind we are in the middle of. It needs no cancelling —
+        // it re-reads the selection and the bound device after its debounce and
+        // no-ops once capture is already on the selection.
         micRebuildTask?.cancel()
         micRebuildTask = nil
 
@@ -1647,14 +1777,23 @@ final class TranscriptionEngine {
         // UID, or the emergency default rebind above with the selection
         // preserved), clear it when a later rebuild lands back on it. Runs on
         // the SUCCESS path only — a failed bind changed nothing.
-        if Self.isMicFallbackActive(
-            selectedUID: userSelectedDeviceUID,
-            selectionResolvesTo: await MicCapture.deviceID(forUID: userSelectedDeviceUID),
-            boundDeviceID: targetMicID
-        ) {
-            await reportMicFallback(boundDeviceID: targetMicID)
-        } else {
-            clearMicFallback()
+        // A degraded lookup can't tell us whether we landed on the selection, and
+        // guessing raises "Selected mic unavailable" over a bind that just
+        // succeeded. Leave the banner state untouched until a later rebuild can
+        // resolve it for real.
+        switch await MicCapture.deviceIDResult(forUID: userSelectedDeviceUID) {
+        case .answered(let selectionResolvesTo):
+            if Self.isMicFallbackActive(
+                selectedUID: userSelectedDeviceUID,
+                selectionResolvesTo: selectionResolvesTo,
+                boundDeviceID: targetMicID
+            ) {
+                await reportMicFallback(boundDeviceID: targetMicID)
+            } else {
+                clearMicFallback()
+            }
+        case .unavailable:
+            diagLog("[MIC-FALLBACK] reconciliation skipped — UID lookup refused (HAL unresponsive)")
         }
         // The new device must prove it delivers real audio, same as at start.
         armMicDigitalSilenceCheck()
@@ -1733,7 +1872,10 @@ final class TranscriptionEngine {
         guard deviceListListenerBlock == nil else { return }
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
-            Task { @MainActor in self.scheduleDeviceSourceReadoption() }
+            Task { @MainActor in
+                self.scheduleMicSourceReadoption()
+                self.scheduleDeviceSourceReadoption()
+            }
         }
         deviceListListenerBlock = block
         var address = Self.deviceListAddress
@@ -1787,6 +1929,44 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Mic-leg re-adoption, scheduled from the same device-list listener and
+    /// debounced the same 2s: a dock event fires a storm of device-list changes
+    /// while the dock's audio devices enumerate, and the pinned mic is only
+    /// worth binding once the graph has settled.
+    ///
+    /// This is what makes a pinned microphone survive an undock: `start()` falls
+    /// back to the system default and raises the banner when the pinned device
+    /// is absent, and this hands capture back the moment it returns —
+    /// mid-session, without the user touching Settings. `restartMic` does the
+    /// rest: it appends to the same session WAV, re-runs the fallback
+    /// reconciliation (which clears the banner now that we're back on the
+    /// selection), re-arms the digital-silence check, and refuses a collision
+    /// with the device-backed system leg.
+    private func scheduleMicSourceReadoption() {
+        guard isRunning, !userSelectedDeviceUID.isEmpty else { return }
+        micReadoptionTask?.cancel()
+        let generation = sessionGeneration
+        micReadoptionTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration else { return }
+            let selectedUID = self.userSelectedDeviceUID
+            let lookup = await MicCapture.deviceIDResult(forUID: selectedUID)
+            guard generation == self.sessionGeneration,
+                  Self.shouldReadoptMicDevice(
+                      isRunning: self.isRunning,
+                      selectedUID: selectedUID,
+                      currentMicDeviceID: self.currentMicDeviceID,
+                      selectionLookup: lookup
+                  )
+            else { return }
+            diagLog("[MIC-READOPT] the selected microphone is present again — restarting the mic leg to adopt it")
+            // `updateSelection: false` — nothing about the user's choice changed;
+            // this only moves capture back onto it.
+            await self.restartMic(inputDeviceUID: selectedUID, updateSelection: false)
+        }
+    }
+
     private func ensureMicrophonePermission() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -1820,6 +2000,8 @@ final class TranscriptionEngine {
         removeDeviceListListener()
         deviceReadoptionTask?.cancel()
         deviceReadoptionTask = nil
+        micReadoptionTask?.cancel()
+        micReadoptionTask = nil
         startupGateTask?.cancel()
         startupGateTask = nil
         sysStartupGateTask?.cancel()

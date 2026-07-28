@@ -874,23 +874,43 @@ final class MicCapture: @unchecked Sendable {
     // versions remain for the HAL queue itself (`performBind`) and tests.
 
     static func availableInputDevices() async -> [(id: AudioDeviceID, uid: String, name: String)] {
-        await HALQueue.enumerate(label: "enumerate-input-devices", fallback: []) { availableInputDevices() }
+        await availableInputDevicesResult().value(or: [])
+    }
+
+    /// Enumeration that distinguishes "the machine has no input devices" from
+    /// "the HAL never answered" — the Settings pickers must keep their current
+    /// list in the second case rather than render every selection unavailable.
+    static func availableInputDevicesResult() async -> HALQueryResult<[(id: AudioDeviceID, uid: String, name: String)]> {
+        await HALQueue.query(label: "enumerate-input-devices") { availableInputDevices() }
     }
 
     static func deviceName(for deviceID: AudioDeviceID) async -> String? {
-        await HALQueue.enumerate(label: "device-name", fallback: nil) { deviceName(for: deviceID) }
+        await HALQueue.query(label: "device-name") { deviceName(for: deviceID) }.value(or: nil)
     }
 
     static func deviceID(forUID uid: String) async -> AudioDeviceID? {
-        await HALQueue.enumerate(label: "device-for-uid", fallback: nil) { deviceID(forUID: uid) }
+        await deviceIDResult(forUID: uid).value(or: nil)
+    }
+
+    /// UID resolution that keeps "no such device present" (`.answered(nil)`)
+    /// separate from "the HAL is unresponsive" (`.unavailable`). Every caller
+    /// that reacts to an absent device by binding something ELSE must use this:
+    /// during a wedge the substitute is typically the wedged device itself.
+    static func deviceIDResult(forUID uid: String) async -> HALQueryResult<AudioDeviceID?> {
+        await HALQueue.query(label: "device-for-uid") { deviceID(forUID: uid) }
     }
 
     static func deviceUID(for deviceID: AudioDeviceID) async -> String? {
-        await HALQueue.enumerate(label: "device-uid", fallback: nil) { deviceUID(for: deviceID) }
+        await HALQueue.query(label: "device-uid") { deviceUID(for: deviceID) }.value(or: nil)
     }
 
     static func defaultInputDeviceID() async -> AudioDeviceID? {
-        await HALQueue.enumerate(label: "default-input-device", fallback: nil) { defaultInputDeviceID() }
+        await defaultInputDeviceIDResult().value(or: nil)
+    }
+
+    /// See `deviceIDResult(forUID:)` — same distinction for the system default.
+    static func defaultInputDeviceIDResult() async -> HALQueryResult<AudioDeviceID?> {
+        await HALQueue.query(label: "default-input-device") { defaultInputDeviceID() }
     }
 
     // MARK: - List available input devices

@@ -134,15 +134,16 @@ private final class InputDeviceList {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled else { return }
             }
-            let enumerated = await MicCapture.availableInputDevices()
+            let enumerated = await MicCapture.availableInputDevicesResult()
             guard !Task.isCancelled else { return }
-            // A wedged HAL degrades enumeration to [] (refused at admission,
-            // or this very call timing out and raising the latch). Keep the
-            // current list instead of rendering every selection
-            // "(unavailable)" — the wedge-cleared notification re-runs this
-            // refresh once the driver recovers.
-            if enumerated.isEmpty && HALQueue.isWedged { return }
-            self?.devices = enumerated
+            // An unanswered enumeration is not an empty machine. Keep the
+            // current list instead of rendering every selection "(unavailable)"
+            // — the wedge-cleared notification re-runs this refresh once the
+            // driver recovers. (Enumeration runs on the query lane, so a wedged
+            // capture bind no longer stalls it at all; this guard now only
+            // covers a query lane that is itself stuck.)
+            guard case .answered(let devices) = enumerated else { return }
+            self?.devices = devices
         }
     }
 }
@@ -200,7 +201,7 @@ private struct AudioTab: View {
                         settings.inputDeviceName = ""
                     }
                 }
-                Text("System Default follows macOS — when AirPods connect, recording moves with them. Pinning a specific mic fights macOS's automatic switching and can drop out during Bluetooth transitions; if a pinned mic keeps failing mid-session, Tome falls back to System Default for that session.")
+                Text("System Default follows macOS — when AirPods connect, recording moves with them. Pinning a specific mic keeps recording on that device across docking: while it's unplugged Tome records from System Default and says so, then moves back to your pick the moment it reappears, even mid-recording. Pinning does fight macOS's automatic switching and can drop out during Bluetooth transitions; if a pinned mic keeps failing mid-session, Tome falls back to System Default for that session.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
