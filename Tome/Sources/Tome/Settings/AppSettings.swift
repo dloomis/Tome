@@ -213,6 +213,14 @@ final class AppSettings {
         }
     }
 
+    /// When true, the main window floats above other apps' windows.
+    var alwaysOnTop: Bool {
+        didSet {
+            UserDefaults.standard.set(alwaysOnTop, forKey: "alwaysOnTop")
+            applyWindowLevel()
+        }
+    }
+
     init() {
         let defaults = UserDefaults.standard
         self.transcriptionLocale = defaults.string(forKey: "transcriptionLocale") ?? "en-US"
@@ -280,6 +288,7 @@ final class AppSettings {
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")
+        self.alwaysOnTop = defaults.bool(forKey: "alwaysOnTop")
 
         // Legacy mic migration, deferred past init (see the mic-selection
         // comment above): resolve on the HAL queue, then persist.
@@ -365,6 +374,15 @@ final class AppSettings {
         let type: NSWindow.SharingType = hideFromScreenShare ? .none : .readOnly
         for window in NSApp.windows {
             window.sharingType = type
+        }
+    }
+
+    /// Apply the always-on-top preference. Scoped to the main window (scene id
+    /// "main") — the Settings window must never float over other apps.
+    func applyWindowLevel() {
+        let level: NSWindow.Level = alwaysOnTop ? .floating : .normal
+        for window in NSApp.windows where window.identifier?.rawValue.hasPrefix("main") == true {
+            window.level = level
         }
     }
 

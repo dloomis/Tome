@@ -99,6 +99,17 @@ final class MicCapture: @unchecked Sendable {
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
 
+    /// User-facing mute. When set, the tap zeroes every buffer in place before
+    /// metering/writing/yielding — the waveform drops to zero, VAD/ASR see
+    /// silence, and the retained WAV keeps its timeline (silence, not a gap,
+    /// so the post-session mixer alignment is untouched). Deliberately not
+    /// reset by `bufferStream`/`stop`: the engine owns the lifecycle (it
+    /// clears the mute at session end) so a mid-session `restartMic` — device
+    /// re-adoption, config rebuild — stays muted.
+    private let _muted = OSAllocatedUnfairLock<Bool>(uncheckedState: false)
+    var isMuted: Bool { _muted.withLock { $0 } }
+    func setMuted(_ muted: Bool) { _muted.withLock { $0 = muted } }
+
     /// Hold a retiring engine for 15s before release. See the retire call site in
     /// `bufferStream` — AVFAudio's async device-change callbacks reference the
     /// engine that registered them, and deallocating it while they're queued is a
@@ -495,11 +506,18 @@ final class MicCapture: @unchecked Sendable {
             let lastSampleTime = self._lastSampleTime
             let sawNonzeroSample = self._sawNonzeroSample
             let content = self._content
+            let muted = self._muted
 
             var tapCallCount = 0
             let installException = TomeCatchObjCException {
                 inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
                 tapCallCount += 1
+                // Mute zeroes the samples but the buffer still flows: delivery
+                // telemetry (first/last sample time, stall watchdog) must keep
+                // seeing a live tap, and the WAV must keep time.
+                if muted.withLock({ $0 }) {
+                    Self.zeroSamples(in: buffer)
+                }
                 let rms = Self.normalizedRMS(from: buffer)
                 level.value = min(rms * 25, 1.0)
                 if rms > 0 { sawNonzeroSample.withLock { $0 = true } }
@@ -714,6 +732,16 @@ final class MicCapture: @unchecked Sendable {
     /// channel 0 only, so an aggregate whose live mic lands on a later channel would
     /// record pure silence without this. Mono float32 input passes through untouched.
     /// Returns nil for empty buffers or unsupported sample layouts.
+    /// Zero a tap buffer in place. All-zero bytes decode to 0 in every PCM
+    /// sample format (int and float alike), so this needs no format branching.
+    private static func zeroSamples(in buffer: AVAudioPCMBuffer) {
+        for audioBuffer in UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList) {
+            if let data = audioBuffer.mData {
+                memset(data, 0, Int(audioBuffer.mDataByteSize))
+            }
+        }
+    }
+
     static func downmixToMono(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         let frames = Int(buffer.frameLength)
         guard frames > 0 else { return nil }

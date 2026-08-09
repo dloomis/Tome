@@ -80,6 +80,7 @@ struct TomeApp: App {
             ContentView(settings: settings, apiServer: apiServer, services: services)
                 .onAppear {
                     settings.applyScreenShareVisibility()
+                    settings.applyWindowLevel()
                     appDelegate.postProcessingQueue = services.postProcessingQueue
                     appDelegate.transcriptLogger = services.transcriptLogger
                     appDelegate.sessionStore = services.sessionStore
@@ -216,6 +217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let type: NSWindow.SharingType = hide ? .none : .readOnly
                 for window in NSApp.windows {
                     window.sharingType = type
+                }
+                // Re-apply the floating level too — a closed-and-reopened main
+                // window is a fresh NSWindow that starts at .normal.
+                let level: NSWindow.Level = UserDefaults.standard.bool(forKey: "alwaysOnTop") ? .floating : .normal
+                for window in NSApp.windows where window.identifier?.rawValue.hasPrefix("main") == true {
+                    window.level = level
                 }
             }
         }

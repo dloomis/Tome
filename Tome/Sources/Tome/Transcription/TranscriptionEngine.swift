@@ -62,6 +62,15 @@ final class TranscriptionEngine {
         max(micCapture.audioLevel, max(systemCapture.audioLevel, systemDeviceCapture.audioLevel))
     }
 
+    /// User-facing mic mute (top-bar toggle). Zeroes the mic leg at the tap —
+    /// transcription, waveform, and the retained WAV all go silent while the
+    /// system leg keeps flowing. Lives on the shared `micCapture` instance, so
+    /// it survives `restartMic` (device re-adoption, config rebuilds). Cleared
+    /// in `stop()` — a new session must never start silently muted.
+    var micMuted = false {
+        didSet { micCapture.setMuted(micMuted) }
+    }
+
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
 
@@ -1503,6 +1512,13 @@ final class TranscriptionEngine {
     /// Post whatever the current feeder verdict calls for, idempotently —
     /// called at the deadline and on every monitor tick while zeros persist.
     private func routeMicSilence() async {
+        // Tome's own mute renders these zeros — intentional, and the top-bar
+        // toggle already shows it. No warning, no hint; the monitor keeps
+        // ticking so a real fault surfaces after unmute.
+        if micMuted {
+            clearMicSilenceWarning()
+            return
+        }
         let name = await MicCapture.deviceName(for: currentMicDeviceID)
         let verdict = feederVerdict(forDeviceName: name)
         switch verdict {
@@ -2012,6 +2028,7 @@ final class TranscriptionEngine {
         micSilenceCheckTask = nil
         micSilenceMessage = nil
         micSilenceHintMessage = nil
+        micMuted = false
         micFallbackMessage = nil
         systemDeviceSilenceCheckTask?.cancel()
         systemDeviceSilenceCheckTask = nil

@@ -529,6 +529,27 @@ struct ContentView: View {
 
             Spacer()
 
+            HStack(spacing: 2) {
+                topBarToggle(
+                    symbol: "mic.slash",
+                    isOn: transcriptionEngine?.micMuted ?? false,
+                    activeTint: Color.recordRed,
+                    help: "Mute microphone — Tome stops hearing and transcribing you"
+                ) { transcriptionEngine?.micMuted.toggle() }
+                .disabled(transcriptionEngine == nil)
+                topBarToggle(
+                    symbol: "eye.slash",
+                    isOn: settings.hideFromScreenShare,
+                    help: "Stealth mode — hide Tome from screen sharing and recording"
+                ) { settings.hideFromScreenShare.toggle() }
+                topBarToggle(
+                    symbol: "pin",
+                    isOn: settings.alwaysOnTop,
+                    help: "Keep Tome on top of other windows"
+                ) { settings.alwaysOnTop.toggle() }
+            }
+            .padding(.trailing, 8)
+
             HStack(spacing: 10) {
                 Text(topBarStatus)
                     .font(.system(size: 11, weight: .medium))
@@ -548,6 +569,32 @@ struct ContentView: View {
         .frame(height: 44)
         .background(Color.bg1.opacity(0.45))
         .overlay(Divider(), alignment: .bottom)
+    }
+
+    /// Compact icon-only toggle for the top bar (stealth / always-on-top) —
+    /// the bar has no room for labels, so state reads through the filled
+    /// symbol variant + tint, and the name lives in the tooltip.
+    private func topBarToggle(
+        symbol: String,
+        isOn: Bool,
+        activeTint: Color = Color.accent1,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: isOn ? "\(symbol).fill" : symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(isOn ? activeTint : Color.fg3)
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isOn ? activeTint.opacity(0.15) : Color.clear)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .contentTransition(.symbolEffect(.replace))
+        .help(help)
     }
 
     private var topBarStatus: String {

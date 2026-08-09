@@ -59,6 +59,11 @@ private struct GeneralTab: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
+
+            Section("Window") {
+                Toggle("Keep on top of other windows", isOn: $settings.alwaysOnTop)
+                    .font(.system(size: 12))
+            }
         }
         .formStyle(.grouped)
     }
