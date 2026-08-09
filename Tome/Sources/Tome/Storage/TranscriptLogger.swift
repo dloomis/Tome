@@ -45,6 +45,10 @@ actor TranscriptLogger {
     /// frontmatter immediately (not at finalize time) so a crash-orphaned
     /// transcript already carries it. Defaults to a fresh mint so no path can
     /// produce an unstamped note.
+    ///
+    /// `startedAt` defaults to now — the live path. An import passes the moment the
+    /// *recording* began, which backdates the filename date prefix, the frontmatter
+    /// `created:`/`time:`, and the t=0 every per-line offset is measured from.
     @discardableResult
     func startSession(
         sourceApp: String,
@@ -54,10 +58,11 @@ actor TranscriptLogger {
         calendarEventId: String? = nil,
         suggestedFilename: String? = nil,
         filenameDateFormat: String = "yyyy-MM-dd HH-mm-ss",
-        filenameTypeLabel: String? = nil
+        filenameTypeLabel: String? = nil,
+        startedAt: Date = Date()
     ) throws -> URL {
         self.sourceApp = sourceApp
-        self.sessionStartTime = Date()
+        self.sessionStartTime = startedAt
         self.sessionType = sessionType
         self.speakersDetected = []
         self.sessionContext = ""
@@ -406,11 +411,13 @@ tags:
     /// Close the current session and return an immutable snapshot for post-processing.
     /// The logger is now free to begin a new session — the snapshot carries everything
     /// `TranscriptFinalizer` needs to finalize this session in the background.
-    func endSession() -> TranscriptSessionSnapshot? {
-        // Capture the stop moment first — duration is measured to here, not to whenever
-        // the background queue eventually finalizes this session (which can be minutes
-        // later behind diarization of an earlier session).
-        let endTime = Date()
+    ///
+    /// `endTime` defaults to the stop moment — duration is measured to here, not to
+    /// whenever the background queue eventually finalizes this session (which can be
+    /// minutes later behind diarization of an earlier session). It stays a parameter
+    /// evaluated before any flush/close so the ordering of side effects is unchanged;
+    /// an import passes `recordingStart + audioDuration` instead.
+    func endSession(endTime: Date = Date()) -> TranscriptSessionSnapshot? {
         flushBuffer()
         try? fileHandle?.synchronize()
         try? fileHandle?.close()

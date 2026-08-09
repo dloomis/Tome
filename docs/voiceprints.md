@@ -39,6 +39,9 @@ Which stream is diarized depends on the session:
   **mic** WAV itself — every speaker, including the recording user, comes from the diarizer.
   → `source: "mic"`, `includesYou: true`, labels numbered from **1**. A solo memo (≤1
   detected speaker) keeps its "You" transcript and writes no sidecar.
+- **Imported WAV** (File ▸ Import) diarizes like a voice memo, but the audio was recorded
+  on some other device, so Tome cannot attest the user is among the speakers.
+  → `source: "imported"`, `includesYou: false`, labels numbered from **1**.
 
 Keys are the **same `Speaker N` labels used in the transcript body** (`speakerLabels`, in
 encounter order from the per-session base) so they line up with what WhisperCal's
@@ -67,9 +70,14 @@ frontmatter key so the link survives a later rename:
 - `model` — embedding-space identity; matches are refused across mismatches. Bump when the
   diarization model changes.
 - `source` — which stream was diarized: `system` (call capture), `mic` (voice memo /
-  in-person meeting), or `mixed` (the backfill CLI re-diarizing a retained mono mix).
+  in-person meeting recorded live on this machine), `imported` (a WAV brought in through
+  File ▸ Import — audio recorded on some other device), or `mixed` (the backfill CLI
+  re-diarizing a retained mono mix). Invariant: `source: "mic"` always implies
+  `includesYou: true`; consumers deciding whether the recording user is among the prints
+  must key on `includesYou`, never on `source` alone.
 - `includesYou` — `false` when the recording user is the un-diarized mic channel (call
-  capture); `true` for a mic-only session, where you *are* one of the diarized speakers
+  capture) or when Tome cannot attest the user is present at all (imported audio);
+  `true` for a live mic-only session, where you *are* one of the diarized speakers
   (Tome doesn't label which — WhisperCal binds it on confirmation, learning your own print).
 - `activeSeconds` / `segmentCount` — per-speaker quality signal so the consumer can refuse
   a flimsy drive-by centroid.

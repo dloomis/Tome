@@ -373,12 +373,14 @@ private struct TranscriptionTab: View {
     /// Spec §4a: no swap may land mid-recording, mid-post-processing, or
     /// mid-recovery — a job re-transcribed by two models is a quality bug.
     /// `isSessionPending` closes the start/stop transition windows that
-    /// `isRecording` misses (audit F-2).
+    /// `isRecording` misses (audit F-2). `isImporting` covers the offline
+    /// import pass, which drives the same ASR backend (WAV import §7).
     private var modelChangeLocked: Bool {
         services.isRecording
             || services.postProcessingQueue.isAnyJobRunning
             || services.isRecovering
             || services.isSessionPending
+            || services.isImporting
     }
 
     /// Per-row install state (spec §6): each row describes ITSELF; the

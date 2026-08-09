@@ -114,6 +114,12 @@ struct TomeApp: App {
                 // shortcuts win when the main window is key, so the menu shortcut
                 // must avoid both.
                 .keyboardShortcut("r", modifiers: [.command, .option])
+                // Same static-enable constraint as the two buttons above: the
+                // action no-ops (beep + error row) when import isn't possible.
+                Button("Import Audio...") {
+                    services.importAudioAction?()
+                }
+                .keyboardShortcut("i", modifiers: .command)
             }
             CommandGroup(after: .toolbar) {
                 Button("Logs") {

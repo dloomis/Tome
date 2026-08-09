@@ -162,8 +162,12 @@ final class PostProcessingJob: Identifiable {
             diarBufferURL = handle.micWavPath
             speakerBase = 1
             preserveYou = false
-            voiceprintSource = "mic"
-            voiceprintIncludesYou = true
+            // Historically `source: "mic"` always implied `includesYou: true`;
+            // downstream consumers key on that (docs/voiceprints.md). An imported
+            // file was recorded elsewhere, so it gets its own source value rather
+            // than a contract-breaking ("mic", includesYou: false) pairing.
+            voiceprintSource = handle.origin == .imported ? "imported" : "mic"
+            voiceprintIncludesYou = handle.voiceprintIncludesYou
         }
 
         var diarOutput: DiarizationOutput?

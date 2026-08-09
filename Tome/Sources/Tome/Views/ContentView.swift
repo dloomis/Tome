@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
+import UserNotifications
 
 // The conferencing-app table lives in `MeetingDetector.swift` (`conferencingApps` /
 // `conferencingAppName`) so detection and source-app labeling share one source of truth.
@@ -72,6 +74,22 @@ struct ContentView: View {
     /// earlier line(s). Reset to 0 whenever the store is cleared for a new session.
     @State private var persistedUtteranceCount = 0
 
+    /// True while a conforming file drag hovers the window and importing is
+    /// currently allowed. Drives the "Drop to import audio" overlay.
+    @State private var importDropTargeted = false
+    /// In-app line for an import that couldn't start or failed — the analogue of
+    /// the discard notice, and independent of notification permission.
+    @State private var importNotice: ImportNotice?
+    @State private var importNoticeDismissTask: Task<Void, Never>?
+
+    /// Text in the import status row's fallback slot. `isError` picks the
+    /// styling: failures get the red warning treatment, informational notes
+    /// (e.g. the one-file-at-a-time note) must not read as errors.
+    private struct ImportNotice: Equatable {
+        let message: String
+        let isError: Bool
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Glass top bar
@@ -103,6 +121,10 @@ struct ContentView: View {
             } else if let notice = discardNotice, activeSessionType == nil {
                 discardBanner(notice)
             }
+
+            // Import status / failure — its own slot, since an import can be in
+            // flight while a previous session's save banner is still up.
+            importStatusRow
 
             // Waveform ribbon
             WaveformView(isRecording: isRunning, audioLevel: audioLevel)
@@ -149,10 +171,22 @@ struct ContentView: View {
                 .keyboardShortcut(.defaultAction)
             Button("Stop Recording", role: .destructive) { stopConfirmation.confirmStop() }
         }
+        .onDrop(
+            of: [.fileURL],
+            delegate: ImportDropDelegate(
+                isEnabled: canImportAudio,
+                isTargeted: $importDropTargeted,
+                onDrop: { urls in beginImport(urls) }
+            )
+        )
         .overlay {
+            // Onboarding wins the overlay slot: the drop target is disabled
+            // while it's up, so the two can't both be showing.
             if showOnboarding {
                 OnboardingView(isPresented: $showOnboarding)
                     .transition(.opacity)
+            } else if importDropTargeted {
+                importDropOverlay
             }
         }
         .onChange(of: showOnboarding) {
@@ -236,6 +270,12 @@ struct ContentView: View {
 
             services.saveTranscriptAction = { saveTranscriptToFile() }
             services.recoverFromWAVAction = { recoverFromWAV() }
+            services.importAudioAction = { importAudio() }
+            // The coordinator's §7 gate asks the app whether it's idle. Everything
+            // else it needs (isRecording / isSessionPending / model readiness)
+            // lives on AppServices; `activeSessionType` is ContentView's, and it
+            // flips before `isRecording` does on the start path.
+            services.importIdleProbe = { activeSessionType == nil }
 
             // Silence stop prompt — the notification's action buttons mirror the
             // in-app prompt so it's answerable while the Tome window is hidden
@@ -350,6 +390,20 @@ struct ContentView: View {
                 guard MixerLeanInPrompt.isMixPublishingMixer(bundleID),
                       activeSessionType == nil else { continue }
                 evaluateMixerLeanInPrompt()
+            }
+        }
+        // One handler for all three import signals — SwiftUI type-checks this
+        // body as a single expression, and three more `.onChange` modifiers
+        // pushed it past the solver's budget.
+        .onChange(of: importSignal) { old, new in
+            // Poke the coordinator whenever the app's busy-ness changes, so a
+            // file queued behind a recording starts the moment the app goes
+            // idle (the coordinator's own retry poll is only a backstop).
+            if old.isBusy != new.isBusy {
+                services.importCoordinator.sessionStateDidChange()
+            }
+            if old.finishedCount != new.finishedCount {
+                handleImportFinished()
             }
         }
         .onChange(of: settings.inputDeviceUID) {
@@ -650,6 +704,289 @@ struct ContentView: View {
         .background(Color.bg1.opacity(0.7))
         .overlay(Divider(), alignment: .top)
         .overlay(Divider(), alignment: .bottom)
+    }
+
+    // MARK: - Import (spec: 2026-08-08 WAV import)
+
+    /// The two things the body watches on behalf of imports, folded into one
+    /// `Equatable` so a single `onChange` covers both.
+    private struct ImportSignal: Equatable {
+        let isBusy: Bool
+        let finishedCount: Int
+    }
+
+    private var importSignal: ImportSignal {
+        ImportSignal(
+            isBusy: activeSessionType != nil || services.isSessionPending,
+            finishedCount: services.importCoordinator.results.count
+        )
+    }
+
+    /// Both entry points — the ⌘I menu item and drag-and-drop — gate on exactly
+    /// this. The coordinator would happily queue a file and wait for the app to
+    /// go idle, but silently accepting a drop mid-recording reads as nothing
+    /// happening; refusing is the honest answer, and the drag gets the system's
+    /// "not allowed" cursor for free.
+    private var canImportAudio: Bool {
+        // Must cover every term of `AppServices.importCanStart`: a gap between
+        // the two gates lets a drop enqueue here and then wait forever on a
+        // condition ("Waiting for the current recording…") that isn't the cause.
+        !showOnboarding
+            && activeSessionType == nil
+            && !isRunning
+            && !services.isSessionPending
+            && !services.isRecovering
+            && services.modelProvisioner.canStartRecording
+    }
+
+    /// Why `canImportAudio` is false, for the no-op path's error row.
+    private var importUnavailableReason: String {
+        if showOnboarding {
+            return "Finish setting up Tome first, then import a recording."
+        }
+        if activeSessionType != nil || isRunning || services.isSessionPending {
+            return "Stop the current recording before importing a file."
+        }
+        if services.isRecovering {
+            return "Wait for the current recovery to finish before importing."
+        }
+        return "Transcription model not ready — check Settings ▸ Transcription"
+    }
+
+    /// `File ▸ Import Audio…` (⌘I). Registered into `AppServices` at boot rather
+    /// than driven by an `@FocusedValue`, and the menu item stays statically
+    /// enabled — see `CLAUDE.md` (Keyboard Shortcuts) for the macOS 26 crash.
+    private func importAudio() {
+        guard canImportAudio else {
+            NSSound.beep()
+            showImportNotice(importUnavailableReason)
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "Import Audio"
+        panel.prompt = "Import"
+        panel.allowedContentTypes = ImportSupport.acceptedContentTypes
+        // v1 is one file per gesture (§2). Flipping this is the v2 entry point —
+        // `beginImport` and the coordinator are already list-shaped.
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.resolvesAliases = true
+
+        guard panel.runModal() == .OK else { return }
+        beginImport(panel.urls)
+    }
+
+    /// Funnel for both entry points. Resolves aliases, applies the cheap type
+    /// gate, and hands the coordinator a list (one element in v1).
+    private func beginImport(_ urls: [URL]) {
+        guard canImportAudio else {
+            NSSound.beep()
+            showImportNotice(importUnavailableReason)
+            return
+        }
+        let resolved = urls.map(Self.resolvedFileURL)
+        let conforming = resolved.filter(ImportSupport.conformsToAcceptedType)
+        guard let first = conforming.first else {
+            NSSound.beep()
+            showImportNotice("Tome can only import .wav recordings right now.")
+            return
+        }
+        if resolved.count > 1 {
+            // Worded to stay true after the import finishes too — the active-job
+            // banner occupies the slot until then, so this often surfaces late.
+            showImportNotice("Tome imports one file at a time — skipped all but \(first.lastPathComponent).", isError: false)
+        } else {
+            clearImportNotice()
+        }
+        services.importCoordinator.enqueue([first])
+    }
+
+    /// Follow an alias/symlink to the file the user actually meant. `NSOpenPanel`
+    /// resolves aliases itself; a dropped item may not be resolved.
+    private static func resolvedFileURL(_ url: URL) -> URL {
+        if let real = try? URL(resolvingAliasFileAt: url, options: []) { return real }
+        return url.resolvingSymlinksInPath()
+    }
+
+    /// One import reached a terminal state. Successes say nothing here — the
+    /// handed-off `PostProcessingJob` drives the ordinary save banner and
+    /// notification when it finishes, exactly as for a native memo.
+    private func handleImportFinished() {
+        guard let result = services.importCoordinator.lastResult,
+              let message = result.message else { return }
+        showImportNotice(message)
+        // The window is often hidden behind whatever the user was doing; the
+        // in-app row alone would go unseen. Same fallback shape as the
+        // job-failure notification in `NotificationPresenter`.
+        if !isMainWindowVisible {
+            Task { await postImportFailureNotification(message) }
+        }
+    }
+
+    private func showImportNotice(_ message: String, isError: Bool = true) {
+        importNotice = ImportNotice(message: message, isError: isError)
+        importNoticeDismissTask?.cancel()
+        importNoticeDismissTask = Task {
+            try? await Task.sleep(for: .seconds(12))
+            if !Task.isCancelled { importNotice = nil }
+        }
+    }
+
+    private func clearImportNotice() {
+        importNoticeDismissTask?.cancel()
+        importNotice = nil
+    }
+
+    private var isMainWindowVisible: Bool {
+        NSApp.windows.contains { $0.isVisible && !$0.isMiniaturized && $0.title == "Tome" }
+    }
+
+    private func postImportFailureNotification(_ message: String) async {
+        await NotificationPresenter.shared.requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = "Import failed"
+        content.body = message
+        content.sound = nil
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        // Silently dropped when permission was denied — the in-app row above is
+        // the permission-independent signal.
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    // MARK: - Import UI
+
+    /// Phase line + progress + Cancel while a file is importing; the waiting
+    /// line while one is queued behind a recording; otherwise the last failure.
+    @ViewBuilder
+    private var importStatusRow: some View {
+        if let job = services.importCoordinator.activeJob, !job.phase.isTerminal {
+            importBanner(
+                icon: "square.and.arrow.down",
+                tint: Color.accent1,
+                title: importPhaseTitle(job),
+                progress: job.phase == .transcribing ? job.progressFraction : nil
+            ) {
+                Button("Cancel") {
+                    services.importCoordinator.cancelActiveJob()
+                }
+                .font(.system(size: 11))
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accent1)
+            }
+        } else if services.importCoordinator.isWaitingForIdle {
+            importBanner(
+                icon: "clock",
+                tint: Color.fg2,
+                title: "Waiting for the current recording to finish…",
+                progress: nil
+            ) {
+                Button("Cancel") {
+                    services.importCoordinator.cancelAll()
+                }
+                .font(.system(size: 11))
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accent1)
+            }
+        } else if let notice = importNotice {
+            importBanner(
+                icon: notice.isError ? "exclamationmark.triangle.fill" : "info.circle.fill",
+                tint: notice.isError ? Color.recordRed : Color.fg2,
+                title: notice.message,
+                progress: nil
+            ) {
+                Button(action: { clearImportNotice() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.fg3)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+            }
+        }
+    }
+
+    private func importPhaseTitle(_ job: ImportJob) -> String {
+        switch job.phase {
+        case .queued, .validating:
+            return "Validating…"
+        case .preparing:
+            return "Preparing…"
+        case .transcribing:
+            let percent = Int(job.progressFraction * 100)
+            return "Transcribing “\(job.sourceStem)” (\(percent)%)"
+        case .handedOff, .failed, .failedInternal, .cancelled:
+            return job.displayName
+        }
+    }
+
+    /// Same slot geometry and glass as the save/discard banners so the three
+    /// never look like different mechanisms.
+    private func importBanner<Trailing: View>(
+        icon: String,
+        tint: Color,
+        title: String,
+        progress: Double?,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(tint.opacity(0.15))
+                .frame(width: 16, height: 16)
+                .overlay(
+                    Image(systemName: icon)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(tint)
+                )
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.fg1)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let progress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .tint(tint)
+                        .frame(height: 2)
+                }
+            }
+            Spacer(minLength: 6)
+            trailing()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.bg1.opacity(0.7))
+        .overlay(Divider(), alignment: .top)
+        .overlay(Divider(), alignment: .bottom)
+    }
+
+    private var importDropOverlay: some View {
+        ZStack {
+            Color.bg0.opacity(0.85)
+            VStack(spacing: 10) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 30))
+                    .foregroundStyle(Color.accent1)
+                Text("Drop to import audio")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.fg1)
+                Text("WAV recordings become voice memos.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.fg2)
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.accent1.opacity(0.7), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                .padding(8)
+        )
+        .allowsHitTesting(false)
+        .transition(.opacity)
     }
 
     // MARK: - Helpers
@@ -1406,5 +1743,67 @@ struct ContentView: View {
             utteranceChannel?.write(speaker: u.speaker, text: u.text, timestamp: u.timestamp)
         }
         persistedUtteranceCount = count
+    }
+}
+
+// MARK: - Import drop target
+
+/// A `DropDelegate` rather than the closure form of `.onDrop` because only
+/// `validateDrop` can *refuse* a drag: returning false there is what makes the
+/// system show the "not allowed" cursor over a PDF, a folder, or any drag while
+/// a session is live — the closure form accepts everything and then discards it,
+/// which reads to the user as Tome silently swallowing the file.
+private struct ImportDropDelegate: DropDelegate {
+    let isEnabled: Bool
+    @Binding var isTargeted: Bool
+    /// List-shaped for v2 batch import; v1's handler takes the first conforming URL.
+    let onDrop: ([URL]) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Both checks: a file URL that is also an accepted audio type. Without
+        // the type term every drag (PDF, folder) gets the inviting overlay and
+        // then a red error row — the refusal cursor is the honest answer.
+        isEnabled
+            && info.hasItemsConforming(to: [.fileURL])
+            && info.hasItemsConforming(to: ImportSupport.acceptedContentTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        isTargeted = validateDrop(info: info)
+    }
+
+    func dropExited(info: DropInfo) {
+        isTargeted = false
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
+        guard isEnabled else { return false }
+        let providers = info.itemProviders(for: [.fileURL])
+        guard !providers.isEmpty else { return false }
+        Task { @MainActor in
+            var urls: [URL] = []
+            for provider in providers {
+                if let url = await Self.fileURL(from: provider) { urls.append(url) }
+            }
+            guard !urls.isEmpty else { return }
+            onDrop(urls)
+        }
+        return true
+    }
+
+    /// `loadObject(ofClass: URL.self)` is unavailable on a non-Sendable-checked
+    /// path here; the data representation of a `public.file-url` is the URL's
+    /// bookmark-free byte form, which `URL(dataRepresentation:)` reads directly.
+    private static func fileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
+            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: url)
+            }
+        }
     }
 }

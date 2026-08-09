@@ -19,6 +19,12 @@ final class StreamingTranscriber: @unchecked Sendable {
     /// stop path depends on this: it awaits `run()`'s task and then snapshots
     /// the transcript, which must already contain the tail utterance.
     private let onFinal: @Sendable (String, Date) async -> Void
+    /// Overrides the audio clock's origin. `nil` (live capture) anchors at the
+    /// wall-clock moment the first buffer arrives; an offline pass over an
+    /// already-recorded file passes the moment that recording *started*, so the
+    /// utterance timestamps — and the per-line offsets derived from them — describe
+    /// audio position rather than replay time.
+    private let injectedBaseTime: Date?
     private let log = Logger(subsystem: tomeLogSubsystem, category: "StreamingTranscriber")
 
     /// Resampler from source format to 16kHz mono Float32.
@@ -35,6 +41,7 @@ final class StreamingTranscriber: @unchecked Sendable {
         vad: any VADStream,
         speaker: Speaker,
         audioSource: AudioSource = .microphone,
+        baseTime: Date? = nil,
         onPartial: @escaping @Sendable (String) -> Void,
         onFinal: @escaping @Sendable (String, Date) async -> Void
     ) {
@@ -42,6 +49,7 @@ final class StreamingTranscriber: @unchecked Sendable {
         self.vad = vad
         self.speaker = speaker
         self.audioSource = audioSource
+        self.injectedBaseTime = baseTime
         self.onPartial = onPartial
         self.onFinal = onFinal
     }
@@ -88,7 +96,9 @@ final class StreamingTranscriber: @unchecked Sendable {
         // received sample (≈ capture start, the same anchor the recording mixer pads
         // each track to). `consumedSamples` counts 16kHz samples handed to the VAD, so
         // `segmentStartSample / 16000` is the audio position where a segment begins.
-        var baseTime: Date?
+        // An injected base (offline pass over a file recorded earlier) pre-seeds it, so
+        // the first-buffer `Date()` below is never reached; live capture is unaffected.
+        var baseTime: Date? = injectedBaseTime
         var consumedSamples = 0
         var segmentStartSample = 0
 

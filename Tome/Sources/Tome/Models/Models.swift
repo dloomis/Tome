@@ -137,6 +137,20 @@ struct TranscriptSessionSnapshot: Sendable {
     }
 }
 
+// MARK: - Session Origin
+
+/// Where a session's audio came from. `.live` is a native capture through the
+/// engine; `.imported` is a file recorded elsewhere and run through the import
+/// pipeline. The distinction exists for exactly one downstream artifact — the
+/// voiceprint sidecar, whose `includesYou` claim (see
+/// `SessionHandle.voiceprintIncludesYou`) and `source` value (`"imported"`
+/// instead of `"mic"`) both turn on it. Nothing else in post-processing
+/// branches on it.
+enum SessionOrigin: String, Codable, Sendable {
+    case live
+    case imported
+}
+
 // MARK: - Session Handle
 
 /// Immutable identity + resources for one session. Handed off at stop time to a
@@ -161,10 +175,26 @@ struct SessionHandle: Sendable {
     let micFirstSampleTime: Date?
     let systemFirstSampleTime: Date?
     var transcript: TranscriptSessionSnapshot
+    /// Native capture vs. imported file. Defaults to `.live` so every existing
+    /// construction site (and any decoded artifact that predates imports) keeps
+    /// its current meaning. `var` (not `let`) because a `let` with a default value
+    /// is excluded from the memberwise initializer — the import pipeline must be
+    /// able to pass `origin: .imported` at construction.
+    var origin: SessionOrigin = .live
     /// Number of times the system-audio WAV writer threw on `write(from:)`. Non-zero
     /// values are not fatal but indicate the diarization input may be incomplete —
     /// the post-processing job logs a warning before diarizing.
     var wavWriteErrorCount: Int = 0
+
+    /// Whether the voiceprint sidecar may assert the recording user is among the
+    /// `Speaker N` prints. Only a mic-only session recorded on this machine can
+    /// claim that: a call capture diarizes the "Them" leg alone, and an imported
+    /// file was recorded on some other device, so Tome cannot attest the user is
+    /// present. Downstream (WhisperCal) must not bind a centroid to the user
+    /// unless this is true.
+    var voiceprintIncludesYou: Bool {
+        sessionType == .voiceMemo && origin == .live
+    }
 
     /// Directory holding this session's capture artifacts (WAVs, session JSONL,
     /// sidecars). Derived strictly from the capture WAV paths — nil when the
