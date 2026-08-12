@@ -527,8 +527,10 @@ struct ContentView: View {
                 )
                 .padding(.leading, 10)
 
-            Spacer()
-
+            // Left-justified, immediately after the language label: anchored here
+            // the toggles keep a fixed position, where trailing placement let the
+            // status text's changing width (Ready / 0:07 / Finalizing…) slide them
+            // back and forth once per second during a recording.
             HStack(spacing: 2) {
                 topBarToggle(
                     symbol: "mic.slash",
@@ -548,11 +550,13 @@ struct ContentView: View {
                     help: "Keep Tome on top of other windows"
                 ) { settings.alwaysOnTop.toggle() }
             }
-            .padding(.trailing, 8)
+            .padding(.leading, 8)
+
+            Spacer()
 
             HStack(spacing: 10) {
                 Text(topBarStatus)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
                     .foregroundStyle(isRunning ? Color.fg1 : Color.fg2)
 
                 if isRunning {
