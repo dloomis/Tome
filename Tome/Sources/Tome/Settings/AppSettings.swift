@@ -104,6 +104,19 @@ final class AppSettings {
         "com.elgato.WaveLink",
     ]
 
+    // MARK: - Record Button
+
+    /// Settings ▸ Output "Record button: Single (auto-detect) | Call Capture +
+    /// Voice Memo". True (default): `ControlBar` shows one Record button that
+    /// starts a `RecordingMode.auto` session — both legs captured, the session
+    /// type resolved at stop (`SessionTypeResolver`); ⌘⇧R / Option-click still
+    /// start an explicit voice memo. False: the split layout, which is the
+    /// pre-2026-09-26 UI verbatim — a one-toggle rollback with no code removed.
+    /// See docs/superpowers/specs/2026-09-26-single-record-button-auto-mode.md §7.
+    var singleRecordButton: Bool {
+        didSet { UserDefaults.standard.set(singleRecordButton, forKey: "singleRecordButton") }
+    }
+
     var vaultMeetingsPath: String {
         didSet { UserDefaults.standard.set(vaultMeetingsPath, forKey: "vaultMeetingsPath") }
     }
@@ -262,6 +275,9 @@ final class AppSettings {
         self.excludedAudioAppIDs = seeded.list
         defaults.set(seeded.list, forKey: "excludedAudioAppIDs")
         defaults.set(seeded.seen, forKey: "excludedAudioAppSeenDefaults")
+        self.singleRecordButton = defaults.object(forKey: "singleRecordButton") == nil
+            ? true
+            : defaults.bool(forKey: "singleRecordButton")
         self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Tome/Meetings").expandingTildeInPath
         self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Tome/Voice").expandingTildeInPath
         self.retainRecordings = defaults.bool(forKey: "retainRecordings")

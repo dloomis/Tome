@@ -62,7 +62,16 @@ final class PostProcessingJob: Identifiable {
     /// this only for call captures with `AppSettings.discardShortMeetings` enabled.
     let discardIfShorterThanOrEqual: TimeInterval?
 
-    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, mergeGapSeconds: Double = 1.5, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, discardIfShorterThanOrEqual: TimeInterval? = nil) {
+    /// Non-nil only when the session RESOLVED to `.voiceMemo` at stop but its live
+    /// note was written provisionally as a call note (the single-button `.auto`
+    /// path — see docs/superpowers/specs/2026-09-26-single-record-button-auto-mode.md).
+    /// `handle.sessionType` is already the resolved type (`.voiceMemo`) in that
+    /// case; the plan only says "the note on disk still looks like a call note —
+    /// re-type it and move it to the voice folder before anything else runs".
+    /// Nil for explicit call captures, explicit voice memos and resolved calls.
+    let provisionalRetype: RetypePlan?
+
+    init(handle: SessionHandle, clusterThreshold: Float, numberOfSpeakers: Int, mergeGapSeconds: Double = 1.5, retention: RecordingRetentionConfig? = nil, exportVoiceprints: Bool = false, discardIfShorterThanOrEqual: TimeInterval? = nil, provisionalRetype: RetypePlan? = nil) {
         self.id = handle.id
         self.handle = handle
         self.clusterThreshold = clusterThreshold
@@ -71,6 +80,7 @@ final class PostProcessingJob: Identifiable {
         self.retention = retention
         self.exportVoiceprints = exportVoiceprints
         self.discardIfShorterThanOrEqual = discardIfShorterThanOrEqual
+        self.provisionalRetype = provisionalRetype
     }
 
     /// Run the full pipeline. The main-actor boundary between steps is where
@@ -88,7 +98,7 @@ final class PostProcessingJob: Identifiable {
         //    meetings) diarize the mic WAV itself — every speaker, including the recording
         //    user, comes from the diarizer, so labels start at 1 and the live "You" lines
         //    are replaced wholesale.
-        diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), micWavPath=\(handle.micWavPath?.path ?? "nil"), sessionType=\(handle.sessionType)")
+        diagLog("[JOB \(id)] starting run, wavBufferPath=\(handle.wavBufferPath?.path ?? "nil"), micWavPath=\(handle.micWavPath?.path ?? "nil"), sessionType=\(handle.sessionType), provisionalRetype=\(provisionalRetype != nil)")
         if handle.wavWriteErrorCount > 0 {
             diagLog("[JOB \(id)] WARN: system-audio WAV had \(handle.wavWriteErrorCount) write errors during capture — diarization input may be incomplete")
         }
@@ -103,9 +113,7 @@ final class PostProcessingJob: Identifiable {
         if let renamed = TranscriptFinalizer.relocateRenamedNote(from: handle.transcript.filePath) {
             diagLog("[JOB \(id)] transcript renamed externally — following to \(renamed.lastPathComponent)")
             handle.transcript = handle.transcript.relocated(to: renamed)
-            if let wavPath = handle.wavBufferPath ?? handle.micWavPath {
-                SessionSidecar.updateTranscriptPath(forWAV: wavPath, to: renamed)
-            }
+            repointSidecars(to: renamed)
         }
 
         // External-deletion fallback (incident 2026-07-23): deleting the meeting
@@ -133,11 +141,62 @@ final class PostProcessingJob: Identifiable {
             }
         }
 
+        // Provisional retype (single-button `.auto` sessions resolved as a memo).
+        // ORDER MATTERS — this runs:
+        //  • AFTER the relocate/rebuild fallbacks above: it patches the note on
+        //    disk, so it needs one there. A JSONL-rebuilt note was rebuilt with the
+        //    resolved `handle.sessionType` (already memo-shaped); the retype is
+        //    idempotent on it and just moves it.
+        //  • BEFORE the discard check and diarization: the note must be typed and
+        //    filed as a memo within seconds of stop, and every later step
+        //    (rebuild, finalize, voiceprint/recording links) must act on the
+        //    relocated path.
+        // A failed content rewrite (note unreadable / unwritable) fails the job
+        // exactly like a finalize failure: WAVs kept, provisional note untouched,
+        // the queue writes `<sid>.failed.json`. A failed MOVE is not a failure —
+        // the finalizer leaves a correctly-typed memo in the meetings folder and
+        // returns that path.
+        if let plan = provisionalRetype {
+            if handle.sessionType == .voiceMemo {
+                do {
+                    handle.transcript = try TranscriptFinalizer.retypeAsVoiceMemo(snapshot: handle.transcript, plan: plan)
+                } catch {
+                    if let bufferURL = handle.wavBufferPath ?? handle.micWavPath {
+                        handleDurableWriteFailure(bufferURL: bufferURL, error: error)
+                    }
+                    phase = .failed(error)
+                    throw error
+                }
+                diagLog("[JOB \(id)] retyped provisional call note as voice memo → \(handle.transcript.filePath.lastPathComponent)")
+                // An `.auto` session wrote TWO sidecars (system `<sid>.wav` and
+                // mic `<sid>.mic.wav`), both naming the meetings-folder path and
+                // both saying `.callCapture` — the provisional type written at
+                // start. Diarization takes minutes; a crash in that window must
+                // not let the orphan scan rebuild a duplicate `type: meeting`
+                // note at the stale path and recover with `preserveYou: true`.
+                // Re-point BOTH at the retyped note and re-type them. (Spec §6
+                // kept the provisional type in the sidecar for v1; re-typing
+                // here is strictly better and needs no schema change.) Done
+                // even when the move failed: the path is unchanged then, but
+                // the type is not.
+                repointSidecars(to: handle.transcript.filePath, sessionType: handle.sessionType)
+            } else {
+                // A plan only exists for a session RESOLVED as a memo. Paired with
+                // a call-capture handle it's a caller bug; re-typing would file a
+                // note as a memo while diarizing it as a call. Keep it a call.
+                diagLogError("[JOB \(id)] provisionalRetype set on a \(handle.sessionType) session — ignored, note stays a call note")
+            }
+        }
+
         // Short-recording discard: a session at/under the user's threshold is almost
         // certainly a canceled or mis-started meeting. Drop it here — before any
-        // expensive diarization — so nothing lands in the output folders. The
-        // sessionType check backstops the caller's call-captures-only policy: a
-        // voice memo is deliberate however short, and must never be discarded.
+        // expensive diarization — so nothing lands in the output folders.
+        // `handle.sessionType` is the RESOLVED type, not the requested mode: a
+        // single-button (`.auto`) session that resolved to a voice memo (a phone
+        // call on speaker) must never be discarded however short, even though it
+        // was captured as a provisional call and the caller computed a threshold.
+        // This check also backstops the caller's call-captures-only policy for
+        // explicit memos: a voice memo is deliberate and is never discarded.
         if let limit = discardIfShorterThanOrEqual, handle.sessionType == .callCapture {
             let duration = handle.transcript.sessionEndTime.timeIntervalSince(handle.transcript.sessionStartTime)
             if duration <= limit {
@@ -273,10 +332,10 @@ final class PostProcessingJob: Identifiable {
         // Finalization may have renamed the note; the crash-recovery sidecar still
         // points at the old path. Refresh it so a crash/quit between here and
         // cleanup leaves an orphan that auto-recovery can actually pair up.
-        // Mic-only sessions carry their sidecar on the mic WAV.
-        if savedPath != handle.transcript.filePath,
-           let wavPath = handle.wavBufferPath ?? handle.micWavPath {
-            SessionSidecar.updateTranscriptPath(forWAV: wavPath, to: savedPath)
+        // Covers every capture WAV's sidecar — a call session has one on the
+        // system WAV AND one on the mic WAV.
+        if savedPath != handle.transcript.filePath {
+            repointSidecars(to: savedPath)
         }
 
         // 2b. Emit per-speaker voiceprints next to the finalized transcript (opt-in).
@@ -322,6 +381,10 @@ final class PostProcessingJob: Identifiable {
             }
         }
 
+        // A resolved memo (single-button session) still has a non-nil
+        // `wavBufferPath` — its silent system leg. Retention above mixes the mic
+        // only for `.voiceMemo`, but cleanup deletes `wavBufferPath` (and its
+        // sidecar) unconditionally, so that WAV doesn't outlive the job.
         if sourceAudioDisposition == .deletable {
             cleanupCaptureFiles()
         }
@@ -391,6 +454,19 @@ final class PostProcessingJob: Identifiable {
         }.value
 
         return produced ? .exported(outputURL) : .failed
+    }
+
+    /// Re-point the crash-recovery sidecar of EVERY capture WAV this session has
+    /// (`wavBufferPath` and `micWavPath`, whichever exist) at `url`, optionally
+    /// re-typing it. Each WAV carries its own sidecar, and `OrphanScanner`
+    /// surfaces whichever WAV is the session's viable primary (the system WAV,
+    /// or the mic WAV when the system one is absent/a stub) — updating only one
+    /// leaves the other able to recover a duplicate note at a stale path, or
+    /// with the wrong `preserveYou`. Best-effort, like the sidecar API.
+    private func repointSidecars(to url: URL, sessionType: SessionType? = nil) {
+        for wavURL in [handle.wavBufferPath, handle.micWavPath].compactMap({ $0 }) {
+            SessionSidecar.updateTranscriptPath(forWAV: wavURL, to: url, sessionType: sessionType)
+        }
     }
 
     /// Delete both transient capture WAVs (and the system sidecar) for this session,

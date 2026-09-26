@@ -88,6 +88,42 @@ import Testing
                 "must not conjure a sidecar out of nothing")
     }
 
+    @Test func updateTranscriptPathWithTypeRewritesPathAndType() throws {
+        // A single-button session resolved as a memo: the provisional
+        // `.callCapture` sidecar is re-pointed AND re-typed; nothing else moves.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let wav = dir.appendingPathComponent("s.wav")
+        try SessionSidecar.write(makeSidecar(), to: SessionSidecar.sidecarURL(forWAV: wav))
+
+        SessionSidecar.updateTranscriptPath(forWAV: wav, to: URL(fileURLWithPath: "/voice/Memo.md"),
+                                            sessionType: .voiceMemo)
+
+        let read = try SessionSidecar.read(from: SessionSidecar.sidecarURL(forWAV: wav))
+        #expect(read.transcriptPath == "/voice/Memo.md")
+        #expect(read.sessionType == .voiceMemo)
+        let original = makeSidecar()
+        #expect(read.schema == original.schema)
+        #expect(read.sessionId == original.sessionId)
+        #expect(read.sessionGuid == original.sessionGuid)
+        #expect(read.sourceApp == original.sourceApp)
+        #expect(read.startedAt == original.startedAt)
+        #expect(read.sampleRate == original.sampleRate)
+        #expect(read.channels == original.channels)
+        #expect(read.bitsPerSample == original.bitsPerSample)
+        #expect(read.appVersion == original.appVersion)
+    }
+
+    @Test func updateTranscriptPathWithTypeIsNoOpWithoutSidecar() throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let wav = dir.appendingPathComponent("nosidecar.wav")
+        SessionSidecar.updateTranscriptPath(forWAV: wav, to: URL(fileURLWithPath: "/x.md"), sessionType: .voiceMemo)
+        #expect(!FileManager.default.fileExists(atPath: SessionSidecar.sidecarURL(forWAV: wav).path))
+    }
+
     @Test func incompatibleSidecarFailsDecodeRatherThanMispairing() throws {
         // Upgrade contract: a sidecar this build can't decode must degrade to
         // "no sidecar" (manual recovery), never to a wrong pairing.
@@ -114,5 +150,37 @@ import Testing
         """
         try json.write(to: url, atomically: true, encoding: .utf8)
         #expect(throws: (any Error).self) { try SessionSidecar.read(from: url) }
+    }
+
+    @Test func handWrittenSchema2SidecarStillDecodes() throws {
+        // Guards the single-record-button §6 follow-up (schema 3 + optional
+        // `requestedMode`): sidecars already on disk from schema-2 builds must
+        // keep decoding, field for field, with no new key present.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+
+        let url = dir.appendingPathComponent("s2.session.json")
+        let json = """
+        {"schema": 2, "sessionId": "session_2026-09-26_10-00-00",
+         "sessionGuid": "44444444-4444-4444-8444-444444444444",
+         "transcriptPath": "/vault/Meetings/2026-09-26 Call Recording.md",
+         "startedAt": "2026-09-26T10:00:00Z", "sourceApp": "Call",
+         "sessionType": "callCapture", "sampleRate": 48000, "channels": 1,
+         "bitsPerSample": 32, "appVersion": "1.9.0"}
+        """
+        try json.write(to: url, atomically: true, encoding: .utf8)
+
+        let read = try SessionSidecar.read(from: url)
+        #expect(read.schema == 2)
+        #expect(read.sessionId == "session_2026-09-26_10-00-00")
+        #expect(read.sessionGuid == "44444444-4444-4444-8444-444444444444")
+        #expect(read.transcriptPath == "/vault/Meetings/2026-09-26 Call Recording.md")
+        #expect(read.startedAt == ISO8601DateFormatter().date(from: "2026-09-26T10:00:00Z"))
+        #expect(read.sourceApp == "Call")
+        #expect(read.sessionType == .callCapture)
+        #expect(read.sampleRate == 48_000)
+        #expect(read.channels == 1)
+        #expect(read.bitsPerSample == 32)
+        #expect(read.appVersion == "1.9.0")
     }
 }

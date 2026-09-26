@@ -110,10 +110,11 @@ struct TomeApp: App {
                 Button("Recover from WAV...") {
                     services.recoverFromWAVAction?()
                 }
-                // Cmd+Opt+R — Cmd+R and Cmd+Shift+R are already taken by Start
-                // Call Capture / Start Voice Memo in `ControlBar.swift`. The window
-                // shortcuts win when the main window is key, so the menu shortcut
-                // must avoid both.
+                // Cmd+Opt+R — Cmd+R and Cmd+Shift+R are already taken in
+                // `ControlBar.swift` (Record / explicit Voice Memo in the single-
+                // button layout; Call Capture / Voice Memo in the split one). The
+                // window shortcuts win when the main window is key, so the menu
+                // shortcut must avoid both.
                 .keyboardShortcut("r", modifiers: [.command, .option])
                 // Same static-enable constraint as the two buttons above: the
                 // action no-ops (beep + error row) when import isn't possible.

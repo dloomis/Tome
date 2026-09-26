@@ -150,6 +150,28 @@ final class TranscriptionEngine {
         var isDevice: Bool { if case .device = self { return true } else { return false } }
     }
 
+    /// The feeder verdict (`FeederDetection`) most recently computed for the
+    /// DEVICE-backed system leg this session — recorded at bind time
+    /// (`armSystemDeviceDigitalSilenceCheck`), refreshed on every
+    /// `routeSystemDeviceSilence` tick (only reached while the leg is silent),
+    /// and forced to `.fed` once the device delivers a non-zero sample (the
+    /// 5s check's and the monitor loop's healthy branches) — real audio is
+    /// proof of feeding independent of the process table, so a bind-time
+    /// `.unfed` (Record hit before the mixer launched) heals when the mix
+    /// starts flowing. Once audio has flowed the verdict is not revised back
+    /// to `.unfed` (the monitor exits): a mix that carried audio could have
+    /// carried the call.
+    ///
+    /// Read by `ContentView.stopSession` as `SessionTypeResolver` evidence:
+    /// `.unfed` means the mix could not have carried a call. nil when the leg
+    /// is not device-backed (SCK, mic-only) or the bind-time name lookup has
+    /// not answered yet — nil carries no signal, it is never "fed".
+    ///
+    /// Reset at every `start()` and whenever the leg lands on SCK. Deliberately
+    /// NOT cleared by `stop()`, same reasoning as `systemSourceMode`: the
+    /// stop-time snapshot must still see it.
+    private(set) var systemLegFeederVerdict: FeederVerdict?
+
     /// Why a session configured for device mode is running on SCK instead. Each
     /// reason is user-visible (Part C of the mixer-device spec): a session
     /// recording from the "wrong" source must never be silent.
@@ -316,6 +338,7 @@ final class TranscriptionEngine {
         activeExcludedAudioAppIDs = excludedAudioAppIDs
         activeSystemSourceUID = captureSystemAudio ? systemAudioSourceUID : ""
         systemSourceMode = .sck
+        systemLegFeederVerdict = nil
         micFallbackMessage = nil
         systemSourceFallbackMessage = nil
         // Resolve the mic device. A HAL that never answers is NOT the same as a
@@ -1010,6 +1033,8 @@ final class TranscriptionEngine {
                 excludedBundleIDs: activeExcludedAudioAppIDs
             )
             systemSourceMode = .sck
+            // The verdict describes a mix device; on SCK it has no meaning.
+            systemLegFeederVerdict = nil
             currentBufferURL = streams.bufferURL
             // Any device-leg warnings describe a source we're no longer using.
             systemDeviceSilenceCheckTask?.cancel()
@@ -1090,7 +1115,16 @@ final class TranscriptionEngine {
             // deadline — silence isn't evidence yet.
             if let self {
                 let name = await MicCapture.deviceName(for: deviceID)
-                if case .unfed = self.feederVerdict(forDeviceName: name) {
+                let verdict = self.feederVerdict(forDeviceName: name)
+                // Record it as stop-time resolution evidence — but only for
+                // THIS arming: the name lookup awaited the HAL queue, and a
+                // stop (generation bump), a newer arming or an SCK fallback
+                // (both cancel this task) may have landed meanwhile. A stale
+                // write would hand the next session a verdict it never saw.
+                if !Task.isCancelled, generation == self.sessionGeneration {
+                    self.systemLegFeederVerdict = verdict
+                }
+                if case .unfed = verdict {
                     await self.routeSystemDeviceSilence(deviceID: deviceID)
                 }
             }
@@ -1103,7 +1137,11 @@ final class TranscriptionEngine {
             }
             if self.systemDeviceCapture.sawNonzeroSample {
                 // Healthy — also retires a bind-time unfed warning that healed
-                // (the mixer launched inside the window).
+                // (the mixer launched inside the window). Non-zero samples ARE
+                // proof the mix is fed, whatever the process table said at
+                // bind: revise the stop-time evidence so a healed `.unfed`
+                // can't resolve the session as `.voiceMemo(.mixUnfed)`.
+                self.systemLegFeederVerdict = .fed
                 self.clearSystemDeviceSilenceWarning()
                 return
             }
@@ -1128,6 +1166,9 @@ final class TranscriptionEngine {
                 }
                 if self.systemDeviceCapture.sawNonzeroSample {
                     diagLog("[SYS-DEVICE-SILENCE] real audio arrived — clearing the silence warning")
+                    // Proof of feeding (see the 5s check above) — the last
+                    // silent tick may have recorded `.unfed`.
+                    self.systemLegFeederVerdict = .fed
                     self.clearSystemDeviceSilenceWarning()
                     return
                 }
@@ -1144,8 +1185,16 @@ final class TranscriptionEngine {
     /// `.fed` + zeros is a quiet call — normal, never a banner; it also
     /// retires an unfed warning whose mixer has come back.
     private func routeSystemDeviceSilence(deviceID: AudioDeviceID) async {
+        let generation = sessionGeneration
         let name = await MicCapture.deviceName(for: deviceID)
         let verdict = feederVerdict(forDeviceName: name)
+        // Stop-time resolution evidence (see `systemLegFeederVerdict`). Only
+        // for the same session and while the leg is still device-backed: the
+        // name lookup awaited the HAL queue, and a stop + new start (generation
+        // bump) or an SCK fallback during it made this verdict someone else's.
+        if generation == sessionGeneration, systemSourceMode.isDevice {
+            systemLegFeederVerdict = verdict
+        }
         switch verdict {
         case .fed:
             if systemDeviceSilenceMessage != nil {

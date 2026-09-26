@@ -129,4 +129,195 @@ struct APIServerTests {
         let (stopStatus, _) = try await request(base, path: "stop", method: "POST")
         #expect(stopStatus == 200)
     }
+
+    // MARK: - Single Record Button (auto mode) — spec §8
+
+    /// POST with a JSON body. `request(_:path:)` sends no body, and
+    /// `/sessions/start` requires one.
+    private func post(
+        _ base: URL, path: String, json body: String, timeout: TimeInterval = 3
+    ) async throws -> (Int, [String: Any]) {
+        var req = URLRequest(url: base.appendingPathComponent(path))
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data(body.utf8)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (status, json)
+    }
+
+    /// Captures the `RecordingMode` the server hands to the registered
+    /// `onStart` callback (which runs on the MainActor).
+    @MainActor
+    private final class StartRecorder {
+        var modes: [RecordingMode] = []
+    }
+
+    /// Registers real (idle) app objects plus a recording `onStart`. The server
+    /// holds the store/engine weakly, so the caller must keep the returned
+    /// objects alive for the test's duration.
+    @MainActor
+    private func registerRecorder(
+        on server: APIServer, sessionsDir: URL
+    ) -> (StartRecorder, TranscriptStore, TranscriptionEngine) {
+        let recorder = StartRecorder()
+        let store = TranscriptStore()
+        let engine = TranscriptionEngine(transcriptStore: store, asrCoordinator: ASRCoordinator())
+        server.register(
+            transcriptStore: store,
+            transcriptionEngine: engine,
+            sessionStore: SessionStore(directory: sessionsDir),
+            onStart: { mode, _, _, _, _ in recorder.modes.append(mode) },
+            onStop: {}
+        )
+        return (recorder, store, engine)
+    }
+
+    /// Polls the MainActor recorder until `onStart` has fired `count` times.
+    private func awaitStarts(_ recorder: StartRecorder, count: Int) async throws -> [RecordingMode] {
+        for _ in 0..<300 {
+            let modes = await MainActor.run { recorder.modes }
+            if modes.count >= count { return modes }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return await MainActor.run { recorder.modes }
+    }
+
+    @Test func startSessionWithoutTypeDefaultsToAuto() async throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let (recorder, store, engine) = await registerRecorder(on: server, sessionsDir: dir)
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+        server.updateModelsReady(true)
+
+        let (status, json) = try await post(base, path: "api/v1/sessions/start", json: "{}")
+        #expect(status == 200)
+        #expect(json["status"] as? String == "starting")
+        #expect(try await awaitStarts(recorder, count: 1) == [.auto])
+        withExtendedLifetime((store, engine)) {}
+    }
+
+    @Test func startSessionAcceptsExplicitAuto() async throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let (recorder, store, engine) = await registerRecorder(on: server, sessionsDir: dir)
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+        server.updateModelsReady(true)
+
+        let (status, _) = try await post(base, path: "api/v1/sessions/start", json: #"{"type":"auto"}"#)
+        #expect(status == 200)
+        #expect(try await awaitStarts(recorder, count: 1) == [.auto])
+        withExtendedLifetime((store, engine)) {}
+    }
+
+    @Test func startSessionPassesExplicitTypesThrough() async throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let (recorder, store, engine) = await registerRecorder(on: server, sessionsDir: dir)
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+        server.updateModelsReady(true)
+
+        let (status, json) = try await post(base, path: "api/v1/sessions/start", json: #"{"type":"voiceMemo"}"#)
+        #expect(status == 200)
+        #expect(try await awaitStarts(recorder, count: 1) == [.voiceMemo])
+
+        // Walk the first session out of `recording` so the gate admits a second start.
+        let firstId = try #require(json["sessionId"] as? String)
+        server.sessionDidStop(id: firstId)
+        let (status2, _) = try await post(base, path: "api/v1/sessions/start", json: #"{"type":"callCapture"}"#)
+        #expect(status2 == 200)
+        #expect(try await awaitStarts(recorder, count: 2) == [.voiceMemo, .callCapture])
+        withExtendedLifetime((store, engine)) {}
+    }
+
+    @Test func startSessionRejectsUnknownType() async throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let (recorder, store, engine) = await registerRecorder(on: server, sessionsDir: dir)
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+        server.updateModelsReady(true)
+
+        let (status, json) = try await post(base, path: "api/v1/sessions/start", json: #"{"type":"meeting"}"#)
+        #expect(status == 400)
+        let message = try #require(json["error"] as? String)
+        #expect(message.contains("auto"))
+        // A rejected request must not start anything or occupy the gate.
+        #expect(server.lifecycleState == .idle)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await MainActor.run { recorder.modes }.isEmpty)
+        withExtendedLifetime((store, engine)) {}
+    }
+
+    @Test func sessionStatusExposesResolutionOnlyAfterRecording() async throws {
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let (_, store, engine) = await registerRecorder(on: server, sessionsDir: dir)
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+
+        let sid = "session_2026-09-26_10-00-00"
+        let guid = "33333333-3333-4333-8333-333333333333"
+        server.sessionDidStart(id: sid, guid: guid)
+
+        // While recording: neither field present. (The per-id "recording" case
+        // is covered below; here the registered engine is idle, so by-guid is
+        // the authoritative recording-state probe.)
+        let (guidStatus, guidJSON) = try await request(base, path: "api/v1/sessions/by-guid/\(guid)/status")
+        #expect(guidStatus == 200)
+        #expect(guidJSON["state"] as? String == "recording")
+        #expect(guidJSON["sessionType"] == nil)
+        #expect(guidJSON["resolution"] == nil)
+
+        // Resolved before the stop, as ContentView.stopSession will call it.
+        server.sessionDidResolve(id: sid, sessionType: .voiceMemo, resolution: "farEndSilent")
+        server.sessionDidStop(id: sid)
+
+        let (idStatus, idJSON) = try await request(base, path: "api/v1/sessions/\(sid)/status")
+        #expect(idStatus == 200)
+        #expect(idJSON["sessionType"] as? String == "voiceMemo")
+        #expect(idJSON["resolution"] as? String == "farEndSilent")
+
+        let (_, guidAfter) = try await request(base, path: "api/v1/sessions/by-guid/\(guid)/status")
+        #expect(guidAfter["state"] as? String == "transcribing")
+        #expect(guidAfter["sessionType"] as? String == "voiceMemo")
+        #expect(guidAfter["resolution"] as? String == "farEndSilent")
+
+        // Survives completion (until the 5s eviction).
+        server.sessionDidComplete(id: sid)
+        let (_, guidDone) = try await request(base, path: "api/v1/sessions/by-guid/\(guid)/status")
+        #expect(guidDone["state"] as? String == "complete")
+        #expect(guidDone["resolution"] as? String == "farEndSilent")
+        withExtendedLifetime((store, engine)) {}
+    }
+
+    @Test func sessionStatusOmitsResolutionForAnotherSessionStillRecording() async throws {
+        // Per-id path for a non-current session in `recording` (a newer session
+        // took over currentSessionId): no resolution fields, even if one leaked.
+        let dir = try TestSupport.makeTempDir()
+        defer { TestSupport.remove(dir) }
+        let server = APIServer(port: 0, portFileURL: dir.appendingPathComponent("api-port"))
+        defer { server.stop() }
+        let base = try await startServer(server, portFile: dir.appendingPathComponent("api-port"))
+
+        let older = "session_2026-09-26_09-00-00"
+        server.sessionDidStart(id: older)
+        server.sessionDidStart(id: "session_2026-09-26_09-30-00")
+
+        let (status, json) = try await request(base, path: "api/v1/sessions/\(older)/status")
+        #expect(status == 200)
+        #expect(json["status"] as? String == "recording")
+        #expect(json["sessionType"] == nil)
+        #expect(json["resolution"] == nil)
+    }
 }

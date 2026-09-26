@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct PulsingDot: View {
     var size: CGFloat = 10
@@ -16,6 +17,14 @@ struct PulsingDot: View {
 struct ControlBar: View {
     let isRecording: Bool
     let activeSessionType: SessionType?
+    /// What the in-flight session was started as. `.auto` sessions carry the
+    /// provisional `activeSessionType == .callCapture` (their real type is only
+    /// resolved at stop), so the Stop subtitle keys off this instead to avoid
+    /// promising "Call Capture" for what may become a voice memo.
+    let activeRequestedMode: RecordingMode?
+    /// `AppSettings.singleRecordButton`: true → one Record button (`.auto`),
+    /// false → the pre-2026-09-26 Call Capture + Voice Memo pair, verbatim.
+    let singleRecordButton: Bool
     let audioLevel: Float
     let detectedApp: String?
     /// Name of an auto-detected active meeting to offer for the Call Capture filename,
@@ -44,6 +53,8 @@ struct ControlBar: View {
     /// False while the selected model is downloading/loading/failed —
     /// disables both record buttons (and thereby their ⌘R/⌘⇧R shortcuts).
     let canStartRecording: Bool
+    /// Single-button start — a `RecordingMode.auto` session.
+    let onStartRecord: () -> Void
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
     /// Main Stop button — requests the "Are you sure?" confirmation
@@ -155,63 +166,98 @@ struct ControlBar: View {
                 if let meetingName = detectedMeetingName {
                     detectedMeetingChip(meetingName)
                 }
-                HStack(spacing: 10) {
-                    Button(action: onStartCallCapture) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "phone.fill")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Color.fg1)
-                            Text("Call Capture")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(Color.fg1)
-                            Text("⌘R")
-                                .font(.system(size: 10))
-                                .foregroundStyle(Color.fg3)
-                        }
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 8)
-                        .background(Color.bg1.opacity(0.7))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.06)))
-                    }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut("r", modifiers: .command)
-                    .disabled(!canStartRecording)
-                    .opacity(canStartRecording ? 1 : 0.45)
-
-                    Button(action: onStartVoiceMemo) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "mic.fill")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Color.fg1)
-                            Text("Voice Memo")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(Color.fg1)
-                            Text("⌘⇧R")
-                                .font(.system(size: 10))
-                                .foregroundStyle(Color.fg3)
-                        }
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 8)
-                        .background(Color.bg1.opacity(0.7))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.06)))
-                    }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(!canStartRecording)
-                    .opacity(canStartRecording ? 1 : 0.45)
+                if singleRecordButton {
+                    singleRecordButtonView
+                } else {
+                    splitRecordButtons
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
             }
         }
         .background(Color.bg1.opacity(0.45))
         .overlay(Divider(), alignment: .top)
+    }
+
+    /// The single Record button (`AppSettings.singleRecordButton`). Starts a
+    /// `.auto` session; Option-click starts an explicit voice memo instead.
+    /// ⌘⇧R keeps its explicit-voice-memo meaning via a zero-size shortcut
+    /// carrier in the background — a callback button like the others, never a
+    /// menu item (see CLAUDE.md ▸ Keyboard Shortcuts).
+    private var singleRecordButtonView: some View {
+        recordButton(icon: "record.circle", title: "Record", shortcutHint: "⌘R") {
+            if NSEvent.modifierFlags.contains(.option) {
+                onStartVoiceMemo()
+            } else {
+                onStartRecord()
+            }
+        }
+        .keyboardShortcut("r", modifiers: .command)
+        .help("Record — resolves to a meeting or a voice memo when you stop. Option-click or ⌘⇧R for an explicit voice memo.")
+        .background {
+            // Invisible ⌘⇧R carrier: explicit voice memo. This is the
+            // established SwiftUI pattern for a hidden shortcut carrier — a real
+            // Button with an empty Text label (an EmptyView label may not get a
+            // button installed at all), zero-size + opacity 0 rather than
+            // `.hidden()` so it stays in the responder chain and the shortcut
+            // fires. Not a menu `.commands` item (macOS 26 crash, CLAUDE.md).
+            // On the manual-acceptance list: verify ⌘⇧R starts a voice memo.
+            Button("", action: onStartVoiceMemo)
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .buttonStyle(.plain)
+                .disabled(!canStartRecording)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    /// The pre-2026-09-26 two-button layout — shown when
+    /// `AppSettings.singleRecordButton` is off.
+    private var splitRecordButtons: some View {
+        HStack(spacing: 10) {
+            recordButton(icon: "phone.fill", title: "Call Capture", shortcutHint: "⌘R", action: onStartCallCapture)
+                .keyboardShortcut("r", modifiers: .command)
+
+            recordButton(icon: "mic.fill", title: "Voice Memo", shortcutHint: "⌘⇧R", action: onStartVoiceMemo)
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    /// Shared chrome for the idle-state record buttons: icon + title + shortcut
+    /// hint in a rounded tile, gated on `canStartRecording`. Call sites add
+    /// only their `.keyboardShortcut` / `.help` / carrier.
+    private func recordButton(
+        icon: String,
+        title: String,
+        shortcutHint: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.fg1)
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.fg1)
+                Text(shortcutHint)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.fg3)
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 8)
+            .background(Color.bg1.opacity(0.7))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canStartRecording)
+        .opacity(canStartRecording ? 1 : 0.45)
     }
 
     /// Shown when the silence limit elapsed. Recording continues — nothing stops
@@ -289,6 +335,17 @@ struct ControlBar: View {
     }
 
     private var activeSessionLabel: String {
+        // `.auto`: the type is only resolved at stop, so name the meeting/app
+        // without committing to "Call Capture" or "Voice Memo".
+        if activeRequestedMode == .auto {
+            if let title = activeMeetingTitle, !title.isEmpty {
+                return "Recording · \(title)"
+            }
+            if let app = detectedApp {
+                return "Recording · \(app)"
+            }
+            return "Recording"
+        }
         switch activeSessionType {
         case .callCapture:
             if let title = activeMeetingTitle, !title.isEmpty {

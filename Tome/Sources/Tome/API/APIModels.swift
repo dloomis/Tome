@@ -12,7 +12,10 @@ struct MeetingContext: Codable, Sendable {
 
 /// Request body for POST /api/v1/sessions/start
 struct StartSessionRequest: Codable, Sendable {
-    let type: String
+    /// `"auto"` | `"callCapture"` | `"voiceMemo"`. Optional — omitted means
+    /// `"auto"` (capture both legs, resolve the session type at stop). Parsed via
+    /// `RecordingMode.fromAPIString`; anything else is a 400.
+    let type: String?
     /// Caller-supplied correlation key (see `WhisperCalStartRequest.sessionGuid`).
     let sessionGuid: String?
     let meetingContext: MeetingContext?
@@ -74,6 +77,13 @@ struct SessionGuidStatusResponse: Codable, Sendable {
     let transcriptPath: String?
     /// Failure phase or message — when state == "failed".
     let error: String?
+    /// Resolved session type — present once the session has left `recording`
+    /// (set by `APIServer.sessionDidResolve`). Nil optionals are dropped by the
+    /// encoder, so responses without it are byte-compatible with older builds.
+    var sessionType: SessionType? = nil
+    /// Why it resolved that way (`SessionTypeResolution.reasonLabel`, e.g.
+    /// `explicit`, `farEndSpeech`, `farEndSilent`) — same lifetime as `sessionType`.
+    var resolution: String? = nil
 }
 
 /// Response body for GET /api/v1/status (WhisperCal integration). `recording` is
@@ -102,6 +112,11 @@ struct SessionStatusResponse: Codable, Sendable {
     let elapsedSeconds: Int
     let speakerCount: Int
     let lineCount: Int
+    /// Resolved session type — present once the session has left `recording`
+    /// (set by `APIServer.sessionDidResolve`); absent while recording.
+    var sessionType: SessionType? = nil
+    /// `SessionTypeResolution.reasonLabel` — same lifetime as `sessionType`.
+    var resolution: String? = nil
 }
 
 /// Matches WhisperCal's TranscriptData.lines[n]

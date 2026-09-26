@@ -83,25 +83,23 @@ actor TranscriptLogger {
         // Heading label is purely cosmetic — keep the built-in names so the
         // YAML/markdown stays predictable for downstream tools. Filename label
         // is what the user actually sees in their vault, so use the override.
+        // An empty override is valid ("date-only filenames") and a label that
+        // sanitizes to nothing falls back to the built-in one — see
+        // `FilenameSanitizer.defaultTranscriptStem`, shared with the finalizer's
+        // voice-memo retype so both derive the same default name.
         let defaultTypeLabel = sessionType == .voiceMemo ? "Voice Memo" : "Call Recording"
-        let chosenLabel = filenameTypeLabel ?? defaultTypeLabel
-        // Empty override is valid ("date-only filenames"); preserve it. Sanitize
-        // only non-empty user input, falling back to the default if sanitization
-        // wipes everything (e.g. user typed only forbidden chars).
-        let sanitizedTypeLabel: String
-        if chosenLabel.isEmpty {
-            sanitizedTypeLabel = ""
-        } else {
-            sanitizedTypeLabel = FilenameSanitizer.sanitize(chosenLabel) ?? defaultTypeLabel
-        }
 
         let stem: String
         if let suggested = suggestedFilename,
            let cleaned = FilenameSanitizer.sanitize(suggested) {
             stem = cleaned
         } else {
-            let datePrefix = FilenameSanitizer.formattedDate(now, format: filenameDateFormat)
-            stem = sanitizedTypeLabel.isEmpty ? datePrefix : "\(datePrefix) \(sanitizedTypeLabel)"
+            stem = FilenameSanitizer.defaultTranscriptStem(
+                start: now,
+                dateFormat: filenameDateFormat,
+                typeLabel: filenameTypeLabel,
+                fallbackLabel: defaultTypeLabel
+            )
         }
         // Never clobber an existing note. `createFile` truncates whatever is at the
         // path, so a repeated suggestedFilename (recurring meeting via the API) or

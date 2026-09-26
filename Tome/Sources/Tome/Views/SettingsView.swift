@@ -444,6 +444,17 @@ private struct OutputTab: View {
 
     var body: some View {
         Form {
+            Section("Record Button") {
+                Picker("Record button", selection: $settings.singleRecordButton) {
+                    Text("Single (auto-detect)").tag(true)
+                    Text("Call Capture + Voice Memo").tag(false)
+                }
+                .font(.system(size: 12))
+                Text("Single always captures both your mic and the call audio, then files the note as a meeting or a voice memo when you stop, based on whether anyone else spoke. ⌘⇧R or Option-click still starts an explicit voice memo.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Vault Folders") {
                 folderRow(
                     title: "Meetings",

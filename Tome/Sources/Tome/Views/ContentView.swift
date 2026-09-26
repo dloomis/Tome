@@ -6,6 +6,81 @@ import UserNotifications
 // The conferencing-app table lives in `MeetingDetector.swift` (`conferencingApps` /
 // `conferencingAppName`) so detection and source-app labeling share one source of truth.
 
+/// Pure stop-time helpers for `ContentView.stopSession`'s session-type
+/// resolution (spec 2026-09-26 §3/§4). Kept out of the view so they can be
+/// unit-tested without SwiftUI state; the ORDERING of the reads that feed them
+/// is the hard part and lives (with its reasoning) in `stopSession`.
+enum StopEvidence {
+    /// `SessionTypeEvidence.themUtteranceCount`: final utterances attributed to
+    /// "Them" whose text is not whitespace-only. "You" lines never count — the
+    /// question is whether the FAR END said anything transcribable.
+    nonisolated static func themUtteranceCount(in utterances: [Utterance]) -> Int {
+        utterances.reduce(into: 0) { count, u in
+            if u.speaker == .them,
+               !u.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                count += 1
+            }
+        }
+    }
+
+    /// The job's provisional-retype plan. Non-nil only for an `.auto` session
+    /// that resolved to a voice memo: that note was written provisionally as a
+    /// call and must be re-typed + moved. Explicit sessions were written as
+    /// their final type from the start, and an `.auto` session that resolved
+    /// as a call already IS a call note — both nil.
+    ///
+    /// An empty voice-folder setting re-types in place (`currentNoteFolder`)
+    /// rather than aiming the move at a path-less URL (which resolves against
+    /// the process cwd).
+    ///
+    /// The filename labels come from `intent` — snapshotted at START, the
+    /// moment the provisional note was named — never from live settings: the
+    /// job recognizes Tome's own default name by the call label that built it,
+    /// so a mid-session label edit must not leak in.
+    nonisolated static func retypePlan(
+        intent: ActiveSessionIntent,
+        resolvedType: SessionType,
+        vaultVoicePath: String,
+        currentNoteFolder: URL
+    ) -> RetypePlan? {
+        guard intent.mode == .auto, resolvedType == .voiceMemo else { return nil }
+        let trimmed = vaultVoicePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let voiceFolder = trimmed.isEmpty
+            ? currentNoteFolder
+            : URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath)
+        return RetypePlan(
+            voiceFolder: voiceFolder,
+            voiceFilenameTypeLabel: intent.filenameVoiceLabel,
+            callFilenameTypeLabel: intent.filenameCallLabel
+        )
+    }
+}
+
+/// Everything the in-flight session knew at START that `stopSession` needs,
+/// captured once in `startSession` (alongside `activeSessionType`), consumed
+/// and cleared once in `stopSession`, cleared in `rollbackFailedStart`. One
+/// value instead of parallel `@State` fields, so the pieces can't drift out of
+/// lockstep.
+struct ActiveSessionIntent: Sendable, Equatable {
+    /// What the session was started as. `.auto` = single Record button (or an
+    /// API start with no `type`); resolved to a `SessionType` at stop.
+    let mode: RecordingMode
+    /// Resolver evidence (spec §3): the session began with a meeting name —
+    /// API `meetingContext` / `suggestedFilename`, or an accepted
+    /// MeetingDetector chip.
+    let hadMeetingEvidence: Bool
+    /// Resolver evidence (spec §3): a *native* conferencing app
+    /// (`conferencingApps` family other than `.meetBrowser`) was frontmost at
+    /// start. Browsers are deliberately excluded — Chrome frontmost during a
+    /// phone-on-speaker call is the normal case, not call evidence.
+    let nativeConferencingAppAtStart: Bool
+    /// `settings.filenameCallLabel` as handed to `TranscriptLogger.startSession`
+    /// — the label the provisional note was actually named with.
+    let filenameCallLabel: String
+    /// `settings.filenameVoiceLabel`, snapshotted at the same moment.
+    let filenameVoiceLabel: String
+}
+
 struct ContentView: View {
     @Bindable var settings: AppSettings
     let apiServer: APIServer
@@ -15,7 +90,18 @@ struct ContentView: View {
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var showOnboarding = false
     @State private var audioLevel: Float = 0
+    /// Provisional type for `.auto` sessions (`.callCapture` until stop resolves
+    /// it — spec §1), so every existing consumer keeps working unchanged.
     @State private var activeSessionType: SessionType?
+    /// Start-time intent + evidence for the in-flight session (see
+    /// `ActiveSessionIntent`). Set alongside `activeSessionType`; nil when idle.
+    @State private var activeSessionIntent: ActiveSessionIntent?
+    /// sessionId → `SessionTypeResolution.reasonLabel`, stashed by `stopSession`
+    /// at resolution and consumed by `handleJobCompleted` for the save banner's
+    /// tooltip (spec §7). Failure/discard drop their entry too.
+    @State private var lastResolutionReason: [String: String] = [:]
+    /// Tooltip for the save banner currently shown ("Filed as … (<reason>)").
+    @State private var savedBannerHelp: String?
     @State private var detectedAppName: String?
     /// Latest passively-detected active meeting (Teams / Google Meet). Drives the
     /// pre-start naming chip. Nil when nothing is detected, screen-recording permission
@@ -133,6 +219,8 @@ struct ContentView: View {
             ControlBar(
                 isRecording: isRunning,
                 activeSessionType: activeSessionType,
+                activeRequestedMode: activeSessionIntent?.mode,
+                singleRecordButton: settings.singleRecordButton,
                 audioLevel: audioLevel,
                 detectedApp: detectedAppName,
                 detectedMeetingName: suggestedMeeting?.title,
@@ -146,8 +234,9 @@ struct ContentView: View {
                 hintMessage: transcriptionEngine?.micSilenceHintMessage,
                 modelStatus: modelStatusText,
                 canStartRecording: services.modelProvisioner.canStartRecording,
-                onStartCallCapture: { startSession(type: .callCapture, detectedMeeting: suggestedMeeting) },
-                onStartVoiceMemo: { startSession(type: .voiceMemo) },
+                onStartRecord: { startSession(mode: .auto, detectedMeeting: suggestedMeeting) },
+                onStartCallCapture: { startSession(mode: .callCapture, detectedMeeting: suggestedMeeting) },
+                onStartVoiceMemo: { startSession(mode: .voiceMemo) },
                 onStopRequested: { stopConfirmation.requestStop() },
                 onStop: stopSession,
                 onKeepRecording: dismissSilencePrompt,
@@ -263,7 +352,7 @@ struct ContentView: View {
                 transcriptStore: transcriptStore,
                 transcriptionEngine: engine,
                 sessionStore: services.sessionStore,
-                onStart: { type, sessionId, sessionGuid, context, filename in startSession(type: type, sessionId: sessionId, sessionGuid: sessionGuid, meetingContext: context, suggestedFilename: filename) },
+                onStart: { mode, sessionId, sessionGuid, context, filename in startSession(mode: mode, sessionId: sessionId, sessionGuid: sessionGuid, meetingContext: context, suggestedFilename: filename) },
                 onStop: { stopSession() }
             )
             apiServer.start()
@@ -424,6 +513,7 @@ struct ContentView: View {
             // job left /status reporting a transcription that would never finish.
             // The by-guid table records `failed` + the message for new pollers.
             apiServer.sessionDidFail(id: failure.jobId, message: failure.message)
+            lastResolutionReason[failure.jobId] = nil
             // The WAVs were preserved; tell the user now, not at next launch.
             Task {
                 await NotificationPresenter.shared.postJobFailure(
@@ -440,6 +530,7 @@ struct ContentView: View {
             // transcription that never ends. By-guid pollers see `failed`: nothing
             // was written, so `complete` (with no transcript) would read as a bug.
             apiServer.sessionDidFail(id: discard.jobId, message: "Discarded: short recording (\(discard.durationSeconds)s ≤ threshold)")
+            lastResolutionReason[discard.jobId] = nil
             // In-app signal FIRST, independent of notification permission — with
             // notifications denied the postDiscard below is silent, and the user
             // must still learn why the transcript isn't in the vault.
@@ -662,6 +753,8 @@ struct ContentView: View {
         .background(Color.bg1.opacity(0.7))
         .overlay(Divider(), alignment: .top)
         .overlay(Divider(), alignment: .bottom)
+        // Resolution reason (spec §7: tooltip only). Empty = no tooltip.
+        .help(savedBannerHelp ?? "")
     }
 
     // MARK: - Mixer lean-in prompt
@@ -1111,7 +1204,12 @@ struct ContentView: View {
         NotificationPresenter.shared.clearSilencePrompt()
     }
 
-    private func startSession(type: SessionType, sessionId: String? = nil, sessionGuid: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
+    /// Start a session. Explicit modes (`.callCapture` / `.voiceMemo`) map
+    /// straight onto the two historical code paths. `.auto` (single Record
+    /// button, API start with no `type`) runs the call-capture path — both legs,
+    /// meetings folder, provisional `type: meeting` note — and its real type is
+    /// resolved at stop (`SessionTypeResolver`, spec §1–§3).
+    private func startSession(mode: RecordingMode, sessionId: String? = nil, sessionGuid: String? = nil, meetingContext: MeetingContext? = nil, suggestedFilename: String? = nil, detectedMeeting: DetectedMeeting? = nil) {
         // UI gating makes this unreachable from the buttons; API starts and
         // races land here. Surfaced via the same error row the UI already has.
         guard services.modelProvisioner.canStartRecording else {
@@ -1144,15 +1242,26 @@ struct ContentView: View {
         // resolved conferencing app only labels the note (`source_app`) — system
         // audio is captured display-wide, not scoped to that app's process (see
         // SystemAudioCapture.bufferStream), so no bundle ID flows to the engine.
+        //
+        // `.auto` is written provisionally as a call (the ~95% case); a stop-time
+        // voice-memo resolution re-types + moves the note in the job.
+        let provisionalType: SessionType = mode.explicitSessionType ?? .callCapture
         let outputPath: String
         let sourceApp: String
         var resolvedAppName: String?
 
-        switch type {
+        // Frontmost app, read once: labels a call's `source_app` (browsers
+        // included) and feeds the resolver's native-conferencing-app evidence
+        // (browsers excluded — spec §3).
+        let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let nativeConferencingApp = frontmostBundleID
+            .flatMap { conferencingApps[$0] }
+            .map { $0.family != .meetBrowser } ?? false
+
+        switch provisionalType {
         case .callCapture:
             outputPath = settings.vaultMeetingsPath
-            if let frontApp = NSWorkspace.shared.frontmostApplication,
-               let bundleID = frontApp.bundleIdentifier,
+            if let bundleID = frontmostBundleID,
                let appName = conferencingAppName(bundleID) {
                 sourceApp = appName
                 resolvedAppName = appName
@@ -1176,6 +1285,9 @@ struct ContentView: View {
             ?? (apiNamePresent
                 ? nil
                 : detectedMeeting.map { MeetingContext(subject: $0.title, attendees: nil, calendarEventId: nil, startTime: nil) })
+        // Resolver evidence (spec §3 rule 2): any meeting name at start — API
+        // context/filename or an accepted detector chip.
+        let hadMeetingEvidence = effectiveContext != nil || suggestedFilename != nil
 
         Task {
             transcriptionEngine?.lastError = nil
@@ -1186,19 +1298,25 @@ struct ContentView: View {
                 subject: effectiveContext?.subject,
                 suggestedFilename: suggestedFilename
             )
+            // Snapshot both filename labels at the moment the logger names the
+            // provisional note; they ride in `ActiveSessionIntent` to stop so a
+            // mid-session Settings edit can't make the retype mis-recognize
+            // Tome's own default name.
+            let filenameCallLabel = settings.filenameCallLabel
+            let filenameVoiceLabel = settings.filenameVoiceLabel
             let transcriptURL: URL
             do {
                 transcriptURL = try await services.transcriptLogger.startSession(
                     sourceApp: sourceApp,
                     vaultPath: outputPath,
-                    sessionType: type,
+                    sessionType: provisionalType,
                     sessionGuid: guid,
                     calendarEventId: meetingContext?.calendarEventId,
                     suggestedFilename: suggestedFilename,
                     filenameDateFormat: settings.filenameDateFormat,
-                    filenameTypeLabel: type == .voiceMemo
-                        ? settings.filenameVoiceLabel
-                        : settings.filenameCallLabel
+                    filenameTypeLabel: provisionalType == .voiceMemo
+                        ? filenameVoiceLabel
+                        : filenameCallLabel
                 )
             } catch {
                 // Transcript note couldn't be created (vault unwritable, etc.). The
@@ -1219,7 +1337,14 @@ struct ContentView: View {
                 await services.transcriptLogger.updateContext(subject)
             }
 
-            activeSessionType = type
+            activeSessionType = provisionalType
+            activeSessionIntent = ActiveSessionIntent(
+                mode: mode,
+                hadMeetingEvidence: hadMeetingEvidence,
+                nativeConferencingAppAtStart: nativeConferencingApp,
+                filenameCallLabel: filenameCallLabel,
+                filenameVoiceLabel: filenameVoiceLabel
+            )
             // Starting a recording is an answer to the lean-in invitation too:
             // don't re-present it in the save-banner slot when this session ends.
             leanInMixer = nil
@@ -1233,11 +1358,12 @@ struct ContentView: View {
                 sessionGuid: guid,
                 transcriptURL: transcriptURL,
                 sourceApp: sourceApp,
-                sessionType: type,
+                sessionType: provisionalType,
                 startedAt: Date()
             )
 
-            if type == .callCapture {
+            if provisionalType == .callCapture {
+                // Call Capture and `.auto` — both legs, always (spec §2).
                 await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceUID: settings.inputDeviceUID,
@@ -1310,6 +1436,7 @@ struct ContentView: View {
 
         // Return the UI to idle: the control bar shows Start, not Stop.
         activeSessionType = nil
+        activeSessionIntent = nil
         detectedAppName = nil
         detectedMeeting = nil
         dismissedMeetingTitle = nil
@@ -1335,12 +1462,35 @@ struct ContentView: View {
         // isn't true until the job actually starts, so this window is otherwise
         // unlocked. Cleared once the job is enqueued (or on early exit). F-2.
         services.isSessionPending = true
-        let wasCallCapture = activeSessionType == .callCapture
         let sessionId = currentSessionId ?? SessionStore.generateSessionId()
         let sourceApp = currentSourceApp ?? "Call"
-        let sessionType: SessionType = wasCallCapture ? .callCapture : .voiceMemo
+
+        // ── Session-type resolution: start-time evidence (spec §3) ──────────
+        // Everything the session knew at START is snapshotted here,
+        // synchronously, before any await: the @State below is cleared a few
+        // lines down, and once this function returns a new `startSession` may
+        // overwrite it. `activeSessionIntent` is set for every live session
+        // (explicit ones carry `.callCapture` / `.voiceMemo`); the nil fallback
+        // is defensive only and derives the explicit mode from the provisional
+        // type, so a nil can never turn an explicit session into `.auto`. The
+        // fallback's labels are the live settings — harmless, since a non-auto
+        // intent never produces a retype plan.
+        let intent = activeSessionIntent ?? ActiveSessionIntent(
+            mode: activeSessionType == .voiceMemo ? .voiceMemo : .callCapture,
+            hadMeetingEvidence: false,
+            nativeConferencingAppAtStart: false,
+            filenameCallLabel: settings.filenameCallLabel,
+            filenameVoiceLabel: settings.filenameVoiceLabel
+        )
+        let requestedMode = intent.mode
+        // Settings consumed after resolution, snapshotted with the session they
+        // belong to (a Settings edit during the stop awaits must not leak in).
+        let vaultVoicePath = settings.vaultVoicePath
+        let discardShortMeetings = settings.discardShortMeetings
+        let discardShortMeetingSeconds = settings.discardShortMeetingSeconds
 
         activeSessionType = nil
+        activeSessionIntent = nil
         detectedAppName = nil
         detectedMeeting = nil
         dismissedMeetingTitle = nil
@@ -1354,13 +1504,6 @@ struct ContentView: View {
 
         let retention = settings.retainRecordings
             ? settings.recordingsFolderURL.map(RecordingRetentionConfig.init(folder:))
-            : nil
-
-        // Short-recording discard applies to call captures only (voice memos are
-        // never dropped). Passing nil for voice memos / when the setting is off
-        // leaves the job's normal save path untouched.
-        let discardLimit: TimeInterval? = (wasCallCapture && settings.discardShortMeetings)
-            ? TimeInterval(settings.discardShortMeetingSeconds)
             : nil
 
         Task {
@@ -1379,6 +1522,25 @@ struct ContentView: View {
             // below points at the right thing to check.
             let systemFromDevice = transcriptionEngine?.systemAudioSourceIsDevice ?? false
 
+            // ── Resolution evidence, engine side — read BEFORE `engine.stop()` ──
+            // Same reasoning as the telemetry above: these are per-session
+            // engine state, and the engine is reused by the next session the
+            // moment stop() returns (the next start() resets the verdict and
+            // re-routes the system-source accessors). Nothing between the top
+            // of this Task and here awaits, so these still describe THIS
+            // session. (stop() itself preserves both, but reading after it
+            // would race a new start landing during the stop's own awaits.)
+            //
+            // `systemLegDelivered == false` is MISSING evidence (leg never bound
+            // — permission declined, SCK failure, wedged HAL), which the
+            // resolver treats as "fall back to call", never as silence.
+            let systemLegDelivered = systemFirstSample != nil
+            // Only meaningful for a device-backed leg; the engine already nils
+            // it on SCK, the gate here keeps that contract local and explicit.
+            let feederVerdict: FeederVerdict? = systemFromDevice
+                ? transcriptionEngine?.systemLegFeederVerdict
+                : nil
+
             await transcriptionEngine?.stop()
 
             // The engine drained the transcribers before returning, so every
@@ -1389,15 +1551,86 @@ struct ContentView: View {
             // barrier the channel so the markdown + JSONL appends land BEFORE
             // endSession() closes those files — an append after close is lost.
             handleNewUtterance()
+
+            // ── Resolution evidence, store side — read AFTER the drain ──────
+            // Why not earlier: the final "Them" utterance flushed at stop only
+            // reaches `transcriptStore` inside `engine.stop()` (the system
+            // transcriber's onFinal does `await MainActor.run { store.append }`
+            // and stop() awaits that task). Counting before the drain makes a
+            // call whose only far-end line was the last one resolve as a memo
+            // (spec §3, rule 4).
+            //
+            // Why not later: `startSession` calls `transcriptStore.clear()`
+            // SYNCHRONOUSLY, and every await between here and the handle is a
+            // MainActor suspension point where a new start (UI or API) can run
+            // and wipe the store. This line and `handleNewUtterance()` above
+            // are back to back with no suspension between them, so the count
+            // and the persisted cursor see the same store.
+            //
+            // Known, pre-existing window (not widened here): a new start that
+            // lands DURING `engine.stop()` has already cleared the store by the
+            // time we read it. That equally breaks `persistedUtteranceCount`
+            // (the tail of this session never reaches disk) and predates the
+            // resolver. It is narrow in practice: stop() holds the engine's
+            // `isRunning` true until its very end, and both start paths gate on
+            // it (ControlBar shows Stop while `isRecording`; the API start gate
+            // refuses while its `isRecording` mirror is set). The wider window
+            // is AFTER stop() returns — which is why nothing here awaits.
+            let themUtteranceCount = StopEvidence.themUtteranceCount(in: transcriptStore.utterances)
+
+            // Pure, no awaits: resolve now while all evidence is in hand.
+            let evidence = SessionTypeEvidence(
+                requestedMode: requestedMode,
+                hasMeetingEvidence: intent.hadMeetingEvidence,
+                nativeConferencingAppAtStart: intent.nativeConferencingAppAtStart,
+                systemLegDelivered: systemLegDelivered,
+                feederVerdict: feederVerdict,
+                themUtteranceCount: themUtteranceCount
+            )
+            let resolution = SessionTypeResolver.resolveSessionType(evidence)
+            diagLog(SessionTypeResolver.logLine(for: resolution, evidence: evidence))
+            let sessionType = resolution.sessionType
+            // Report to the API now, before the first await below. Ordering vs
+            // `sessionDidStop` (called synchronously at the top, before this
+            // Task): the resolution is only known here, after the drain, so it
+            // necessarily lands AFTER the session moved to `transcribing`.
+            // That's fine — `sessionDidResolve` keys by sessionId (and by-guid
+            // via guidBySessionId), doesn't check state, and the stored value
+            // survives `sessionDidStop`/`sessionDidComplete` until the 5s
+            // post-completion eviction; /status only hides it while the state
+            // is still `recording`. It must precede `sessionDidComplete` (the
+            // nil-snapshot guard below and the job's completion) so the eviction
+            // timer can't start first. A new start with the same second-granular
+            // id clears it — the pre-existing id-collision caveat, not new here.
+            apiServer.sessionDidResolve(id: sessionId, sessionType: sessionType, resolution: resolution.reasonLabel)
+            lastResolutionReason[sessionId] = resolution.reasonLabel
+
             await utteranceChannel?.flush()
 
             await services.sessionStore.endSession()
             guard let transcriptSnapshot = await services.transcriptLogger.endSession() else {
+                lastResolutionReason[sessionId] = nil   // no job → no banner
                 transcriptionEngine?.assetStatus = "Ready"
                 apiServer.sessionDidComplete(id: sessionId)
                 services.isSessionPending = false   // nothing to enqueue (F-2)
                 return
             }
+
+            // Short-recording discard applies to call captures only (voice memos
+            // are never dropped). Keyed on the RESOLVED type: an `.auto` session
+            // that resolved to a memo (a 20-second phone call) must be as
+            // un-discardable as an explicit memo. nil = the job's normal save path.
+            let discardLimit: TimeInterval? = (sessionType == .callCapture && discardShortMeetings)
+                ? TimeInterval(discardShortMeetingSeconds)
+                : nil
+            // Only an `.auto` session resolved to a memo was written provisionally
+            // as a call note; the job re-types + relocates it first.
+            let provisionalRetype = StopEvidence.retypePlan(
+                intent: intent,
+                resolvedType: sessionType,
+                vaultVoicePath: vaultVoicePath,
+                currentNoteFolder: transcriptSnapshot.filePath.deletingLastPathComponent()
+            )
 
             // Build the immutable handle and hand it off to the background queue.
             // The engine and logger are now free for the next recording.
@@ -1419,7 +1652,8 @@ struct ContentView: View {
                 mergeGapSeconds: settings.diarizationMergeGapSeconds,
                 retention: retention,
                 exportVoiceprints: settings.exportVoiceprints,
-                discardIfShorterThanOrEqual: discardLimit
+                discardIfShorterThanOrEqual: discardLimit,
+                provisionalRetype: provisionalRetype
             )
 
             services.postProcessingQueue.enqueue(job)
@@ -1428,18 +1662,28 @@ struct ContentView: View {
             // stop-window pending lock (F-2).
             services.isSessionPending = false
 
-            // End-of-session note for a call capture whose system leg carried no
-            // audible content at all. Content-based, not delivery-based —
-            // SCStream delivers silent buffers continuously, so this is the only
-            // signal that "Them" is empty. Gated to sessions ≥60s so a quick
-            // test start/stop doesn't nag; the fixed notification ID replaces
-            // the watchdog's mid-session warning rather than stacking on it.
-            if wasCallCapture, audibleSystemBuffers == 0,
+            // End-of-session note for a session that captured a system leg (an
+            // explicit call or `.auto`) whose leg carried no audible content at
+            // all. Content-based, not delivery-based — SCStream delivers silent
+            // buffers continuously, so this is the only signal that "Them" is
+            // empty. Gated to sessions ≥60s so a quick test start/stop doesn't
+            // nag; the fixed notification ID replaces the watchdog's mid-session
+            // warning rather than stacking on it. Suppressed only for a memo
+            // resolved BECAUSE the live leg was silent (`.farEndSilent`) — there
+            // silence is the expected outcome. `.mixUnfed` still gets it (the
+            // advice to launch the mixer is correct), as do explicit calls and
+            // meeting/app-evidenced calls (the "is my mix wired?" case). §7.
+            let capturedSystemLeg = requestedMode != .voiceMemo
+            if capturedSystemLeg, audibleSystemBuffers == 0,
                let firstSample = micFirstSample ?? systemFirstSample,
                Date().timeIntervalSince(firstSample) >= 60 {
-                diagLog("[STOP] call capture ended with zero audible system-audio buffers — posting silent-leg note")
-                let detail = TranscriptionEngine.systemAudioSilentDetail(deviceMode: systemFromDevice, atStop: true)
-                Task { await NotificationPresenter.shared.postSystemAudioSilent(detail: detail) }
+                if resolution.suppressesSilentLegNote {
+                    diagLog("[STOP] silent-leg note suppressed — session resolved \(resolution.reasonLabel)")
+                } else {
+                    diagLog("[STOP] call capture ended with zero audible system-audio buffers — posting silent-leg note")
+                    let detail = TranscriptionEngine.systemAudioSilentDetail(deviceMode: systemFromDevice, atStop: true)
+                    Task { await NotificationPresenter.shared.postSystemAudioSilent(detail: detail) }
+                }
             }
         }
     }
@@ -1453,8 +1697,12 @@ struct ContentView: View {
 
         Task { await NotificationPresenter.shared.postCompletion(savedURL: savedURL, sessionType: sessionType) }
 
+        let reason = lastResolutionReason.removeValue(forKey: jobId)
         if activeSessionType == nil {
             savedFileURL = savedURL
+            savedBannerHelp = reason.map {
+                "Filed as \(sessionType == .callCapture ? "Meeting" : "Voice memo") (\($0))"
+            }
             bannerDismissTask?.cancel()
             bannerDismissTask = Task {
                 try? await Task.sleep(for: .seconds(8))

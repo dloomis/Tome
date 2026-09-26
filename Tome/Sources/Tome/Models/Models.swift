@@ -135,6 +135,28 @@ struct TranscriptSessionSnapshot: Sendable {
             filenameDateFormat: filenameDateFormat
         )
     }
+
+    /// Copy re-pointed at `newPath` with EVERY other field kept — including the
+    /// rename inputs (`sessionContext` / `suggestedFilename`). This is Tome moving
+    /// its own note (e.g. `TranscriptFinalizer.retypeAsVoiceMemo` relocating a
+    /// provisional call note into the voice folder), so a context- or API-driven
+    /// rename must still happen later in `finalizeFrontmatter`. Contrast
+    /// `relocated(to:)`, which clears those inputs because an EXTERNAL pipeline
+    /// chose the new name and finalization must not rename it back.
+    func withFilePath(_ newPath: URL) -> TranscriptSessionSnapshot {
+        TranscriptSessionSnapshot(
+            filePath: newPath,
+            sessionGuid: sessionGuid,
+            calendarEventId: calendarEventId,
+            sessionStartTime: sessionStartTime,
+            sessionEndTime: sessionEndTime,
+            speakersDetected: speakersDetected,
+            sourceApp: sourceApp,
+            sessionContext: sessionContext,
+            suggestedFilename: suggestedFilename,
+            filenameDateFormat: filenameDateFormat
+        )
+    }
 }
 
 // MARK: - Session Origin
@@ -218,6 +240,18 @@ struct SessionHandle: Sendable {
 /// destination folder for the exported combined `.m4a`.
 struct RecordingRetentionConfig: Sendable {
     let folder: URL
+}
+
+// MARK: - Provisional Retype
+
+/// Carried by a PostProcessingJob when a session that was written provisionally as a
+/// call note resolved to a voice memo at stop. See TranscriptFinalizer.retypeAsVoiceMemo.
+struct RetypePlan: Sendable, Equatable {
+    let voiceFolder: URL
+    /// settings.filenameVoiceLabel, snapshotted at start
+    let voiceFilenameTypeLabel: String
+    /// settings.filenameCallLabel, snapshotted at start — used to recognize Tome's own default name
+    let callFilenameTypeLabel: String
 }
 
 // MARK: - Post-Processing Error

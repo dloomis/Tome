@@ -53,4 +53,26 @@ enum FilenameSanitizer {
         fallback.dateFormat = "yyyy-MM-dd HH-mm-ss"
         return fallback.string(from: date)
     }
+
+    /// Tome's default note stem when no suggested filename applies:
+    /// `"<date> <label>"`. `typeLabel == nil` means "no user override" and uses
+    /// `fallbackLabel`; an empty label is a valid override meaning a date-only
+    /// stem; a non-empty label is sanitized, falling back to `fallbackLabel` if
+    /// sanitizing wipes it out (e.g. the user typed only forbidden chars).
+    ///
+    /// The single source of truth for this derivation: `TranscriptLogger.startSession`
+    /// names new notes with it, and `TranscriptFinalizer.retypeAsVoiceMemo` uses it
+    /// both to recognize Tome's own default call name and to produce the voice
+    /// default — so the two can never drift apart.
+    static func defaultTranscriptStem(
+        start: Date,
+        dateFormat: String,
+        typeLabel: String?,
+        fallbackLabel: String
+    ) -> String {
+        let datePrefix = formattedDate(start, format: dateFormat)
+        let chosen = typeLabel ?? fallbackLabel
+        let label = chosen.isEmpty ? "" : (sanitize(chosen) ?? fallbackLabel)
+        return label.isEmpty ? datePrefix : "\(datePrefix) \(label)"
+    }
 }

@@ -47,6 +47,16 @@ final class APIServer: @unchecked Sendable {
         var transcriptURL: URL?
         var errorMessage: String?
         var finishedAt: Date?
+        /// Resolved type + reason label, set by `sessionDidResolve` at stop.
+        var resolvedType: SessionType?
+        var resolution: String?
+    }
+
+    /// A session's stop-time type resolution (`sessionDidResolve`).
+    struct SessionResolutionInfo: Sendable, Equatable {
+        let sessionType: SessionType
+        /// `SessionTypeResolution.reasonLabel`.
+        let resolution: String
     }
 
     /// Retain every live session plus at most this many finished (complete or
@@ -68,6 +78,10 @@ final class APIServer: @unchecked Sendable {
         /// when a newer session is already recording. The top-level `lifecycleState`
         /// tracks the most recent session for `/status` backwards compatibility.
         var sessionStates: [String: SessionLifecycleState] = [:]
+        /// Stop-time type resolution per sessionId, for `/sessions/{id}/status`.
+        /// Written by `sessionDidResolve` (just before `sessionDidStop`), cleared
+        /// at start and by the same 5s post-completion eviction as `sessionStates`.
+        var sessionResolutions: [String: SessionResolutionInfo] = [:]
         var lifecycleState: SessionLifecycleState = .idle
         /// The active recording's subject/title and suggested filename, set at
         /// start and echoed from GET /status while recording or transcribing.
@@ -111,8 +125,8 @@ final class APIServer: @unchecked Sendable {
 
     // Guarded by `lock` (Sendable, so handlers may read them on the API queue).
     private var _sessionStore: SessionStore?
-    /// (type, sessionId, sessionGuid, meetingContext, suggestedFilename)
-    private var _onStartSession: (@MainActor @Sendable (SessionType, String, String, MeetingContext?, String?) -> Void)?
+    /// (requested mode, sessionId, sessionGuid, meetingContext, suggestedFilename)
+    private var _onStartSession: (@MainActor @Sendable (RecordingMode, String, String, MeetingContext?, String?) -> Void)?
     private var _onStopSession: (@MainActor @Sendable () -> Void)?
 
     // MARK: - Networking
@@ -148,7 +162,7 @@ final class APIServer: @unchecked Sendable {
         transcriptStore: TranscriptStore,
         transcriptionEngine: TranscriptionEngine,
         sessionStore: SessionStore,
-        onStart: @escaping @MainActor @Sendable (SessionType, String, String, MeetingContext?, String?) -> Void,
+        onStart: @escaping @MainActor @Sendable (RecordingMode, String, String, MeetingContext?, String?) -> Void,
         onStop: @escaping @MainActor @Sendable () -> Void
     ) {
         self.transcriptStore = transcriptStore
@@ -245,6 +259,9 @@ final class APIServer: @unchecked Sendable {
         withState { s in
             s.currentSessionId = id
             s.sessionStates[id] = .recording
+            // Second-granular ids can repeat; a new start never inherits a
+            // previous session's resolution.
+            s.sessionResolutions.removeValue(forKey: id)
             s.lifecycleState = .recording
             s.hasDiarizationCompleted = false
             s.recordingSubject = subject
@@ -252,6 +269,23 @@ final class APIServer: @unchecked Sendable {
             s.recordingGuid = guid ?? s.recordingGuid
             if let guid {
                 Self.registerTracked(guid: guid, sessionId: id, in: &s)
+            }
+        }
+    }
+
+    /// Record a stopped session's resolved type and the resolver's reason label
+    /// (`SessionTypeResolution.reasonLabel`). Called by `ContentView.stopSession`
+    /// right before `sessionDidStop`; surfaced as `sessionType` + `resolution`
+    /// on `/sessions/{id}/status` and `/sessions/by-guid/{guid}/status` once the
+    /// session has left `recording`. Survives `sessionDidStop`/`sessionDidComplete`;
+    /// the 5s post-completion eviction drops it with the rest of the per-id state.
+    func sessionDidResolve(id: String, sessionType: SessionType, resolution: String) {
+        withState { s in
+            s.sessionResolutions[id] = SessionResolutionInfo(sessionType: sessionType, resolution: resolution)
+            if let guid = s.guidBySessionId[id], var tracked = s.sessionsByGuid[guid] {
+                tracked.resolvedType = sessionType
+                tracked.resolution = resolution
+                s.sessionsByGuid[guid] = tracked
             }
         }
     }
@@ -300,6 +334,7 @@ final class APIServer: @unchecked Sendable {
             guard let self else { return }
             withState { s in
                 s.sessionStates.removeValue(forKey: id)
+                s.sessionResolutions.removeValue(forKey: id)
                 if s.lifecycleState == .complete && s.currentSessionId == id {
                     s.lifecycleState = .idle
                     s.currentSessionId = nil
@@ -591,6 +626,8 @@ final class APIServer: @unchecked Sendable {
         let onStart = lock.withLock { _onStartSession }
         let context = req?.meetingContext
         let filename = req?.suggestedFilename
+        // Always explicit: WhisperCal knows it is starting a meeting (spec §8),
+        // so its sessions are never re-resolved at stop.
         Task { @MainActor in
             onStart?(.callCapture, sessionId, sessionGuid, context, filename)
         }
@@ -658,12 +695,15 @@ final class APIServer: @unchecked Sendable {
             return (400, #"{"error":"Invalid request body"}"#)
         }
 
-        let type: SessionType
-        switch req.type {
-        case "voiceMemo": type = .voiceMemo
-        case "callCapture": type = .callCapture
-        default:
-            return (400, #"{"error":"Invalid session type. Must be \"callCapture\" or \"voiceMemo\"."}"#)
+        // `type` omitted → `.auto` (spec §8): capture both legs, resolve at stop.
+        let mode: RecordingMode
+        if let raw = req.type {
+            guard let parsed = RecordingMode.fromAPIString(raw) else {
+                return (400, #"{"error":"Invalid session type. Must be \"auto\", \"callCapture\" or \"voiceMemo\"."}"#)
+            }
+            mode = parsed
+        } else {
+            mode = .auto
         }
 
         let sessionId = SessionStore.generateSessionId()
@@ -696,7 +736,7 @@ final class APIServer: @unchecked Sendable {
         let onStart = lock.withLock { _onStartSession }
         let context = req.meetingContext
         Task { @MainActor in
-            onStart?(type, sessionId, sessionGuid, context, nil)
+            onStart?(mode, sessionId, sessionGuid, context, nil)
         }
 
         return (200, encode(SessionStartResponse(
@@ -718,7 +758,9 @@ final class APIServer: @unchecked Sendable {
             startedAt: tracked.state == .recording ? iso8601.string(from: tracked.startedAt) : nil,
             transcriptFilename: tracked.transcriptURL?.lastPathComponent,
             transcriptPath: tracked.transcriptURL?.path,
-            error: tracked.errorMessage
+            error: tracked.errorMessage,
+            sessionType: tracked.state == .recording ? nil : tracked.resolvedType,
+            resolution: tracked.state == .recording ? nil : tracked.resolution
         )))
     }
 
@@ -746,8 +788,9 @@ final class APIServer: @unchecked Sendable {
     }
 
     private func handleSessionStatus(sessionId: String) async -> (Int, String) {
-        let (isCurrentSession, perSessionState, elapsed) = withState {
-            ($0.currentSessionId == sessionId, $0.sessionStates[sessionId], $0.sessionElapsed)
+        let (isCurrentSession, perSessionState, elapsed, resolved) = withState {
+            ($0.currentSessionId == sessionId, $0.sessionStates[sessionId], $0.sessionElapsed,
+             $0.sessionResolutions[sessionId])
         }
 
         // Per-session state takes precedence over file-based lookup — it reflects
@@ -758,7 +801,9 @@ final class APIServer: @unchecked Sendable {
                 status: state.rawValue,  // "transcribing" or "complete"
                 elapsedSeconds: 0,
                 speakerCount: 0,
-                lineCount: 0
+                lineCount: 0,
+                sessionType: state == .recording ? nil : resolved?.sessionType,
+                resolution: state == .recording ? nil : resolved?.resolution
             )))
         }
 
@@ -808,12 +853,16 @@ final class APIServer: @unchecked Sendable {
             status = "complete"
         }
 
+        // Resolution only exists once stopSession has run; never shown while
+        // the engine is still capturing.
         return (200, encode(SessionStatusResponse(
             sessionId: sessionId,
             status: status,
             elapsedSeconds: elapsed,
             speakerCount: speakerCount,
-            lineCount: lineCount
+            lineCount: lineCount,
+            sessionType: isRecording ? nil : resolved?.sessionType,
+            resolution: isRecording ? nil : resolved?.resolution
         )))
     }
 
@@ -1349,7 +1398,9 @@ final class APIServer: @unchecked Sendable {
               "startedAt": { "type": "string", "format": "date-time", "description": "Present while recording." },
               "transcriptFilename": { "type": "string", "description": "Final transcript basename (after collision -1/-2 suffixes and renames). Present when complete." },
               "transcriptPath": { "type": "string", "description": "Absolute path of the finalized transcript. Present when complete." },
-              "error": { "type": "string", "description": "Present when state is failed." }
+              "error": { "type": "string", "description": "Present when state is failed." },
+              "sessionType": { "type": "string", "enum": ["callCapture", "voiceMemo"], "description": "Resolved session type. Present once the session has left recording; absent while recording." },
+              "resolution": { "type": "string", "enum": ["explicit", "meetingEvidence", "conferencingApp", "farEndSpeech", "legUnavailable", "farEndSilent", "mixUnfed"], "description": "Why the session resolved to sessionType (explicit = the start request named a type). Present once the session has left recording; absent while recording." }
             }
           },
           "RecordingInfo": {
@@ -1363,9 +1414,8 @@ final class APIServer: @unchecked Sendable {
           },
           "StartSessionRequest": {
             "type": "object",
-            "required": ["type"],
             "properties": {
-              "type": { "type": "string", "enum": ["callCapture", "voiceMemo"] },
+              "type": { "type": "string", "enum": ["auto", "callCapture", "voiceMemo"], "default": "auto", "description": "auto (default when omitted): capture both your mic and the call audio, then resolve the session type at stop from whether anyone else spoke (see sessionType/resolution on the status endpoints). callCapture / voiceMemo: explicit, never re-resolved; voiceMemo captures the mic only." },
               "sessionGuid": { "type": "string", "maxLength": 64, "description": "Caller-generated correlation key; see WhisperCalStartRequest.sessionGuid." },
               "meetingContext": { "$ref": "#/components/schemas/MeetingContext" }
             }
@@ -1407,7 +1457,9 @@ final class APIServer: @unchecked Sendable {
               "status": { "type": "string", "enum": ["loading", "recording", "diarizing", "finalizing", "complete"] },
               "elapsedSeconds": { "type": "integer" },
               "speakerCount": { "type": "integer" },
-              "lineCount": { "type": "integer" }
+              "lineCount": { "type": "integer" },
+              "sessionType": { "type": "string", "enum": ["callCapture", "voiceMemo"], "description": "Resolved session type. Present once the session has left recording; absent while recording." },
+              "resolution": { "type": "string", "enum": ["explicit", "meetingEvidence", "conferencingApp", "farEndSpeech", "legUnavailable", "farEndSilent", "mixUnfed"], "description": "Why the session resolved to sessionType (explicit = the start request named a type). Present once the session has left recording; absent while recording." }
             }
           },
           "SessionListResponse": {

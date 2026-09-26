@@ -124,7 +124,14 @@ struct SessionSidecar: Codable, Sendable {
     /// can still pair with its transcript. Best-effort: on any failure the sidecar
     /// keeps the stale path and recovery degrades to "transcript file missing"
     /// (manual Cmd+Opt+R), exactly the pre-existing behavior.
-    static func updateTranscriptPath(forWAV wavURL: URL, to newTranscriptURL: URL) {
+    ///
+    /// `sessionType`, when non-nil, also overwrites the recorded type — used when a
+    /// single-button (`.auto`) session, written provisionally as `.callCapture`,
+    /// resolves to `.voiceMemo` and its note is re-typed and moved. Recovery picks
+    /// `preserveYou` from this field, so a sidecar left saying `.callCapture` would
+    /// recover a memo as a call. Nil keeps the recorded type. Schema unchanged.
+    /// No sidecar (or an unreadable one) → no-op.
+    static func updateTranscriptPath(forWAV wavURL: URL, to newTranscriptURL: URL, sessionType: SessionType? = nil) {
         let url = sidecarURL(forWAV: wavURL)
         guard let old = try? read(from: url) else { return }
         let updated = SessionSidecar(
@@ -134,7 +141,7 @@ struct SessionSidecar: Codable, Sendable {
             transcriptPath: newTranscriptURL.path,
             startedAt: old.startedAt,
             sourceApp: old.sourceApp,
-            sessionType: old.sessionType,
+            sessionType: sessionType ?? old.sessionType,
             sampleRate: old.sampleRate,
             channels: old.channels,
             bitsPerSample: old.bitsPerSample,
