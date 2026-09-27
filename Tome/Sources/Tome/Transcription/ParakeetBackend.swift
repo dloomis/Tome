@@ -1,7 +1,11 @@
 @preconcurrency import AVFoundation
 import FluidAudio
 
-/// Parakeet-TDT v3 via FluidAudio.
+/// Parakeet Ultra via FluidAudio — moondream's post-trained Parakeet-TDT v3
+/// (`AsrModelVersion.ultra`, FluidAudio 0.17.3+): same 25 languages, tokenizer,
+/// API and speed as v3, lower WER everywhere (LibriSpeech test-other 3.81% vs
+/// 4.12%, FLEURS mean 11.67% vs 14.81%). Switched 2026-09-27; the old v3 cache
+/// directory is left in place.
 ///
 /// Fresh `TdtDecoderState` per call is deliberate: FluidAudio 0.14 removed
 /// AsrManager's internal decoder state and requires the caller to thread
@@ -17,7 +21,7 @@ final actor ParakeetBackend: ASRBackend {
     private var asrManager: AsrManager?
 
     static func isInstalled() -> Bool {
-        AsrModels.modelsExist(at: AsrModels.defaultCacheDirectory(for: .v3), version: .v3)
+        AsrModels.modelsExist(at: AsrModels.defaultCacheDirectory(for: .ultra), version: .ultra)
     }
 
     func prepare(onEvent: @Sendable @escaping (PrepareEvent) -> Void) async throws {
@@ -30,7 +34,7 @@ final actor ParakeetBackend: ASRBackend {
         // fetched. When NOT installed we surface real download progress (F-5).
         let installed = Self.isInstalled()
         if installed { onEvent(.loading) }
-        let models = try await AsrModels.downloadAndLoad(version: .v3, progressHandler: { progress in
+        let models = try await AsrModels.downloadAndLoad(version: .ultra, progressHandler: { progress in
             if installed { onEvent(.loading); return }
             switch progress.phase {
             case .listing: onEvent(.downloading(progress: nil))

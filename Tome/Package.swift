@@ -6,13 +6,13 @@ let package = Package(
     name: "Tome",
     platforms: [.macOS(.v26)],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.1"),
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0"),
-        // argmax-oss-swift (formerly WhisperKit), pinned to the merge commit of PR #463,
-        // which adds DiarizationResult.speakerCentroidEmbeddings — the official version of
-        // the voiceprint centroids (see docs/voiceprints.md). Unreleased as of this pin;
-        // re-pin to a tagged release once #463 ships in one.
-        .package(url: "https://github.com/argmaxinc/argmax-oss-swift", revision: "94cf6b120cf9dde32d9dea01acc326e77371302c"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.17.4"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.0"),
+        // argmax-oss-swift (formerly WhisperKit). 1.1.0 is the first tagged release
+        // containing PR #463 (DiarizationResult.speakerCentroidEmbeddings — the
+        // voiceprint centroids, see docs/voiceprints.md); SpeakerKit's pyannote
+        // weights are unchanged since 0.18.
+        .package(url: "https://github.com/argmaxinc/argmax-oss-swift", from: "1.1.0"),
     ],
     targets: [
         // ObjC shim to catch NSExceptions from AVFoundation (Swift can't) —

@@ -223,7 +223,10 @@ sign_path "$APP_DIR" --entitlements "$ENTITLEMENTS"
 echo "Code signing complete (mode: $SIGN_MODE)"
 codesign -vvv "$APP_DIR" 2>&1 || true
 
-# Install to /Applications
+# Install to /Applications. Remove the old bundle first: `cp -R` over an
+# existing bundle fails when a framework resource changes between a file and a
+# directory (Sparkle 2.10 turned SUUpdatePermissionPrompt.nib into a bundle).
+rm -rf "/Applications/$APP_NAME.app"
 cp -R "$APP_DIR" /Applications/
 echo "Installed to /Applications/$APP_NAME.app"
 

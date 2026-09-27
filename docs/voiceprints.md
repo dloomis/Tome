@@ -22,7 +22,7 @@ official API added in **argmax-oss-swift** (formerly WhisperKit) by upstream PR 
 mean embedding per speaker cluster, returned in the raw embedder space (un-normalized).
 Tome L2-normalizes each centroid in `VoiceprintSidecar.build` before writing, so the stored
 print is unit-length and matches the backfill CLI's output. `Tome/Package.swift` is pinned to
-that commit (unreleased as of pinning); re-pin to a tagged release once it ships in one. The
+that commit; since 2026-09-27 Tome pins the tagged release 1.1.0, the first to include it. The
 embedding space is identified by the sidecar's `model` field (`speakerkit-1.0`); consumers
 refuse to compare vectors across differing models.
 

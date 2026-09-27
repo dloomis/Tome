@@ -10,7 +10,7 @@ import Testing
     }
 
     @Test func displayNames() {
-        #expect(TranscriberModel.parakeetTDTv3.displayName == "Parakeet-TDT v3")
+        #expect(TranscriberModel.parakeetTDTv3.displayName == "Parakeet Ultra")
         #expect(TranscriberModel.whisperLargeV3Turbo.displayName == "Whisper Large v3 Turbo")
     }
 

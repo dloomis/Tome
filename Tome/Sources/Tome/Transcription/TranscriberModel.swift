@@ -1,12 +1,15 @@
 /// User-selectable ASR model. Raw values are persisted in UserDefaults —
 /// treat them as a stable on-disk format.
 enum TranscriberModel: String, CaseIterable, Sendable, Codable {
+    /// Parakeet Ultra since 2026-09-27 (moondream's post-trained Parakeet-TDT v3,
+    /// `AsrModelVersion.ultra`). The raw value is the persisted selection key and
+    /// deliberately unchanged — it names the model *family*, not the weights.
     case parakeetTDTv3 = "parakeet-tdt-v3"
     case whisperLargeV3Turbo = "whisper-large-v3-turbo"
 
     var displayName: String {
         switch self {
-        case .parakeetTDTv3: "Parakeet-TDT v3"
+        case .parakeetTDTv3: "Parakeet Ultra"
         case .whisperLargeV3Turbo: "Whisper Large v3 Turbo"
         }
     }
@@ -40,7 +43,7 @@ extension TranscriberModel {
     /// device-resolved variant (M1 gets the quantized build).
     var approxDownloadSize: String {
         switch self {
-        case .parakeetTDTv3: "~600 MB"
+        case .parakeetTDTv3: "~650 MB"
         case .whisperLargeV3Turbo:
             WhisperBackend.resolveVariant().hasSuffix("_626MB") ? "~0.6 GB" : "~1.5 GB"
         }
