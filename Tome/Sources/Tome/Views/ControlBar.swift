@@ -35,6 +35,9 @@ struct ControlBar: View {
     let silenceSeconds: Int
     let silenceAutoStopSeconds: Int
     let silencePromptActive: Bool
+    /// True when the silence timer is judging the far-end leg alone (it has
+    /// been heard this session) — the prompts then say "call audio".
+    let silenceIsFarEnd: Bool
     let statusMessage: String?
     let errorMessage: String?
     /// Persistent non-fatal warning (amber, below the error line): capture is
@@ -155,7 +158,7 @@ struct ControlBar: View {
                     silenceStopPrompt
                 } else if silenceAutoStopSeconds > 0,
                           silenceSeconds >= max(silenceAutoStopSeconds - 30, 1) {
-                    Text("Silence — will ask to stop in \(max(silenceAutoStopSeconds - silenceSeconds, 0))s")
+                    Text("\(silenceIsFarEnd ? "Call audio silent" : "Silence") — will ask to stop in \(max(silenceAutoStopSeconds - silenceSeconds, 0))s")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -269,7 +272,7 @@ struct ControlBar: View {
                 Image(systemName: "waveform.slash")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.orange)
-                Text("Silent for \(formatSilence(silenceSeconds)) — stop recording?")
+                Text("\(silenceIsFarEnd ? "Call audio silent" : "Silent") for \(formatSilence(silenceSeconds)) — stop recording?")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.orange)
             }

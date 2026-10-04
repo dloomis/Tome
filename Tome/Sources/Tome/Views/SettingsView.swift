@@ -267,7 +267,7 @@ private struct AudioTab: View {
                     get: { Double(settings.silenceAutoStopSeconds) },
                     set: { settings.silenceAutoStopSeconds = Int($0) }
                 ), in: 0...600, step: 30)
-                Text("Ask to stop recording after this many seconds of silence (mic + system audio). Recording never stops without your confirmation. 0 disables the prompt. Default: 120s")
+                Text("Ask to stop recording after this many seconds of silence. Once the other side of a call has been heard, only call audio counts — your mic alone won't keep the recording going. Recording never stops without your confirmation. 0 disables the prompt. Default: 120s")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }

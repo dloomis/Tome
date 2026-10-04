@@ -113,6 +113,11 @@ struct ContentView: View {
     /// Meeting title applied to the in-flight session, shown in the Stop subtitle.
     @State private var activeMeetingTitle: String?
     @State private var silenceSeconds: Int = 0
+    /// The level the silence timer judges — the far-end leg alone once it has
+    /// been heard this session, mic + far end until then (`SilenceSignal`).
+    @State private var silenceLevel: Float = 0
+    /// Latched when the "Them" leg first delivers audible audio in a session.
+    @State private var farEndHeard = false
     /// True while the silence stop-confirmation prompt (in-app + notification) is
     /// up. Recording continues until the user answers; cleared when audio resumes
     /// or the session ends. Replaces the old behavior of silently auto-stopping.
@@ -228,6 +233,7 @@ struct ContentView: View {
                 silenceSeconds: silenceSeconds,
                 silenceAutoStopSeconds: settings.silenceAutoStopSeconds,
                 silencePromptActive: silencePromptActive,
+                silenceIsFarEnd: farEndHeard,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError ?? modelFailureText,
                 warningMessage: captureWarningMessage,
@@ -400,14 +406,18 @@ struct ContentView: View {
                 }
                 if engine.isRunning {
                     audioLevel = engine.audioLevel
-                    if audioLevel > 0.01 {
+                    let farEnd = engine.farEndAudioLevel
+                    if farEnd > SilenceSignal.audibleLevel { farEndHeard = true }
+                    silenceLevel = SilenceSignal.level(combined: audioLevel, farEnd: farEnd, farEndHeard: farEndHeard)
+                    if silenceLevel > SilenceSignal.audibleLevel {
                         silenceSeconds = 0
                         // Audio resumed — the silence premise is gone, so the
                         // pending stop confirmation withdraws itself.
                         if silencePromptActive { dismissSilencePrompt() }
                     }
-                } else if audioLevel != 0 {
+                } else if audioLevel != 0 || silenceLevel != 0 {
                     audioLevel = 0
+                    silenceLevel = 0
                 }
             }
         }
@@ -425,7 +435,7 @@ struct ContentView: View {
                 }
                 sessionElapsed += 1
                 apiServer.sessionElapsed = sessionElapsed
-                if audioLevel < 0.01 {
+                if silenceLevel < SilenceSignal.audibleLevel {
                     silenceSeconds += 1
                     let limit = settings.silenceAutoStopSeconds
                     if limit > 0 && silenceSeconds >= limit && !silencePromptActive {
@@ -1192,7 +1202,8 @@ struct ContentView: View {
     private func presentSilencePrompt() {
         silencePromptActive = true
         let elapsed = silenceSeconds
-        Task { await NotificationPresenter.shared.postSilencePrompt(silentForSeconds: elapsed) }
+        let farEnd = farEndHeard
+        Task { await NotificationPresenter.shared.postSilencePrompt(silentForSeconds: elapsed, farEndOnly: farEnd) }
     }
 
     /// Withdraw the silence prompt and restart the silence window — fired by
@@ -1226,6 +1237,7 @@ struct ContentView: View {
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0
         silencePromptActive = false
+        farEndHeard = false
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
@@ -1445,6 +1457,7 @@ struct ContentView: View {
         currentSourceApp = nil
         silenceSeconds = 0
         silencePromptActive = false
+        farEndHeard = false
         sessionElapsed = 0
     }
 
@@ -1497,6 +1510,7 @@ struct ContentView: View {
         activeMeetingTitle = nil
         silenceSeconds = 0
         silencePromptActive = false
+        farEndHeard = false
         NotificationPresenter.shared.clearSilencePrompt()
         currentSessionId = nil
         currentSourceApp = nil
@@ -2029,9 +2043,14 @@ struct ContentView: View {
         if count < persistedUtteranceCount { persistedUtteranceCount = 0 }
         guard count > persistedUtteranceCount else { return }
 
-        silenceSeconds = 0
-        // Speech evidence cancels a pending silence stop prompt, same as raw audio.
-        if silencePromptActive { dismissSilencePrompt() }
+        // Speech evidence cancels a pending silence stop prompt, same as raw
+        // audio — but once the far end has been heard, only "Them" speech counts.
+        let heard = farEndHeard
+        if transcriptStore.utterances[persistedUtteranceCount..<count]
+            .contains(where: { SilenceSignal.utteranceBreaksSilence($0.speaker, farEndHeard: heard) }) {
+            silenceSeconds = 0
+            if silencePromptActive { dismissSilencePrompt() }
+        }
 
         // Drain every utterance since the cursor, not just the last one. Two
         // utterances can land in a single update tick (mic + system finalizing

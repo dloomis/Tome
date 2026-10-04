@@ -83,13 +83,13 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     /// in-app prompt in `ControlBar` for when the Tome window is hidden behind
     /// the meeting app. Recording continues until an action is chosen — this
     /// notification never stops anything by itself.
-    func postSilencePrompt(silentForSeconds: Int) async {
+    func postSilencePrompt(silentForSeconds: Int, farEndOnly: Bool = false) async {
         await requestAuthorizationIfNeeded()
         guard authorized else { return }
 
         let content = UNMutableNotificationContent()
         content.title = "Still there? Tome is recording silence"
-        content.body = "No audio for \(Self.silenceDescription(silentForSeconds)). Recording continues until you stop it."
+        content.body = "No \(farEndOnly ? "call audio" : "audio") for \(Self.silenceDescription(silentForSeconds)). Recording continues until you stop it."
         content.sound = .default
         content.categoryIdentifier = Self.silenceCategoryID
 

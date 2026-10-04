@@ -62,6 +62,13 @@ final class TranscriptionEngine {
         max(micCapture.audioLevel, max(systemCapture.audioLevel, systemDeviceCapture.audioLevel))
     }
 
+    /// Level of the "Them" leg alone (whichever source is bound) — the silence
+    /// stop-confirmation judges this once the far end has been heard, so mic
+    /// noise after a call ends can't keep the session alive (`SilenceSignal`).
+    var farEndAudioLevel: Float {
+        max(systemCapture.audioLevel, systemDeviceCapture.audioLevel)
+    }
+
     /// User-facing mic mute (top-bar toggle). Zeroes the mic leg at the tap —
     /// transcription, waveform, and the retained WAV all go silent while the
     /// system leg keeps flowing. Lives on the shared `micCapture` instance, so
