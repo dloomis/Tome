@@ -119,24 +119,32 @@ and `wasRecording`.
    recording *mid-call* (a sensitive stretch, a wrong-meeting start) must not
    be asked "Record this meeting?" ten seconds later. An instance created
    inside the window is born `handled`.
-3. **Evidence.** `present` = `o.meeting != nil && o.callAudio == .present`;
-   `unknown` = `o.meeting != nil && o.callAudio == .unknown`.
-   On `unknown` return `.none` with no state change (the instance ages toward
-   expiry in step 5; sixty seconds of unanswered queries end it — acceptable).
-4. **Present.**
+3. **Expiry — before the evidence is read.** If an instance exists and
+   `now - lastEvidence ≥ 60 s`: drop it (remember whether it was `prompted`).
+   This runs on *every* non-recording poll, not only absent ones: after a
+   sleep, a present poll is a **new** call that must sustain its own 10 s and
+   must not inherit yesterday's `handled`; and sixty seconds of unanswered
+   queries end an instance as intended. (A `prompted` instance whose evidence
+   lapses keeps its prompt up to 60 s — the panel's own timeout (§3) usually
+   closes it first. Deliberately *not* "withdraw on first missed poll": a Teams
+   retitle during screen-share would kill the prompt with no second chance.)
+4. **Evidence.** `present` = `o.meeting != nil && o.callAudio == .present`.
+   On no meeting, `.absent`, or `.unknown`: return `.withdraw` if step 3
+   dropped a prompted instance, else `.none`. No other state change — `unknown`
+   neither advances nor resets; `absent` only ages the instance toward step 3.
+5. **Present.**
    - No instance, or the instance's bundle ID differs (switched apps): create
      one — `phase = handled` if `now < suppressNewInstancesUntil`, else
-     `accumulating`. Return `.withdraw` if the replaced instance was
-     `prompted`, else `.none`.
-   - Same instance: `lastEvidence = now`; if `accumulating` and
-     `now - firstEvidence ≥ 10 s` → `prompted`, return `.prompt(meeting)`.
-     Otherwise `.none`.
-5. **Absent.** If an instance exists and `now - lastEvidence ≥ 60 s`: drop it,
-   return `.withdraw` if it was `prompted`. Else `.none`. (A `prompted`
-   instance whose evidence lapses keeps its prompt up to 60 s — the panel's own
-   timeout (§3) usually closes it first. Deliberately *not* "withdraw on first
-   missed poll": a Teams retitle during screen-share would kill the prompt
-   with no second chance.)
+     `accumulating`. Return `.withdraw` if the replaced (or step-3-dropped)
+     instance was `prompted`, else `.none`.
+   - Same instance: `lastEvidence = now`, `meeting = o.meeting` (latest
+     title); if `accumulating` and `now - firstEvidence ≥ 10 s` → `prompted`,
+     return `.prompt(meeting)`. Otherwise `.none`.
+
+The evidence type is `CallAudioEvidence`; the matcher is
+`MeetingJoinPolicy.callAudioEvidence(for:from:)`. A read-only `phase` and
+`isPromptAlive` (true iff `prompted`) are exposed for the stale-notification
+guard and logging.
 
 `userAccepted` / `userDeclined` set `phase = handled`. There is no snooze: the
 instance ends when the call ends, and the next call is a new question.
@@ -335,7 +343,7 @@ change **after** its in-call audio signature is checked on a real call:
 12. Stale-notification guard: `isPromptAlive` (or equivalent) is false after
     the instance expires.
 
-`AudioProcessInspectorMatchTests` — the pure `evidence(for:from:)`:
+`CallAudioEvidenceMatchTests` — the pure `callAudioEvidence(for:from:)`:
 `com.microsoft.teams2` exact; `com.microsoft.teams2.modulehost` prefix;
 `com.microsoft.teams2helper` (no dot) does **not** match; `.unavailable` →
 `.unknown`; `.answered(nil)` → `.unknown`; `.answered([])` → `.absent`.
