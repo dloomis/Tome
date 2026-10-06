@@ -541,10 +541,18 @@ private struct OutputTab: View {
                 Text("Forbidden filesystem characters (/ : \\ ? * < > | \") are converted to dashes. Leave a label blank for date-only filenames.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+            }
 
+            Section("Meeting Detection") {
                 Toggle("Auto-name from detected meetings", isOn: $settings.useDetectedMeetingNames)
                     .font(.system(size: 12))
                 Text("When you're in a Teams or Google Meet call, use the meeting's name for the Call Capture filename instead of the label above. The detected name appears as a dismissible chip, so you can ignore a false match. Names supplied over the API always take priority.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                Toggle("Ask to record when a call is live", isOn: $settings.promptToRecordDetectedMeetings)
+                    .font(.system(size: 12))
+                Text("When a Teams meeting is running and Tome isn't recording, show a prompt over the meeting with a Record button. Needs the Screen Recording permission Tome uses to see window titles; the prompt never starts a recording on its own.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }

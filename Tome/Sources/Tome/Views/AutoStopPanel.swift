@@ -5,17 +5,17 @@ import SwiftUI
 /// Floating countdown for the forgotten-recording failsafe (spec
 /// `docs/superpowers/specs/2026-10-06-forgotten-recording-failsafe.md` §6).
 ///
-/// A non-activating `NSPanel`: it floats over every Space (and full-screen
-/// apps), never takes key focus, and never activates Tome — so a Return or
-/// Space typed into the meeting app can't answer it by accident. That is the
-/// reason this isn't an `NSAlert` (which would also block the main actor the
-/// engine lives on).
+/// A non-activating `FloatingPromptPanel` (see `FloatingPromptPanel.swift`):
+/// it floats over every Space (and full-screen apps), never takes key focus,
+/// and never activates Tome — so a Return or Space typed into the meeting app
+/// can't answer it by accident. That is the reason this isn't an `NSAlert`
+/// (which would also block the main actor the engine lives on).
 ///
 /// The controller only presents. Its buttons call the supplied closures and
 /// nothing else; the caller decides when to `hide()`.
 @MainActor
 final class AutoStopPanelController {
-    private var panel: AutoStopPanel?
+    private var panel: FloatingPromptPanel?
     private let model = AutoStopPanelModel()
 
     var isVisible: Bool { panel?.isVisible ?? false }
@@ -36,23 +36,14 @@ final class AutoStopPanelController {
         model.onKeep = onKeep
         model.onStopNow = onStopNow
 
-        let panel = self.panel ?? makePanel()
+        let panel = self.panel ?? FloatingPromptPanel.make(rootView: AutoStopPanelView(model: model))
         self.panel = panel
-        panel.sharingType = hiddenFromSharing ? .none : .readOnly
+        panel.applySharing(hidden: hiddenFromSharing)
 
         let wasVisible = panel.isVisible
-        if let content = panel.contentView {
-            // Refit to the (possibly re-wrapped) line, keeping the top edge
-            // fixed so an in-place update doesn't jump the panel upward.
-            content.layoutSubtreeIfNeeded()
-            let top = panel.frame.maxY
-            panel.setContentSize(content.fittingSize)
-            if wasVisible {
-                panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: top - panel.frame.height))
-            }
-        }
+        panel.refitToContent(keepingTopEdge: wasVisible)
         if !wasVisible {
-            position(panel)
+            panel.positionTopCenter()
             panel.orderFrontRegardless()
             NSSound.beep()
         }
@@ -83,64 +74,6 @@ final class AutoStopPanelController {
         let s = max(seconds, 0)
         return "\(s / 60):\(String(format: "%02d", s % 60))"
     }
-
-    // MARK: - Private
-
-    private func makePanel() -> AutoStopPanel {
-        let panel = AutoStopPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 160),
-            styleMask: [.nonactivatingPanel, .borderless],
-            backing: .buffered,
-            defer: true
-        )
-        panel.isFloatingPanel = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.becomesKeyOnlyIfNeeded = true
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
-        panel.animationBehavior = .utilityWindow
-
-        let host = FirstMouseHostingView(rootView: AutoStopPanelView(model: model))
-        host.sizingOptions = [.intrinsicContentSize]
-        panel.contentView = host
-        return panel
-    }
-
-    /// Top-center of the screen holding the mouse, a little below the menu bar.
-    private func position(_ panel: NSPanel) {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        guard let screen else { return }
-        let visible = screen.visibleFrame
-        let size = panel.frame.size
-        let origin = NSPoint(
-            x: visible.midX - size.width / 2,
-            y: visible.maxY - size.height - 12
-        )
-        panel.setFrameOrigin(origin)
-    }
-}
-
-// MARK: - Panel + hosting view
-
-/// Never key, never main: the panel must not take focus from the meeting app.
-/// Mouse clicks still reach its buttons (see `FirstMouseHostingView`).
-private final class AutoStopPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-}
-
-/// The first click on an inactive app's panel should press the button, not
-/// merely "focus" the window.
-private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 // MARK: - Model + view
