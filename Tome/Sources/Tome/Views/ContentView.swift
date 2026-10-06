@@ -122,6 +122,21 @@ struct ContentView: View {
     /// up. Recording continues until the user answers; cleared when audio resumes
     /// or the session ends. Replaces the old behavior of silently auto-stopping.
     @State private var silencePromptActive = false
+    /// Forgotten-recording failsafe (spec 2026-10-06). The policy owns the
+    /// countdown — `autoStop.countdown` is the one source of truth; everything
+    /// below it is plumbing or display.
+    @State private var autoStop = AutoStopPolicy()
+    /// Departure signals (DepartureMonitor + engine) since the last 1 s tick.
+    @State private var autoStopSignalQueue: [DepartureSignal] = []
+    /// The previous live tick, for the sleep-gap arithmetic. nil = no live tick yet.
+    @State private var autoStopPreviousTick: AutoStopPolicy.TickStamp?
+    /// `silenceSeconds` as the previous step saw it — see the tick for why.
+    @State private var autoStopPreviousSilence = 0
+    /// ControlBar countdown row. Non-nil exactly while a countdown is shown.
+    @State private var autoStopLine: String?
+    @State private var autoStopRemainingSeconds = 0
+    @State private var autoStopPanel = AutoStopPanelController()
+    @State private var departureMonitor = DepartureMonitor()
     /// Confirmation gate for the main Stop button. `onConfirm` is wired to
     /// `stopSession()` in the boot task; the silence prompt, notification
     /// action, and HTTP API bypass it (see StopConfirmationModel).
@@ -246,7 +261,11 @@ struct ContentView: View {
                 onStopRequested: { stopConfirmation.requestStop() },
                 onStop: stopSession,
                 onKeepRecording: dismissSilencePrompt,
-                onDismissMeeting: { dismissedMeetingTitle = detectedMeeting?.title }
+                onDismissMeeting: { dismissedMeetingTitle = detectedMeeting?.title },
+                autoStopLine: autoStopLine,
+                autoStopRemainingSeconds: autoStopRemainingSeconds,
+                onAutoStopKeep: autoStopKeepRecording,
+                onAutoStopStopNow: autoStopStopNow
             )
         }
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
@@ -302,6 +321,17 @@ struct ContentView: View {
             // Session ended through another path (capture error, API stop,
             // notification stop) — withdraw a pending stop confirmation.
             if !running { stopConfirmation.recordingDidEnd() }
+            // Failsafe signal sources live and die with capture. Fresh policy
+            // on the rising edge too: a stop → start inside one second never
+            // shows the tick a non-running state, and teardown signals the
+            // previous session's engine emitted while still `isRunning` must
+            // not latch into this one.
+            resetAutoStop()
+            if running {
+                departureMonitor.start()
+            } else {
+                departureMonitor.stop()
+            }
         }
         .onChange(of: services.modelProvisioner.canStartRecording, initial: true) { _, ready in
             // Mirror model readiness into the APIServer: /health's modelsReady
@@ -333,6 +363,27 @@ struct ContentView: View {
                 )
             }
             guard let engine = transcriptionEngine else { return }
+            // Failsafe intake — wired before anything can start a session. Both
+            // sources only queue; the 1 s tick is the one place they're judged.
+            // Gated on a live recording session (engine capturing AND a session
+            // ContentView still owns): after stopSession() clears
+            // activeSessionType the engine stays `isRunning` through its
+            // teardown awaits, and a route change from that teardown is not a
+            // departure.
+            engine.onDepartureSignal = { signal in
+                if isLiveRecordingSession { autoStopSignalQueue.append(signal) }
+            }
+            departureMonitor.onSignal = { signal in
+                if isLiveRecordingSession { autoStopSignalQueue.append(signal) }
+            }
+            // Lid closing: get the transcript onto disk, and that's all. The
+            // sleep's length is unknowable here, so nothing is stopped — R1 is
+            // decided at wake from the tick gap.
+            departureMonitor.onWillSleep = {
+                guard isLiveRecordingSession else { return }
+                diagLog("[AUTOSTOP] will sleep")
+                Task { await services.transcriptLogger.flushIfNeeded() }
+            }
             await services.asrCoordinator.setLanguage(settings.transcriptionLanguage)
 
             // Kick provisioning of the selected model before anything that
@@ -380,12 +431,24 @@ struct ContentView: View {
                 if silencePromptActive { stopSession() }
             }
             NotificationPresenter.shared.silenceKeepAction = {
-                if silencePromptActive { dismissSilencePrompt() }
+                // A silence-prompt notification that outlived its withdrawal
+                // (the failsafe countdown took over) still means "keep" — answer
+                // the countdown too, settle window included.
+                if autoStop.countdown != nil {
+                    autoStopKeepRecording()
+                } else if silencePromptActive {
+                    dismissSilencePrompt()
+                }
             }
             // Dialog "Stop Recording" → the real teardown. stopSession()'s
             // re-entrance guard makes a stale confirm (session already ended
             // by the API/notification in the same instant) a harmless no-op.
             stopConfirmation.onConfirm = { stopSession() }
+            // Failsafe countdown notification — same two functions as the panel
+            // and the ControlBar row; both no-op without a live countdown, so a
+            // stale notification (countdown cancelled, session ended) can't act.
+            NotificationPresenter.shared.autoStopKeepAction = { autoStopKeepRecording() }
+            NotificationPresenter.shared.autoStopStopNowAction = { autoStopStopNow() }
 
             // Returning users: onboarding never shows, so we surface the orphan
             // prompt at the end of boot. First-launch users hit the onChange
@@ -423,6 +486,10 @@ struct ContentView: View {
         }
         // Silence stop-confirmation + elapsed timer
         .task {
+            // A (re)started loop hasn't watched the interval since the last
+            // tick — e.g. the window was closed, cancelling this task, while
+            // @State survived. That gap is not a sleep: never let it read as R1.
+            autoStopPreviousTick = nil
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard isRunning else {
@@ -431,18 +498,32 @@ struct ContentView: View {
                     // than stopSession() (e.g. a capture error), don't leave a
                     // stale prompt up.
                     if silencePromptActive { dismissSilencePrompt() }
+                    // Same for the failsafe: no countdown outlives capture.
+                    if autoStopPreviousTick != nil || autoStop.countdown != nil || autoStopLine != nil {
+                        resetAutoStop()
+                    }
                     continue
                 }
                 sessionElapsed += 1
                 apiServer.sessionElapsed = sessionElapsed
-                if silenceLevel < SilenceSignal.audibleLevel {
-                    silenceSeconds += 1
-                    let limit = settings.silenceAutoStopSeconds
-                    if limit > 0 && silenceSeconds >= limit && !silencePromptActive {
-                        // Silence limit reached — never stop silently. Keep
-                        // recording and ask the user to confirm.
-                        presentSilencePrompt()
-                    }
+                let silent = silenceLevel < SilenceSignal.audibleLevel
+                if silent { silenceSeconds += 1 }
+                // Failsafe step on every live tick (audible ones withdraw a
+                // countdown). Before the silence prompt below, so a countdown
+                // that begins this tick suppresses a prompt that would land on
+                // the same tick — otherwise the prompt's async notification post
+                // could arrive after the countdown withdrew it. An auto-stop
+                // here zeroes `silenceSeconds`, so the prompt can't follow it.
+                autoStopTick()
+                let limit = settings.silenceAutoStopSeconds
+                // One question at a time: while the failsafe countdown is up it
+                // owns the ControlBar slot and the notification, so the silence
+                // prompt doesn't (re)present underneath it.
+                if silent && limit > 0 && silenceSeconds >= limit && !silencePromptActive
+                    && autoStop.countdown == nil {
+                    // Silence limit reached — never stop silently. Keep
+                    // recording and ask the user to confirm.
+                    presentSilencePrompt()
                 }
             }
         }
@@ -1149,6 +1230,14 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// Capturing AND still owned by ContentView — the only state the
+    /// forgotten-recording failsafe acts in. `activeSessionType` goes nil
+    /// synchronously in stopSession(), while the engine stays `isRunning`
+    /// until its teardown completes.
+    private var isLiveRecordingSession: Bool {
+        isRunning && activeSessionType != nil
+    }
+
     /// Main-screen provisioning banner (spec §7). Display-uppercased here;
     /// Settings shows the sentence-case versions.
     private var modelStatusText: String? {
@@ -1215,6 +1304,147 @@ struct ContentView: View {
         NotificationPresenter.shared.clearSilencePrompt()
     }
 
+    // MARK: - Forgotten-recording failsafe (spec 2026-10-06 §5)
+
+    /// One failsafe step, run by the 1 s session tick after its silence
+    /// bookkeeping — on every live tick, audible ones included, because audio
+    /// is what withdraws a countdown. All judgement is `AutoStopPolicy`'s; this
+    /// only gathers inputs and acts on the answer.
+    private func autoStopTick() {
+        // Live recording sessions only: an import or WAV recovery never binds
+        // the engine, and the stopSession() → engine.stop() window (engine
+        // still `isRunning`, session already handed off) is not a session.
+        guard isLiveRecordingSession, let engine = transcriptionEngine else {
+            if autoStopPreviousTick != nil || autoStop.countdown != nil || autoStopLine != nil {
+                resetAutoStop()
+            }
+            return
+        }
+        let stamp = AutoStopPolicy.TickStamp.now
+        let now = stamp.continuous
+        let gap = AutoStopPolicy.tickGapSeconds(previous: autoStopPreviousTick, now: stamp)
+        autoStopPreviousTick = stamp
+        let signals = autoStopSignalQueue
+        autoStopSignalQueue.removeAll()
+
+        // Audio between ticks must read as audio. The 100 ms poll (and
+        // handleNewUtterance) zero `silenceSeconds` the moment anything is
+        // audible, but the tick above then re-increments it if the level has
+        // dropped again by the time it samples — so a half-second far-end
+        // "hello?" leaves the counter at 1, not 0. The policy keys "audio came
+        // back" on a zero counter (its step 3 deadline pass and step 8 cancel),
+        // and would otherwise fire the deadline over that blip. Between two
+        // ticks the counter either grew by exactly one or something reset it,
+        // so anything short of growth is fed as zero.
+        let policySilence = silenceSeconds > autoStopPreviousSilence ? silenceSeconds : 0
+        autoStopPreviousSilence = silenceSeconds
+
+        let action = autoStop.step(AutoStopPolicy.Inputs(
+            enabled: settings.autoStopWhenAway,
+            now: now,
+            tickGapSeconds: gap,
+            newSignals: signals,
+            silenceSeconds: policySilence,
+            judgedLegDelivering: engine.judgedLegIsDelivering(farEndHeard: farEndHeard),
+            silencePromptLimit: settings.silenceAutoStopSeconds
+        ))
+        switch action {
+        case .none:
+            break
+        case .beginCountdown(let reason):
+            beginAutoStopCountdown(reason)
+        case .cancelCountdown:
+            diagLog("[AUTOSTOP] countdown cancelled")
+            tearDownAutoStopSurfaces()
+        case .stop(let reason):
+            autoStopSession(reason: reason)
+            return
+        }
+        if let countdown = autoStop.countdown {
+            autoStopRemainingSeconds = AutoStopPanelController.remainingSeconds(until: countdown.deadline, now: now)
+        }
+    }
+
+    private func beginAutoStopCountdown(_ reason: AutoStopReason) {
+        guard let countdown = autoStop.countdown else { return }
+        let line = reason.countdownLine(farEndOnly: farEndHeard)
+        diagLog("[AUTOSTOP] countdown reason=\(reason.logLabel) silence=\(silenceSeconds)s")
+        // Withdraw ONLY the silence prompt's notification — never call
+        // dismissSilencePrompt() here. It zeroes `silenceSeconds`, the policy
+        // caps trusted silence at that counter, and a zero trusted silence
+        // cancels the countdown on the very next tick. R3 arms precisely while
+        // the silence prompt is up, so "dismissing" it would make R3 (and any
+        // R2 that overlaps the prompt) cancel itself one second after showing.
+        // The prompt's state stays; the ControlBar renders the countdown row in
+        // its place while `autoStopLine` is set.
+        NotificationPresenter.shared.clearSilencePrompt()
+        autoStopLine = line
+        autoStopRemainingSeconds = AutoStopPanelController.remainingSeconds(until: countdown.deadline, now: .now)
+        autoStopPanel.show(
+            line: line,
+            deadline: countdown.deadline,
+            hiddenFromSharing: settings.hideFromScreenShare,
+            onKeep: { autoStopKeepRecording() },
+            onStopNow: { autoStopStopNow() }
+        )
+        Task { await NotificationPresenter.shared.postAutoStopCountdown(line: line, seconds: AutoStopPolicy.countdownSeconds) }
+    }
+
+    /// The policy fired. Snapshot what the notice needs before stopSession()
+    /// zeroes it, then stop through the one ordinary path — its re-entrance
+    /// guard covers a racing API / notification / Stop-dialog stop.
+    private func autoStopSession(reason: AutoStopReason) {
+        let silence = silenceSeconds
+        let farEndOnly = farEndHeard
+        var line = "[AUTOSTOP] reason=\(reason.logLabel) silence=\(silence)s"
+        if case .slept(let seconds) = reason { line += " slept=\(seconds)s" }
+        diagLog(line)
+        tearDownAutoStopSurfaces()
+        let detail = reason.stoppedDetail(silenceSeconds: silence, farEndOnly: farEndOnly)
+        Task { await NotificationPresenter.shared.postAutoStopped(detail: detail) }
+        stopSession()
+    }
+
+    /// Keep Recording — panel, ControlBar row, notification action. No-op
+    /// without a live countdown (a stale notification must not act).
+    private func autoStopKeepRecording() {
+        guard autoStop.countdown != nil else { return }
+        autoStop.keepRecording(now: .now)
+        tearDownAutoStopSurfaces()
+        diagLog("[AUTOSTOP] keep")
+        // Also answers the silence prompt: zeroes `silenceSeconds`, so both
+        // the prompt and R3 re-arm only after another full silence window.
+        dismissSilencePrompt()
+    }
+
+    /// Stop Now — already a confirmation, so it skips StopConfirmationModel
+    /// (like the silence prompt's Stop & Save). No-op without a live countdown.
+    private func autoStopStopNow() {
+        guard autoStop.countdown != nil else { return }
+        tearDownAutoStopSurfaces()
+        diagLog("[AUTOSTOP] stop-now")
+        stopSession()
+    }
+
+    /// Panel, countdown notification, ControlBar row. Policy state untouched.
+    private func tearDownAutoStopSurfaces() {
+        autoStopPanel.hide()
+        NotificationPresenter.shared.clearAutoStopCountdown()
+        autoStopLine = nil
+        autoStopRemainingSeconds = 0
+    }
+
+    /// Session boundary: policy back to idle, nothing queued, no surfaces.
+    private func resetAutoStop() {
+        autoStop.reset()
+        autoStopSignalQueue.removeAll()
+        autoStopPreviousTick = nil
+        autoStopPreviousSilence = 0
+        if autoStopLine != nil || autoStopPanel.isVisible {
+            tearDownAutoStopSurfaces()
+        }
+    }
+
     /// Start a session. Explicit modes (`.callCapture` / `.voiceMemo`) map
     /// straight onto the two historical code paths. `.auto` (single Record
     /// button, API start with no `type`) runs the call-capture path — both legs,
@@ -1238,6 +1468,7 @@ struct ContentView: View {
         silenceSeconds = 0
         silencePromptActive = false
         farEndHeard = false
+        resetAutoStop()
         sessionElapsed = 0
         savedFileURL = nil
         bannerDismissTask?.cancel()
@@ -1458,6 +1689,7 @@ struct ContentView: View {
         silenceSeconds = 0
         silencePromptActive = false
         farEndHeard = false
+        resetAutoStop()
         sessionElapsed = 0
     }
 
@@ -1512,6 +1744,9 @@ struct ContentView: View {
         silencePromptActive = false
         farEndHeard = false
         NotificationPresenter.shared.clearSilencePrompt()
+        // Failsafe: any stop path (manual, API, notification, auto) takes the
+        // countdown panel/row/notification down with the session.
+        resetAutoStop()
         currentSessionId = nil
         currentSourceApp = nil
         apiServer.sessionDidStop(id: sessionId)

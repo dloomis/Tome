@@ -28,19 +28,47 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     var silenceStopAction: (() -> Void)?
     var silenceKeepAction: (() -> Void)?
 
+    // MARK: - Auto-stop countdown (forgotten-recording failsafe)
+
+    /// Category + action identifiers for the auto-stop countdown. Registered in
+    /// `init` alongside the silence category (`setNotificationCategories`
+    /// replaces the whole set, so both must go in one call).
+    nonisolated static let autoStopCategoryID = "TOME_AUTOSTOP_COUNTDOWN"
+    nonisolated static let autoStopKeepActionID = "TOME_AUTOSTOP_KEEP"
+    nonisolated static let autoStopStopNowActionID = "TOME_AUTOSTOP_STOP_NOW"
+    /// Fixed request identifiers: a re-post replaces, and the countdown can be
+    /// withdrawn by id when cancelled.
+    private nonisolated static let autoStopCountdownRequestID = "tome-autostop-countdown"
+    private nonisolated static let autoStoppedRequestID = "tome-autostop-stopped"
+
+    /// Registered by `ContentView` — same wiring as the silence actions.
+    /// Invoked on the main actor when the user answers the countdown from the
+    /// notification.
+    var autoStopKeepAction: (() -> Void)?
+    var autoStopStopNowAction: (() -> Void)?
+
     override private init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
 
         let stop = UNNotificationAction(identifier: Self.silenceStopActionID, title: "Stop Recording", options: [])
         let keep = UNNotificationAction(identifier: Self.silenceKeepActionID, title: "Keep Recording", options: [])
+        let autoKeep = UNNotificationAction(identifier: Self.autoStopKeepActionID, title: "Keep Recording", options: [])
+        let autoStopNow = UNNotificationAction(identifier: Self.autoStopStopNowActionID, title: "Stop Now", options: [])
+        // One call: setNotificationCategories REPLACES the registered set.
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(
                 identifier: Self.silenceCategoryID,
                 actions: [stop, keep],
                 intentIdentifiers: [],
                 options: []
-            )
+            ),
+            UNNotificationCategory(
+                identifier: Self.autoStopCategoryID,
+                actions: [autoKeep, autoStopNow],
+                intentIdentifiers: [],
+                options: []
+            ),
         ])
     }
 
@@ -111,6 +139,55 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
 
     private static func silenceDescription(_ seconds: Int) -> String {
         seconds < 120 ? "\(seconds) seconds" : "\(seconds / 60) minutes"
+    }
+
+    /// The failsafe is counting down to a stop. Best-effort mirror of the
+    /// floating panel and ControlBar row — Focus modes will often swallow it.
+    /// `line` is `AutoStopReason.countdownLine(farEndOnly:)`.
+    func postAutoStopCountdown(line: String, seconds: Int) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome will stop recording in \(seconds) seconds"
+        content.body = line
+        content.sound = .default
+        content.categoryIdentifier = Self.autoStopCategoryID
+
+        let request = UNNotificationRequest(
+            identifier: Self.autoStopCountdownRequestID,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw the countdown — kept, stopped, or cancelled because audio
+    /// resumed. Safe to call when nothing is posted.
+    func clearAutoStopCountdown() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.autoStopCountdownRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.autoStopCountdownRequestID])
+    }
+
+    /// The failsafe ended the session. `detail` is
+    /// `AutoStopReason.stoppedDetail(silenceSeconds:farEndOnly:)`. The normal
+    /// completion notification still follows when the job finishes.
+    func postAutoStopped(detail: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Tome stopped recording"
+        content.body = detail
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: Self.autoStoppedRequestID,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - Capture stall
@@ -343,6 +420,24 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
                 default:
                     // Banner body clicked — bring Tome forward so the user can
                     // answer via the in-app prompt instead.
+                    NSApp.activate()
+                }
+            }
+            completionHandler()
+            return
+        }
+
+        if content.categoryIdentifier == Self.autoStopCategoryID {
+            let action = response.actionIdentifier
+            Task { @MainActor in
+                switch action {
+                case Self.autoStopKeepActionID:
+                    self.autoStopKeepAction?()
+                case Self.autoStopStopNowActionID:
+                    self.autoStopStopNowAction?()
+                default:
+                    // Banner body clicked — bring Tome forward; the in-app
+                    // row and floating panel carry the same choice.
                     NSApp.activate()
                 }
             }

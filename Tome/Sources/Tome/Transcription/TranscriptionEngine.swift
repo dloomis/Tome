@@ -240,7 +240,9 @@ final class TranscriptionEngine {
     /// listener watches the OS DEFAULT device and is inert while a specific
     /// device is pinned. A device-list change is the precise "it may be back"
     /// signal for both legs; each handler re-resolves and rebuilds only when its
-    /// own selection is actually adoptable again.
+    /// own selection is actually adoptable again. Since the forgotten-recording
+    /// failsafe it is installed for every session — it also drives the
+    /// emit-only `audioDeviceRemoved` check (`scheduleInputDeviceRemovalCheck`).
     private var deviceListListenerBlock: AudioObjectPropertyListenerBlock?
 
     /// Debounced re-adoption check scheduled by the device-list listener.
@@ -253,6 +255,40 @@ final class TranscriptionEngine {
     /// re-adopt independently — docking restores the pinned mic whether or not a
     /// call-audio device came back with it.
     private var micReadoptionTask: Task<Void, Never>?
+
+    // MARK: Departure signals (forgotten-recording failsafe)
+
+    /// Sink for departure signals — evidence the user's context changed
+    /// mid-session (spec: 2026-10-06-forgotten-recording-failsafe.md §2). The
+    /// engine only OBSERVES: every emit site sits on a path that already exists
+    /// for its own reasons and does exactly what it did before. Whether a signal
+    /// matters is the policy's call, never the engine's. Wired by ContentView.
+    var onDepartureSignal: ((DepartureSignal) -> Void)?
+
+    /// Listens for default OUTPUT device changes (AirPods coming out at the end
+    /// of a call). Emit-only — capture never follows the output device.
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// Debounced input-device removal check, scheduled by the device-list
+    /// listener alongside the two re-adoption checks. Own task (same supersede
+    /// rule) because removal is judged against the whole device set, not a
+    /// selection.
+    private var deviceRemovalCheckTask: Task<Void, Never>?
+
+    /// Session-scoped, LOG-ONLY hang-up probe (spec §8, shadow mode): polls
+    /// which processes run audio input and logs `[AUTOSTOP-SHADOW]` lines when
+    /// a long-held input is released. Never emits a departure signal. Started
+    /// at the end of `start()`, cancelled in `stop()`.
+    private var inputReleaseShadowTask: Task<Void, Never>?
+
+    /// Input-device UIDs present at the last ANSWERED enumeration this session.
+    /// nil until seeded; a refused enumeration never replaces it. Cleared in
+    /// `stop()`.
+    private var inputDeviceUIDSnapshot: Set<String>?
+
+    /// How recent a tap-written buffer must be for its leg to count as
+    /// delivering — see `judgedLegIsDelivering(farEndHeard:)`.
+    nonisolated static let legDeliveryFreshness: TimeInterval = 5
 
     /// Debounced mic rebuild scheduled by `AVAudioEngineConfigurationChange`.
     /// Bluetooth transitions (AirPods connect, HFP↔A2DP renegotiation) fire the
@@ -541,14 +577,20 @@ final class TranscriptionEngine {
 
         // Install CoreAudio listener for default input device changes
         installDefaultDeviceListener()
+        // Emit-only: an output-route change is a departure signal, nothing more.
+        installDefaultOutputListener()
 
         // Re-adoption trigger for whichever selections can go missing: a mixer
         // that republishes its devices mid-session (BT-flip storm), or a pinned
         // mic that comes back when the laptop is docked — both must be adopted
-        // when the device returns. See `deviceListListenerBlock`.
-        if !activeSystemSourceUID.isEmpty || !userSelectedDeviceUID.isEmpty {
-            installDeviceListListener()
-        }
+        // when the device returns. See `deviceListListenerBlock`. Installed for
+        // EVERY session since the failsafe: a device-list change is also the
+        // `audioDeviceRemoved` trigger. The re-adoption schedulers keep their own
+        // "is anything configured?" guards, so an unconfigured session still
+        // never re-adopts.
+        installDeviceListListener()
+        seedInputDeviceSnapshot()
+        startInputReleaseShadowProbe()
     }
 
     /// One-shot handle for the startup-delivery gate armed in `start()`. See
@@ -871,6 +913,11 @@ final class TranscriptionEngine {
         isRebuild: Bool = false,
         inheritedAnchor: Date? = nil
     ) async -> AsyncStream<AVAudioPCMBuffer>? {
+        // Snapshot BEFORE the awaits: only `startDeviceSystemLeg` /
+        // `startSCKSystemLeg` reassign the mode, and `start()` resets it to `.sck`
+        // before its bring-up, so true here means "a rebuild of a leg that was on
+        // the configured device" — the `callSourceLost` precondition below.
+        let wasOnDevice = systemSourceMode.isDevice
         let resolution = Self.resolveSystemSource(
             uid: activeSystemSourceUID,
             resolvedDeviceID: await MicCapture.deviceID(forUID: activeSystemSourceUID),
@@ -902,6 +949,13 @@ final class TranscriptionEngine {
             return stream
         case .sckFallback(let reason):
             await reportSystemSourceFallback(reason: reason, deviceID: nil)
+            // The call-audio device vanished under a live device-mode leg — the
+            // mixer's mix going away is a departure. Not at start (the device
+            // was never ours this session), not `.sameAsMic` (a collision, the
+            // device is still there), not `.bindFailed` (present but unbindable).
+            if isRebuild, wasOnDevice, reason == .deviceUnavailable {
+                emitDeparture(.callSourceLost)
+            }
             return await startSCKSystemLeg(recordingContext: recordingContext)
         case .sck:
             return await startSCKSystemLeg(recordingContext: recordingContext)
@@ -1860,7 +1914,16 @@ final class TranscriptionEngine {
                 selectionResolvesTo: selectionResolvesTo,
                 boundDeviceID: targetMicID
             ) {
+                // `restartMic` only runs inside a live session, so a raise HERE is
+                // the mid-session kind (the pinned mic vanished) — `start()`'s own
+                // raise never comes through this path. Emit on the nil→set
+                // transition only: a fallback carried over from start (or an
+                // earlier restart) is already-known context, not a new departure.
+                let wasRaised = micFallbackMessage != nil
                 await reportMicFallback(boundDeviceID: targetMicID)
+                if !wasRaised, micFallbackMessage != nil {
+                    emitDeparture(.micRouteChanged)
+                }
             } else {
                 clearMicFallback()
             }
@@ -1897,7 +1960,12 @@ final class TranscriptionEngine {
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.isRunning, self.userSelectedDeviceUID.isEmpty else { return }
+                guard self.isRunning else { return }
+                // The OS default input moving is departure evidence whether or not
+                // capture follows it (a pinned mic ignores it) — so emit BEFORE the
+                // System Default guard below.
+                self.emitDeparture(.micRouteChanged)
+                guard self.userSelectedDeviceUID.isEmpty else { return }
                 // User has "System Default" selected — follow the OS default
                 await self.restartMic(inputDeviceUID: "")
             }
@@ -1928,6 +1996,220 @@ final class TranscriptionEngine {
         defaultDeviceListenerBlock = nil
     }
 
+    // MARK: - Default output listener (departure signal only)
+
+    private static var defaultOutputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    /// Same shape and lifecycle as `installDefaultDeviceListener` (installed in
+    /// `start()`, removed in `stop()`). The block does no HAL query — the fire
+    /// itself is the evidence — and capture never reacts to it.
+    private func installDefaultOutputListener() {
+        guard defaultOutputListenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.emitDeparture(.outputRouteChanged)
+            }
+        }
+        defaultOutputListenerBlock = block
+        var address = Self.defaultOutputAddress
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+    }
+
+    private func removeDefaultOutputListener() {
+        guard let block = defaultOutputListenerBlock else { return }
+        var address = Self.defaultOutputAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        defaultOutputListenerBlock = nil
+    }
+
+    // MARK: - Departure signal sink + trusted-silence probe
+
+    /// The one funnel for every engine-side departure signal. Guards `isRunning`
+    /// so a listener fire racing `stop()` (the blocks hop to the main actor
+    /// asynchronously) can't latch evidence into an idle app.
+    private func emitDeparture(_ signal: DepartureSignal) {
+        guard isRunning else { return }
+        diagLog("[AUTOSTOP] signal=\(signal.rawValue)")
+        onDepartureSignal?(signal)
+    }
+
+    /// Spec §3 "trusted silence": is the leg `SilenceSignal` is judging actually
+    /// delivering? The system leg (whichever source is bound) once the far end
+    /// has been heard, the mic before that. A stalled or mid-rebuild leg reads
+    /// as level 0, and silence the app can't vouch for must never arm a stop.
+    /// Seeded timestamps never count — same discipline as the watchdog's
+    /// `canResume`: SCK seeds `lastSampleTime` at `bufferStream` start, so it
+    /// needs `firstSampleTime` (reset on stop) as proof of a real buffer;
+    /// `MicCapture` (mic and device-mode system leg) writes `lastSampleTime`
+    /// only from the tap and nils it on stop. Digital zeros ARE delivery.
+    func judgedLegIsDelivering(farEndHeard: Bool) -> Bool {
+        guard isRunning else { return false }
+        let now = Date()
+        if farEndHeard {
+            if systemSourceMode.isDevice {
+                let tap = systemDeviceCapture.lastSampleTime
+                return Self.legIsDelivering(lastSample: tap, hasDelivered: tap != nil, now: now)
+            }
+            return Self.legIsDelivering(
+                lastSample: systemCapture.lastSampleTime,
+                hasDelivered: systemCapture.firstSampleTime != nil,
+                now: now
+            )
+        }
+        let tap = micCapture.lastSampleTime
+        return Self.legIsDelivering(lastSample: tap, hasDelivered: tap != nil, now: now)
+    }
+
+    /// Pure freshness rule behind `judgedLegIsDelivering`: a real (tap-written)
+    /// buffer strictly less than `legDeliveryFreshness` seconds ago. `hasDelivered`
+    /// is the caller's proof that `lastSample` isn't a bring-up seed.
+    nonisolated static func legIsDelivering(lastSample: Date?, hasDelivered: Bool, now: Date) -> Bool {
+        guard hasDelivered, let lastSample else { return false }
+        return now.timeIntervalSince(lastSample) < legDeliveryFreshness
+    }
+
+    /// Input-device removal decision for the `audioDeviceRemoved` signal. Pure.
+    /// A refused enumeration is NO evidence (a HAL query that goes unanswered is
+    /// not a device that is absent): nothing removed, old snapshot kept. With no
+    /// previous snapshot the answer only seeds. Additions are arrivals, never a
+    /// departure.
+    nonisolated static func removedInputDeviceUIDs(
+        previous: Set<String>?,
+        current: HALQueryResult<Set<String>>
+    ) -> (removed: Set<String>, nextSnapshot: Set<String>?) {
+        guard case .answered(let present) = current else { return ([], previous) }
+        guard let previous else { return ([], present) }
+        return (previous.subtracting(present), present)
+    }
+
+    /// Project an enumeration onto its UID set, keeping `.unavailable` intact.
+    nonisolated static func inputDeviceUIDs(
+        _ enumeration: HALQueryResult<[(id: AudioDeviceID, uid: String, name: String)]>
+    ) -> HALQueryResult<Set<String>> {
+        switch enumeration {
+        case .answered(let devices): .answered(Set(devices.map(\.uid)))
+        case .unavailable: .unavailable
+        }
+    }
+
+    /// Seed the removal snapshot off the `start()` path: a generation-guarded
+    /// task on the HAL query lane, so session start gains no awaited HAL work.
+    /// A refused seed leaves the snapshot nil and the first removal check seeds
+    /// instead; a removal check that already seeded wins (never overwritten).
+    private func seedInputDeviceSnapshot() {
+        let generation = sessionGeneration
+        Task { [weak self] in
+            let enumerated = await MicCapture.availableInputDevicesResult()
+            guard let self, generation == self.sessionGeneration, self.isRunning,
+                  self.inputDeviceUIDSnapshot == nil else { return }
+            self.inputDeviceUIDSnapshot = Self.removedInputDeviceUIDs(
+                previous: nil,
+                current: Self.inputDeviceUIDs(enumerated)
+            ).nextSnapshot
+        }
+    }
+
+    /// Scheduled from the device-list listener next to the two re-adoption
+    /// checks, debounced the same 2s so an undock's enumeration storm collapses
+    /// into one diff. Read-only (query lane) and emit-only: it never rebinds.
+    /// Catches the physical dock mic disappearing behind a mixer's persistent
+    /// virtual devices, which the re-adoption paths can't see.
+    private func scheduleInputDeviceRemovalCheck() {
+        guard isRunning else { return }
+        deviceRemovalCheckTask?.cancel()
+        let generation = sessionGeneration
+        deviceRemovalCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self else { return }
+            guard generation == self.sessionGeneration else { return }
+            let enumerated = await MicCapture.availableInputDevicesResult()
+            // A superseding check will diff against the same snapshot — bail
+            // without touching it rather than race that check's update.
+            guard !Task.isCancelled, generation == self.sessionGeneration, self.isRunning else { return }
+            let diff = Self.removedInputDeviceUIDs(
+                previous: self.inputDeviceUIDSnapshot,
+                current: Self.inputDeviceUIDs(enumerated)
+            )
+            self.inputDeviceUIDSnapshot = diff.nextSnapshot
+            guard !diff.removed.isEmpty else { return }
+            diagLog("[AUTOSTOP] \(diff.removed.count) input device(s) disappeared")
+            self.emitDeparture(.audioDeviceRemoved)
+        }
+    }
+
+    // MARK: - Hang-up probe (shadow mode, log-only)
+
+    /// Poll interval for the hang-up probe (spec §8: every 5 s).
+    nonisolated static let inputReleasePollInterval: Duration = .seconds(5)
+
+    /// Wall-clock gap between answered polls beyond which continuity was not
+    /// observed (system sleep, or a run of unanswered polls): holds are reset
+    /// rather than risk reporting a release nobody watched happen.
+    nonisolated static let inputReleaseMaxPollGap: TimeInterval = 15
+
+    /// Spec §8 shadow mode: log when a process that held audio input for 60 s+
+    /// stops (a call app hanging up), so a week of real meetings can show
+    /// whether any app releases input on MUTE before this becomes a real
+    /// `DepartureSignal`. LOG-ONLY — it never calls `emitDeparture` and feeds
+    /// nothing else. Spawned, not awaited: `start()` gains no HAL work.
+    ///
+    /// The process query runs on the HAL `.query` lane (never the main actor,
+    /// never `.bind`). An unanswered poll is skipped outright — feeding an empty
+    /// set would read as every process hanging up at once.
+    private func startInputReleaseShadowProbe() {
+        inputReleaseShadowTask?.cancel()
+        let generation = sessionGeneration
+        let excluded = Set(MixerLeanInPrompt.mixPublishingMixerBundleIDs + [Bundle.main.bundleIdentifier ?? ""])
+            .filter { !$0.isEmpty }
+        inputReleaseShadowTask = Task { [weak self] in
+            var tracker = InputReleaseTracker(excluding: excluded)
+            var loggedHolds: Set<String> = []
+            var lastAnsweredPoll: Date?
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.inputReleasePollInterval)
+                guard !Task.isCancelled else { return }
+                guard let self, generation == self.sessionGeneration, self.isRunning else { return }
+                let result = await HALQueue.query(label: "input-running-processes") {
+                    AudioProcessInspector.inputRunningBundleIDs()
+                }
+                guard !Task.isCancelled, generation == self.sessionGeneration, self.isRunning else { return }
+                // Unanswered (timed out / lane wedged) or a failed process-list
+                // read: no evidence either way. Skip without touching the
+                // tracker; a long enough run of these trips the gap reset below.
+                guard case .answered(let snapshot) = result, let running = snapshot else { continue }
+                let now = Date()
+                defer { lastAnsweredPoll = now }
+                if let last = lastAnsweredPoll, now.timeIntervalSince(last) > Self.inputReleaseMaxPollGap {
+                    tracker.reset()
+                    diagLog("[AUTOSTOP-SHADOW] poll gap \(Int(now.timeIntervalSince(last)))s — holds reset")
+                    continue
+                }
+                let observation = tracker.observe(running: running, now: now)
+                for bundleID in observation.newlyHeld where loggedHolds.insert(bundleID).inserted {
+                    diagLog("[AUTOSTOP-SHADOW] input held by \(bundleID)")
+                }
+                for release in observation.releases {
+                    diagLog("[AUTOSTOP-SHADOW] input released by \(release.bundleID) after \(release.heldSeconds)s")
+                }
+            }
+        }
+    }
+
     // MARK: - Device-list listener (call-audio source re-adoption)
 
     private static var deviceListAddress = AudioObjectPropertyAddress(
@@ -1936,8 +2218,9 @@ final class TranscriptionEngine {
         mElement: kAudioObjectPropertyElementMain
     )
 
-    /// Installed per session, only when a call-audio source is configured (the
-    /// default "" source never needs re-adoption). Registering a listener is a
+    /// Installed for every session (the failsafe's `audioDeviceRemoved` check
+    /// needs it even with nothing pinned); each re-adoption scheduler no-ops at
+    /// its own guard when its selection is empty. Registering a listener is a
     /// non-blocking CoreAudio call — same pattern as the default-device
     /// listener and the Settings picker's `InputDeviceList`.
     private func installDeviceListListener() {
@@ -1947,6 +2230,7 @@ final class TranscriptionEngine {
             Task { @MainActor in
                 self.scheduleMicSourceReadoption()
                 self.scheduleDeviceSourceReadoption()
+                self.scheduleInputDeviceRemovalCheck()
             }
         }
         deviceListListenerBlock = block
@@ -2069,11 +2353,17 @@ final class TranscriptionEngine {
         sessionGeneration += 1
         lastError = nil
         removeDefaultDeviceListener()
+        removeDefaultOutputListener()
         removeDeviceListListener()
         deviceReadoptionTask?.cancel()
         deviceReadoptionTask = nil
         micReadoptionTask?.cancel()
         micReadoptionTask = nil
+        deviceRemovalCheckTask?.cancel()
+        deviceRemovalCheckTask = nil
+        inputReleaseShadowTask?.cancel()
+        inputReleaseShadowTask = nil
+        inputDeviceUIDSnapshot = nil
         startupGateTask?.cancel()
         startupGateTask = nil
         sysStartupGateTask?.cancel()
