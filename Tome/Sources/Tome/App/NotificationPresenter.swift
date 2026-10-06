@@ -47,29 +47,65 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     var autoStopKeepAction: (() -> Void)?
     var autoStopStopNowAction: (() -> Void)?
 
+    // MARK: - "Record this meeting?" prompt
+
+    /// Category + action identifiers for the meeting-join prompt (spec
+    /// `2026-10-06-record-this-meeting-prompt.md` §3). Registered in `init`
+    /// alongside the silence and auto-stop categories
+    /// (`setNotificationCategories` replaces the whole set, so all must go in
+    /// one call).
+    nonisolated static let meetingJoinCategoryID = "TOME_MEETING_JOIN_PROMPT"
+    nonisolated static let meetingJoinRecordActionID = "TOME_MEETING_JOIN_RECORD"
+    nonisolated static let meetingJoinDeclineActionID = "TOME_MEETING_JOIN_DECLINE"
+    /// Fixed request identifier: a re-post replaces, and the prompt can be
+    /// withdrawn by id when answered on the panel or the call ends.
+    private nonisolated static let meetingJoinPromptRequestID = "tome-meeting-join-prompt"
+
+    /// Registered by `ContentView` — same wiring as the silence actions.
+    /// Invoked on the main actor when the user answers the join prompt from
+    /// the notification. The Record closure must check the prompt is still
+    /// alive (a stale notification for an ended call only activates Tome).
+    var meetingJoinRecordAction: (() -> Void)?
+    var meetingJoinDeclineAction: (() -> Void)?
+
     override private init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
 
-        let stop = UNNotificationAction(identifier: Self.silenceStopActionID, title: "Stop Recording", options: [])
-        let keep = UNNotificationAction(identifier: Self.silenceKeepActionID, title: "Keep Recording", options: [])
-        let autoKeep = UNNotificationAction(identifier: Self.autoStopKeepActionID, title: "Keep Recording", options: [])
-        let autoStopNow = UNNotificationAction(identifier: Self.autoStopStopNowActionID, title: "Stop Now", options: [])
         // One call: setNotificationCategories REPLACES the registered set.
-        UNUserNotificationCenter.current().setNotificationCategories([
+        UNUserNotificationCenter.current().setNotificationCategories(Self.notificationCategories())
+    }
+
+    /// Every actionable category Tome registers. Built in one place because
+    /// `setNotificationCategories` REPLACES the registered set — a category
+    /// registered by a second call would silently drop the others.
+    nonisolated static func notificationCategories() -> Set<UNNotificationCategory> {
+        let stop = UNNotificationAction(identifier: silenceStopActionID, title: "Stop Recording", options: [])
+        let keep = UNNotificationAction(identifier: silenceKeepActionID, title: "Keep Recording", options: [])
+        let autoKeep = UNNotificationAction(identifier: autoStopKeepActionID, title: "Keep Recording", options: [])
+        let autoStopNow = UNNotificationAction(identifier: autoStopStopNowActionID, title: "Stop Now", options: [])
+        let joinRecord = UNNotificationAction(identifier: meetingJoinRecordActionID, title: "Record", options: [])
+        let joinDecline = UNNotificationAction(identifier: meetingJoinDeclineActionID, title: "Not This Meeting", options: [])
+        return [
             UNNotificationCategory(
-                identifier: Self.silenceCategoryID,
+                identifier: silenceCategoryID,
                 actions: [stop, keep],
                 intentIdentifiers: [],
                 options: []
             ),
             UNNotificationCategory(
-                identifier: Self.autoStopCategoryID,
+                identifier: autoStopCategoryID,
                 actions: [autoKeep, autoStopNow],
                 intentIdentifiers: [],
                 options: []
             ),
-        ])
+            UNNotificationCategory(
+                identifier: meetingJoinCategoryID,
+                actions: [joinRecord, joinDecline],
+                intentIdentifiers: [],
+                options: []
+            ),
+        ]
     }
 
     /// Ask for permission lazily — only when we actually have a notification to post.
@@ -188,6 +224,37 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             trigger: nil
         )
         try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// A meeting-titled conferencing window plus sustained far-end audio
+    /// output while Tome is idle: ask whether to record. Silent on purpose —
+    /// this fires during a live meeting, into a live mic. Mirrors the floating
+    /// `MeetingJoinPanelController`; this notification never starts anything
+    /// by itself.
+    func postMeetingJoinPrompt(appName: String, meetingTitle: String) async {
+        await requestAuthorizationIfNeeded()
+        guard authorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = MeetingJoinPanelController.title
+        content.body = MeetingJoinPanelController.bodyLine(appName: appName, meetingTitle: meetingTitle)
+        content.sound = nil
+        content.categoryIdentifier = Self.meetingJoinCategoryID
+
+        let request = UNNotificationRequest(
+            identifier: Self.meetingJoinPromptRequestID,
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Withdraw the join prompt — answered on the panel, declined, timed out,
+    /// a recording started, or the call ended. Safe when nothing is posted.
+    func clearMeetingJoinPrompt() {
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [Self.meetingJoinPromptRequestID])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.meetingJoinPromptRequestID])
     }
 
     // MARK: - Capture stall
@@ -438,6 +505,24 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
                 default:
                     // Banner body clicked — bring Tome forward; the in-app
                     // row and floating panel carry the same choice.
+                    NSApp.activate()
+                }
+            }
+            completionHandler()
+            return
+        }
+
+        if content.categoryIdentifier == Self.meetingJoinCategoryID {
+            let action = response.actionIdentifier
+            Task { @MainActor in
+                switch action {
+                case Self.meetingJoinRecordActionID:
+                    self.meetingJoinRecordAction?()
+                case Self.meetingJoinDeclineActionID:
+                    self.meetingJoinDeclineAction?()
+                default:
+                    // Banner body clicked — bring Tome forward; the chip and
+                    // Record button carry the same choice in-app.
                     NSApp.activate()
                 }
             }
