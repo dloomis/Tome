@@ -60,6 +60,29 @@ enum AudioProcessInspector {
         return found
     }
 
+    /// Bundle IDs of processes currently running audio OUTPUT (input not
+    /// considered); processes reporting no or an empty bundle ID are skipped.
+    /// Blocking HAL reads — call only on the `HALQueue` `.query` lane, never
+    /// the main actor. Feeds the "Record this meeting?" prompt's in-call
+    /// evidence (spec `2026-10-06-record-this-meeting-prompt.md` §1): a
+    /// meeting-titled window plus sustained far-end output is a joined call.
+    ///
+    /// Returns nil when the process-object list itself can't be read — the
+    /// same contract as `inputRunningBundleIDs`. The caller reads nil as
+    /// "unknown", never "absent": a failed read is not evidence either way.
+    static func outputRunningBundleIDs() -> Set<String>? {
+        guard let processObjects = processObjectList() else { return nil }
+        var found: Set<String> = []
+        for object in processObjects {
+            guard scalarProperty(of: object, selector: kAudioProcessPropertyIsRunningOutput) == 1,
+                  let bundleID = stringProperty(of: object, selector: kAudioProcessPropertyBundleID),
+                  !bundleID.isEmpty
+            else { continue }
+            found.insert(bundleID)
+        }
+        return found
+    }
+
     /// `kAudioHardwarePropertyProcessObjectList`, or nil when the read fails
     /// (as opposed to `arrayProperty`, which returns [] for both).
     private static func processObjectList() -> [AudioObjectID]? {

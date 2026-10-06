@@ -136,6 +136,10 @@ struct ContentView: View {
     @State private var autoStopLine: String?
     @State private var autoStopRemainingSeconds = 0
     @State private var autoStopPanel = AutoStopPanelController()
+    /// "Record this meeting?" prompt (spec 2026-10-06-record-this-meeting-prompt).
+    /// Stepped from the meeting-detection loop; only ever asks, never starts.
+    @State private var joinPolicy = MeetingJoinPolicy()
+    @State private var meetingJoinPanel = MeetingJoinPanelController()
     @State private var departureMonitor = DepartureMonitor()
     /// Confirmation gate for the main Stop button. `onConfirm` is wired to
     /// `stopSession()` in the boot task; the silence prompt, notification
@@ -449,6 +453,11 @@ struct ContentView: View {
             // stale notification (countdown cancelled, session ended) can't act.
             NotificationPresenter.shared.autoStopKeepAction = { autoStopKeepRecording() }
             NotificationPresenter.shared.autoStopStopNowAction = { autoStopStopNow() }
+            // "Record this meeting?" notification — the same two functions as
+            // the floating panel. Record re-checks that the prompt is still
+            // alive, so a notification that outlived its call only opens Tome.
+            NotificationPresenter.shared.meetingJoinRecordAction = { acceptJoinPrompt() }
+            NotificationPresenter.shared.meetingJoinDeclineAction = { declineJoinPrompt(.button) }
 
             // Returning users: onboarding never shows, so we surface the orphan
             // prompt at the end of boot. First-launch users hit the onChange
@@ -537,20 +546,15 @@ struct ContentView: View {
                 }
             }
         }
-        // Active-meeting detection (pre-start naming). Passive window-title scan via
-        // SCShareableContent — uses the screen-recording permission Tome already holds
-        // and never prompts (see MeetingDetector.scan). Idle-only; the chip is gated
-        // on `suggestedMeeting`, which requires `!isRunning`.
+        // Active-meeting detection (pre-start naming) + the "Record this
+        // meeting?" prompt. Passive window-title scan via SCShareableContent —
+        // uses the screen-recording permission Tome already holds and never
+        // prompts (see MeetingDetector.scan). The scan is idle-only (the chip is
+        // gated on `suggestedMeeting`, which requires `!isRunning`); the loop
+        // ticks regardless so the join policy sees recording and the stop edge.
         .task {
             while !Task.isCancelled {
-                if !isRunning {
-                    let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-                    let result = await MeetingDetector.scan(frontmostBundleID: front)
-                    if result != detectedMeeting {
-                        detectedMeeting = result
-                        if let result { diagLog("[DETECT] \(result.appName) meeting detected") }
-                    }
-                }
+                await meetingDetectionTick()
                 try? await Task.sleep(for: .seconds(3))
             }
         }
@@ -1445,6 +1449,122 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - "Record this meeting?" prompt (spec 2026-10-06-record-this-meeting-prompt §4)
+
+    /// Recording, or a start/stop in flight. `isRunning` covers the engine
+    /// being up without an owning session — the old scan gate, kept so the
+    /// chip scan never runs while the engine is live.
+    private var joinPromptSeesRecording: Bool {
+        isLiveRecordingSession || services.isSessionPending || isRunning
+    }
+
+    /// One 3 s poll: the chip scan (idle only) and one `MeetingJoinPolicy` step.
+    private func meetingDetectionTick() async {
+        guard !joinPromptSeesRecording else {
+            actOnJoinPolicy(joinPolicy.step(.init(meeting: nil, callAudio: .absent, isRecording: true, now: .now)),
+                            recording: true)
+            return
+        }
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let result = await MeetingDetector.scan(frontmostBundleID: front)
+        if result != detectedMeeting {
+            detectedMeeting = result
+            if let result { diagLog("[DETECT] \(result.appName) meeting detected") }
+        }
+        var callAudio = CallAudioEvidence.absent
+        if let result, conferencingApps[result.bundleID]?.promptsToRecord == true {
+            // Blocking HAL read — `.query` lane only, never the main actor.
+            let processes = await HALQueue.query(label: "output-running-processes") {
+                AudioProcessInspector.outputRunningBundleIDs()
+            }
+            callAudio = MeetingJoinPolicy.callAudioEvidence(for: result.bundleID, from: processes)
+        }
+        // Re-read after the awaits: a Record press (or API start) that landed
+        // mid-scan must be stepped as recording, never prompted over.
+        let recording = joinPromptSeesRecording
+        let observation = MeetingJoinPolicy.Observation(
+            meeting: recording ? nil : result,
+            callAudio: recording ? .absent : callAudio,
+            isRecording: recording,
+            now: .now
+        )
+        actOnJoinPolicy(joinPolicy.step(observation), recording: recording)
+    }
+
+    private func actOnJoinPolicy(_ action: MeetingJoinPolicy.Action, recording: Bool) {
+        switch action {
+        case .none:
+            return
+        case .withdraw:
+            withdrawJoinPrompt(reason: recording ? "recording" : "call-ended")
+        case .prompt(let meeting):
+            guard settings.promptToRecordDetectedMeetings,
+                  services.modelProvisioner.canStartRecording else {
+                // Settle the instance so flipping the toggle later doesn't
+                // prompt for a meeting half an hour in.
+                joinPolicy.userDeclined()
+                diagLog(JoinPromptLog.declined(.disabled))
+                return
+            }
+            meetingJoinPanel.show(
+                appName: meeting.appName,
+                meetingTitle: meeting.title,
+                hiddenFromSharing: settings.hideFromScreenShare,
+                onRecord: { acceptJoinPrompt() },
+                onDecline: { declineJoinPrompt(.button) },
+                // Timeout hides the panel only. The notification stays and the
+                // policy stays `prompted`, so Record from Notification Center
+                // still works until the call ends (instance expiry withdraws
+                // it) or a recording starts.
+                onTimeout: {
+                    meetingJoinPanel.hide()
+                    diagLog(JoinPromptLog.panelTimedOut)
+                }
+            )
+            Task {
+                await NotificationPresenter.shared.postMeetingJoinPrompt(
+                    appName: meeting.appName, meetingTitle: meeting.title)
+            }
+            diagLog(JoinPromptLog.prompted(appName: meeting.appName))
+        }
+    }
+
+    /// Panel + notification. Policy state untouched.
+    private func withdrawJoinPrompt(reason: String) {
+        meetingJoinPanel.hide()
+        NotificationPresenter.shared.clearMeetingJoinPrompt()
+        diagLog(JoinPromptLog.withdrawn(reason: reason))
+    }
+
+    /// Record, from the panel or the notification — exactly a Record-button
+    /// press. A stale notification (call ended, already answered) or a state
+    /// the Record button would be disabled in only brings Tome forward.
+    private func acceptJoinPrompt() {
+        guard joinPolicy.isPromptAlive,
+              services.modelProvisioner.canStartRecording,
+              !joinPromptSeesRecording, activeSessionType == nil else {
+            NSApp.activate()
+            return
+        }
+        joinPolicy.userAccepted()
+        withdrawJoinPrompt(reason: "accepted")
+        diagLog(JoinPromptLog.accepted)
+        startSession(mode: .auto, detectedMeeting: suggestedMeeting)
+    }
+
+    /// Not This Meeting / ✕. A stale notification's decline
+    /// (prompt no longer alive) just clears the surfaces without a log line.
+    private func declineJoinPrompt(_ reason: JoinPromptLog.DeclineReason) {
+        guard joinPolicy.isPromptAlive else {
+            meetingJoinPanel.hide()
+            NotificationPresenter.shared.clearMeetingJoinPrompt()
+            return
+        }
+        joinPolicy.userDeclined()
+        withdrawJoinPrompt(reason: reason.rawValue)
+        diagLog(JoinPromptLog.declined(reason))
+    }
+
     /// Start a session. Explicit modes (`.callCapture` / `.voiceMemo`) map
     /// straight onto the two historical code paths. `.auto` (single Record
     /// button, API start with no `type`) runs the call-capture path — both legs,
@@ -1463,6 +1583,10 @@ struct ContentView: View {
         // until the engine flips live. Cleared on EVERY exit of the Task below
         // (success, rollback, early return). Audit F-2.
         services.isSessionPending = true
+        // Any start path (API/WhisperCal included): no "Record this meeting?"
+        // over a live recording; the join policy reconciles on its next tick.
+        meetingJoinPanel.hide()
+        NotificationPresenter.shared.clearMeetingJoinPrompt()
         transcriptStore.clear()
         persistedUtteranceCount = 0  // new session — rewind the persistence cursor
         silenceSeconds = 0

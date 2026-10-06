@@ -229,6 +229,14 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(useDetectedMeetingNames, forKey: "useDetectedMeetingNames") }
     }
 
+    /// When true (default), a meeting-titled conferencing window plus sustained
+    /// far-end audio output while Tome is idle raises a "Record this meeting?"
+    /// prompt (floating panel + notification). The prompt never starts a
+    /// recording on its own. Spec `2026-10-06-record-this-meeting-prompt.md` §5.
+    var promptToRecordDetectedMeetings: Bool {
+        didSet { UserDefaults.standard.set(promptToRecordDetectedMeetings, forKey: "promptToRecordDetectedMeetings") }
+    }
+
     /// When true, all app windows are invisible to screen sharing / recording.
     var hideFromScreenShare: Bool {
         didSet {
@@ -315,6 +323,9 @@ final class AppSettings {
         self.useDetectedMeetingNames = defaults.object(forKey: "useDetectedMeetingNames") == nil
             ? true
             : defaults.bool(forKey: "useDetectedMeetingNames")
+        self.promptToRecordDetectedMeetings = defaults.object(forKey: "promptToRecordDetectedMeetings") == nil
+            ? true
+            : defaults.bool(forKey: "promptToRecordDetectedMeetings")
         self.hideFromScreenShare = defaults.object(forKey: "hideFromScreenShare") == nil
             ? true
             : defaults.bool(forKey: "hideFromScreenShare")

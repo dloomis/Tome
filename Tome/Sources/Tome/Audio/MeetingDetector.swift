@@ -18,22 +18,26 @@ enum ConferencingFamily: Sendable { case teams, zoom, meetBrowser, webex, faceti
 struct ConferencingApp: Sendable {
     let displayName: String
     let family: ConferencingFamily
+    /// Eligible for the idle "Record this meeting?" prompt. Enable a family only after
+    /// its in-call audio signature is checked on a real call — see §7 of
+    /// docs/superpowers/specs/2026-10-06-record-this-meeting-prompt.md.
+    let promptsToRecord: Bool
 }
 
 /// Canonical conferencing-app table — the single source of truth for "is this a call
 /// app", shared by `MeetingDetector` and `ContentView.startSession`'s source-app lookup.
 let conferencingApps: [String: ConferencingApp] = [
-    "com.microsoft.teams2": ConferencingApp(displayName: "Teams", family: .teams),
-    "com.microsoft.teams": ConferencingApp(displayName: "Teams", family: .teams),
-    "us.zoom.xos": ConferencingApp(displayName: "Zoom", family: .zoom),
-    "com.apple.FaceTime": ConferencingApp(displayName: "FaceTime", family: .facetime),
-    "com.tinyspeck.slackmacgap": ConferencingApp(displayName: "Slack", family: .slack),
-    "com.cisco.webexmeetingsapp": ConferencingApp(displayName: "Webex", family: .webex),
-    "Cisco-Systems.Spark": ConferencingApp(displayName: "Webex", family: .webex),
-    "com.google.Chrome": ConferencingApp(displayName: "Chrome", family: .meetBrowser),
-    "company.thebrowser.Browser": ConferencingApp(displayName: "Arc", family: .meetBrowser),
-    "com.apple.Safari": ConferencingApp(displayName: "Safari", family: .meetBrowser),
-    "com.microsoft.edgemac": ConferencingApp(displayName: "Edge", family: .meetBrowser),
+    "com.microsoft.teams2": ConferencingApp(displayName: "Teams", family: .teams, promptsToRecord: true),
+    "com.microsoft.teams": ConferencingApp(displayName: "Teams", family: .teams, promptsToRecord: true),
+    "us.zoom.xos": ConferencingApp(displayName: "Zoom", family: .zoom, promptsToRecord: false),
+    "com.apple.FaceTime": ConferencingApp(displayName: "FaceTime", family: .facetime, promptsToRecord: false),
+    "com.tinyspeck.slackmacgap": ConferencingApp(displayName: "Slack", family: .slack, promptsToRecord: false),
+    "com.cisco.webexmeetingsapp": ConferencingApp(displayName: "Webex", family: .webex, promptsToRecord: false),
+    "Cisco-Systems.Spark": ConferencingApp(displayName: "Webex", family: .webex, promptsToRecord: false),
+    "com.google.Chrome": ConferencingApp(displayName: "Chrome", family: .meetBrowser, promptsToRecord: false),
+    "company.thebrowser.Browser": ConferencingApp(displayName: "Arc", family: .meetBrowser, promptsToRecord: false),
+    "com.apple.Safari": ConferencingApp(displayName: "Safari", family: .meetBrowser, promptsToRecord: false),
+    "com.microsoft.edgemac": ConferencingApp(displayName: "Edge", family: .meetBrowser, promptsToRecord: false),
 ]
 
 /// Friendly name for a conferencing bundle ID (e.g. "Teams"), or nil if not a call app.
