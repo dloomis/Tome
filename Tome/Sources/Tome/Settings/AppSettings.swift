@@ -192,6 +192,17 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(silenceAutoStopSeconds, forKey: "silenceAutoStopSeconds") }
     }
 
+    /// Forgotten-recording failsafe (default on). When true, a session that has
+    /// gone quiet is stopped and saved without confirmation in three cases: a
+    /// departure signal (undock, lock, route change) followed by a 30s
+    /// countdown, a sleep of more than 3 minutes (ended at wake), or a silence
+    /// prompt left unanswered for 10 minutes. Audible call audio is never
+    /// stopped. False → the policy is inert and silence only ever asks.
+    /// Spec: `docs/superpowers/specs/2026-10-06-forgotten-recording-failsafe.md`.
+    var autoStopWhenAway: Bool {
+        didSet { UserDefaults.standard.set(autoStopWhenAway, forKey: "autoStopWhenAway") }
+    }
+
     // MARK: - Filename Template
 
     /// `DateFormatter` pattern used as the date prefix on transcript filenames.
@@ -295,6 +306,9 @@ final class AppSettings {
         self.silenceAutoStopSeconds = defaults.object(forKey: "silenceAutoStopSeconds") == nil
             ? 120
             : defaults.integer(forKey: "silenceAutoStopSeconds")
+        self.autoStopWhenAway = defaults.object(forKey: "autoStopWhenAway") == nil
+            ? true
+            : defaults.bool(forKey: "autoStopWhenAway")
         self.filenameDateFormat = defaults.string(forKey: "filenameDateFormat") ?? "yyyy-MM-dd HH-mm-ss"
         self.filenameCallLabel = defaults.string(forKey: "filenameCallLabel") ?? "Call Recording"
         self.filenameVoiceLabel = defaults.string(forKey: "filenameVoiceLabel") ?? "Voice Memo"

@@ -36,6 +36,49 @@ enum AudioProcessInspector {
         return found.sorted()
     }
 
+    /// Bundle IDs of processes currently running audio INPUT (output not
+    /// considered); processes reporting no or an empty bundle ID are skipped.
+    /// Blocking HAL reads — call only on the `HALQueue` `.query` lane. Feeds the
+    /// forgotten-recording failsafe's log-only hang-up probe
+    /// (`InputReleaseTracker`, spec 2026-10-06 §8); exclusions are the tracker's
+    /// job, so this returns everything it sees.
+    ///
+    /// Returns nil when the process-object list itself can't be read — unlike
+    /// `micPassthroughBundleIDs`, which folds that into "none". The tracker
+    /// reads absence as a release, so a failed read reported as an empty set
+    /// would look like every process hanging up at once.
+    static func inputRunningBundleIDs() -> Set<String>? {
+        guard let processObjects = processObjectList() else { return nil }
+        var found: Set<String> = []
+        for object in processObjects {
+            guard scalarProperty(of: object, selector: kAudioProcessPropertyIsRunningInput) == 1,
+                  let bundleID = stringProperty(of: object, selector: kAudioProcessPropertyBundleID),
+                  !bundleID.isEmpty
+            else { continue }
+            found.insert(bundleID)
+        }
+        return found
+    }
+
+    /// `kAudioHardwarePropertyProcessObjectList`, or nil when the read fails
+    /// (as opposed to `arrayProperty`, which returns [] for both).
+    private static func processObjectList() -> [AudioObjectID]? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size) == noErr else { return nil }
+        let count = Int(size) / MemoryLayout<AudioObjectID>.stride
+        guard count > 0 else { return [] }
+        var result = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &result) == noErr else { return nil }
+        // The list can shrink between the two calls; trust the returned size.
+        return Array(result.prefix(Int(size) / MemoryLayout<AudioObjectID>.stride))
+    }
+
     private static func arrayProperty<T>(
         of objectID: AudioObjectID,
         selector: AudioObjectPropertySelector,

@@ -69,6 +69,15 @@ struct ControlBar: View {
     let onKeepRecording: () -> Void
     let onDismissMeeting: () -> Void
 
+    // Forgotten-recording failsafe countdown (spec 2026-10-06 §6). `var` with
+    // defaults so existing call sites compile unchanged — a `let` with a
+    // default would drop out of the memberwise init. Non-nil `autoStopLine`
+    // (while recording) replaces the silence prompt and its pre-warning.
+    var autoStopLine: String? = nil
+    var autoStopRemainingSeconds: Int = 0
+    var onAutoStopKeep: () -> Void = {}
+    var onAutoStopStopNow: () -> Void = {}
+
     var body: some View {
         VStack(spacing: 0) {
             if let error = errorMessage {
@@ -154,7 +163,9 @@ struct ControlBar: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
 
-                if silencePromptActive {
+                if let autoStopLine {
+                    autoStopCountdownRow(autoStopLine)
+                } else if silencePromptActive {
                     silenceStopPrompt
                 } else if silenceAutoStopSeconds > 0,
                           silenceSeconds >= max(silenceAutoStopSeconds - 30, 1) {
@@ -291,6 +302,51 @@ struct ControlBar: View {
                 .buttonStyle(.plain)
 
                 Button(action: onKeepRecording) {
+                    Text("Keep Recording")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.fg1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.bg1.opacity(0.7))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+    }
+
+    /// The failsafe is counting down to a stop. Same slot and look as
+    /// `silenceStopPrompt`; "Stop Now" is already a confirmation (no
+    /// StopConfirmationModel), "Keep Recording" cancels the countdown.
+    private func autoStopCountdownRow(_ line: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "timer")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.orange)
+                Text("\(line) — stopping in \(AutoStopPanelController.formatCountdown(autoStopRemainingSeconds))")
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                Button(action: onAutoStopStopNow) {
+                    Text("Stop Now")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.fg1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.recordRed.opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.recordRed.opacity(0.3)))
+                }
+                .buttonStyle(.plain)
+
+                Button(action: onAutoStopKeep) {
                     Text("Keep Recording")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Color.fg1)

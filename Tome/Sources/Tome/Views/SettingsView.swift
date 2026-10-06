@@ -267,7 +267,12 @@ private struct AudioTab: View {
                     get: { Double(settings.silenceAutoStopSeconds) },
                     set: { settings.silenceAutoStopSeconds = Int($0) }
                 ), in: 0...600, step: 30)
-                Text("Ask to stop recording after this many seconds of silence. Once the other side of a call has been heard, only call audio counts — your mic alone won't keep the recording going. Recording never stops without your confirmation. 0 disables the prompt. Default: 120s")
+                Text("Ask to stop recording after this many seconds of silence. Once the other side of a call has been heard, only call audio counts — your mic alone won't keep the recording going. With the option below off, recording never stops without your confirmation. 0 disables the prompt. Default: 120s")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Toggle("Stop automatically when I've left", isOn: $settings.autoStopWhenAway)
+                    .font(.system(size: 12))
+                Text("For recordings you forgot to stop. If your Mac undocks, locks, or its audio devices change while the call has gone quiet, Tome counts down 30 seconds, then stops and saves. A recording that sleeps for more than 3 minutes is ended and saved when the Mac wakes. A silence prompt left unanswered for 10 minutes is ended and saved too. A call with audible call audio is never stopped.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
