@@ -84,13 +84,40 @@ outranks all context in the finalizer.
   stays hidden. Cleared when a session ends.
 - During recording the Stop subtitle shows `Call Capture · <name>` so the chosen name
   is visible throughout the session.
-- Global off-switch: **Settings ▸ Output ▸ Filename Template ▸ "Auto-name from detected
+- Global off-switch: **Settings ▸ Output ▸ Meeting Detection ▸ "Auto-name from detected
   meetings"** (`AppSettings.useDetectedMeetingNames`, default on).
+
+## "Record this meeting?" prompt
+
+The same scan also drives a proactive prompt (spec:
+`superpowers/specs/2026-10-06-record-this-meeting-prompt.md`). The chip only helps a
+user who is looking at Tome; the prompt reaches one who is looking at the meeting.
+
+- **Evidence** is two-signal: a detected meeting for an app whose `ConferencingApp`
+  entry has `promptsToRecord` (Teams only in v1) **and** that app running audio
+  *output* (`AudioProcessInspector.outputRunningBundleIDs`, HAL query lane). Both must
+  hold for 10 s. Output, not input: muted joins are common and a live call always has
+  far-end audio, while the pre-join lobby has none. An unanswered HAL query is
+  `.unknown` — it neither advances nor resets the sustain.
+- **`MeetingJoinPolicy`** (`Models/`) is a pure reducer stepped once per 3 s tick, idle
+  or not: one instance per call keyed by bundle ID; it prompts once; accept, decline, or
+  a recording settle it; stopping a recording mid-call suppresses a new instance for
+  30 s; 60 s without evidence ends the instance.
+- **Surfaces**: a silent non-activating floating panel (`MeetingJoinPanelController`,
+  on the shared `FloatingPromptPanel`; never key, follows hide-from-screen-share) and an
+  actionable notification (`TOME_MEETING_JOIN_PROMPT`). **Record** is the Record
+  button's exact call (`startSession(mode: .auto, detectedMeeting: suggestedMeeting)` —
+  so the chip's ✕ and the auto-name switch still govern the filename). The panel hides
+  after 60 s; the notification stays actionable until the call ends.
+- Off-switch: **Settings ▸ Output ▸ Meeting Detection ▸ "Ask to record when a call is
+  live"** (`AppSettings.promptToRecordDetectedMeetings`, default on). Nothing here
+  ever starts a recording by itself.
 
 ## Limitations
 
 - Heuristic, English-marker, active-tab-only (browsers); the ✕ is the safety net.
-- Zoom and non-Teams/Meet apps yield no name in v1.
+- Zoom and non-Teams/Meet apps yield no name in v1; the record prompt is Teams-only
+  until each app's in-call audio signature is checked on a real call (`promptsToRecord`).
 - Detection requires Screen Recording permission (already used for audio).
 - Meeting titles are **never** logged (logging policy is metadata-only).
 
