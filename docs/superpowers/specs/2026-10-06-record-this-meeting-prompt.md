@@ -1,7 +1,7 @@
 # "Record this meeting?" — Prompt When a Call Is Live and Tome Is Idle
 
 **Date:** 2026-10-06
-**Status:** Draft
+**Status:** Implemented 2026-10-06; manual acceptance owed
 **Type:** Feature (capture UX / meeting detection)
 **Prereq reading:** `MeetingDetector.swift` (window-title detection, the chip),
 `2026-10-06-forgotten-recording-failsafe.md` §6 + §8 (the floating panel, and
@@ -164,7 +164,10 @@ this one would beep into someone's sentence.)
   in a shared screen is visible to the people being recorded. Copy:
   "Record this meeting?" / "*Weekly sync* in Teams is live and Tome isn't
   recording." / **Record** · **Not This Meeting**. Auto-hides **60 s** after
-  show (→ `userDeclined`); the notification remains the durable path.
+  show — **the panel only**: the policy stays `prompted` and the notification
+  stays posted, so Record from Notification Center still works for someone
+  who stepped away; the instance's own expiry (call ended) or a recording
+  start withdraws it.
   Factor the NSPanel setup (`AutoStopPanel` subclass, `FirstMouseHostingView`,
   `position(_:)`) into a shared `FloatingPromptPanel.swift` used by both
   controllers. `AutoStopPanelController` behavior must not change
@@ -216,7 +219,8 @@ every 3 s:
   honors `useDetectedMeetingNames` and the chip's ✕. `.auto` so the stop-time
   resolver still decides the type (rule 2 fires on `hadMeetingEvidence`;
   rule 3 usually too, since the non-activating panel leaves Teams frontmost).
-- **Not This Meeting / ✕ / timeout** — `policy.userDeclined()`, withdraw.
+- **Not This Meeting / ✕** — `policy.userDeclined()`, withdraw both.
+- **Panel timeout** — hide the panel, log; no policy call, notification kept.
 
 Reset sites: `stopSession()` and the API-stop path need no policy call — step
 2 sees the edge on the next tick. On app termination nothing is persisted.
@@ -236,7 +240,7 @@ new **Meeting Detection** section and add below it:
 ### 6. Logging
 
 `[JOIN-PROMPT] prompted — Teams` / `withdrawn (<reason>)` / `accepted` /
-`declined (<button|timeout|disabled>)`. App name only — the meeting title is a
+`declined (<button|disabled>)` / `panel timed out — notification remains`. App name only — the meeting title is a
 subject line, and `[DETECT]` already keeps titles out of the log store.
 
 ### 7. Table-driven scope
@@ -386,7 +390,8 @@ categories, or add) — the join category is registered with both actions.
   this adds one cheap process-list read per poll, only when a Teams window is
   already found.
 - **Panel timeout vs. a user who was away from the keyboard** — after 60 s
-  the panel is gone and only the notification remains; if Focus swallowed it,
+  the panel is gone and only the notification remains (still actionable until
+  the call ends); if Focus swallowed it,
   the call goes unrecorded. Same bound the auto-stop panel accepts; the
   alternative is a panel that sits over the meeting indefinitely.
 

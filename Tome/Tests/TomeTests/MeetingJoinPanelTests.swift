@@ -62,7 +62,7 @@ import UserNotifications
         #expect(JoinPromptLog.withdrawn(reason: "recording") == "[JOIN-PROMPT] withdrawn (recording)")
         #expect(JoinPromptLog.accepted == "[JOIN-PROMPT] accepted")
         #expect(JoinPromptLog.declined(.button) == "[JOIN-PROMPT] declined (button)")
-        #expect(JoinPromptLog.declined(.timeout) == "[JOIN-PROMPT] declined (timeout)")
+        #expect(JoinPromptLog.panelTimedOut == "[JOIN-PROMPT] panel timed out — notification remains")
         #expect(JoinPromptLog.declined(.disabled) == "[JOIN-PROMPT] declined (disabled)")
     }
 }

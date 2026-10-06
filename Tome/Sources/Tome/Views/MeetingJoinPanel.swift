@@ -187,7 +187,7 @@ private struct MeetingJoinPanelView: View {
 /// subject line and stays out of the log store, like `[DETECT]`.
 enum JoinPromptLog {
     enum DeclineReason: String, Sendable {
-        case button, timeout, disabled
+        case button, disabled
     }
 
     static func prompted(appName: String) -> String {
@@ -199,6 +199,10 @@ enum JoinPromptLog {
     }
 
     static let accepted = "[JOIN-PROMPT] accepted"
+
+    /// The panel timed out unanswered. Not a decline: the notification stays
+    /// up and the policy stays `prompted` until the call ends (spec §3).
+    static let panelTimedOut = "[JOIN-PROMPT] panel timed out — notification remains"
 
     static func declined(_ reason: DeclineReason) -> String {
         "[JOIN-PROMPT] declined (\(reason.rawValue))"
