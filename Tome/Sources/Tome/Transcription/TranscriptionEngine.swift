@@ -256,6 +256,19 @@ final class TranscriptionEngine {
     /// call-audio device came back with it.
     private var micReadoptionTask: Task<Void, Never>?
 
+    /// Retry loop for a pinned mic that is present but refused its bind (see
+    /// `micFallbackRetryInterval`). At most one per session; it ends itself
+    /// once the fallback clears and is never cancelled from inside
+    /// `restartMic` — its own attempts run there, same rule as
+    /// `micReadoptionTask`.
+    private var micFallbackRetryTask: Task<Void, Never>?
+
+    /// When the latest config-change notification arrived for each
+    /// AVAudioEngine-backed leg — the rebuild gates ask whether the tap has
+    /// delivered SINCE then (`tapDeliveredSince`).
+    private var micConfigChangeAt: Date?
+    private var systemDeviceConfigChangeAt: Date?
+
     // MARK: Departure signals (forgotten-recording failsafe)
 
     /// Sink for departure signals — evidence the user's context changed
@@ -736,6 +749,33 @@ final class TranscriptionEngine {
         return resolved != currentMicDeviceID
     }
 
+    /// Seconds between attempts to move capture back onto a pinned mic that is
+    /// PRESENT but refused a bind (the emergency-fallback case — a dock's
+    /// device returning HAL 'nope' while its graph settles). Device-list
+    /// re-adoption can't cover this: the pinned device never left the list, so
+    /// no device-list change ever fires (2026-10-07: 63 minutes on a fallback).
+    ///
+    /// Each attempt tears down the fallback mic for a fraction of a second, so
+    /// the cadence depends on what that costs. A fallback delivering only
+    /// digital zeros (the built-in mic with the lid closed) records nothing —
+    /// retry fast. A live fallback is recording the user — back off hard.
+    nonisolated static func micFallbackRetryInterval(attempts: Int, fallbackIsSilent: Bool) -> TimeInterval {
+        let step = Double(max(attempts, 0) + 1)
+        return fallbackIsSilent ? min(5 * step, 15) : min(30 * step, 120)
+    }
+
+    /// Ground-truth gate for a config-change-driven rebuild: has the tap
+    /// delivered a buffer AFTER the change notification? A recency window
+    /// can't answer this — the debounce (1.2s) sits inside it (2s), so a tap
+    /// the change itself stopped always read as "delivering" off its last
+    /// pre-change buffer, and the dead mic waited 15s for the watchdog
+    /// (2026-10-07). A live tap delivers every ~100ms, so the debounce gives
+    /// it ample time to prove itself.
+    nonisolated static func tapDeliveredSince(_ changeAt: Date, lastSample: Date?) -> Bool {
+        guard let lastSample else { return false }
+        return lastSample > changeAt
+    }
+
     /// User-facing text for a system leg that carried no audible content — the
     /// watchdog's 60s warning (`atStop: false`) and ContentView's end-of-session
     /// note (`atStop: true`). Mode-aware: in device mode the exclusion list is
@@ -870,6 +910,18 @@ final class TranscriptionEngine {
         case .fed, .unknown:
             return "\(name) is delivering silence — it may be muted, or the app that provides it (e.g. Wave Link) may not be running."
         }
+    }
+
+    /// The built-in mic with the lid closed is not "maybe muted" — it is off,
+    /// and the hedged `micSilenceText` sent the user looking at Wave Link.
+    /// `retryingSelection`: capture landed here as a fallback and the retry
+    /// loop is still aiming at the user's chosen mic.
+    nonisolated static func micLidClosedText(deviceName: String?, retryingSelection: Bool) -> String {
+        let name = deviceName ?? "The built-in microphone"
+        let base = "\(name) is off while the lid is closed — your side is not being recorded."
+        return retryingSelection
+            ? base + " Tome keeps trying to switch back to your selected microphone; open the lid or pick another microphone in Settings."
+            : base + " Open the lid or pick a different microphone in Settings."
     }
 
     /// The neutral hint for a muted-but-fed mic. Never routed to `lastError`.
@@ -1288,19 +1340,20 @@ final class TranscriptionEngine {
     /// Debounced rebuild of the DEVICE-backed system leg, fired by that capture's
     /// `AVAudioEngineConfigurationChange` / HAL fast path. Mirrors
     /// `scheduleMicRebuild` gate for gate — ground truth (a tap that delivered
-    /// within 2s is alive, the notification was informational), first-delivery
+    /// since the change is alive, the notification was informational), first-delivery
     /// grace (our own rebuild's HAL echo must not trigger a second one), and the
     /// 4-per-minute storm cap that hands recovery back to the stall watchdog.
     private func scheduleSystemDeviceRebuild(reason: String) {
         guard isRunning, systemSourceMode.isDevice else { return }
+        let changeAt = Date()
+        systemDeviceConfigChangeAt = changeAt
         systemDeviceRebuildTask?.cancel()
         systemDeviceRebuildTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1200))
             guard !Task.isCancelled else { return }
             guard let self, self.isRunning, self.systemSourceMode.isDevice else { return }
 
-            if let last = self.systemDeviceCapture.lastSampleTime,
-               Date().timeIntervalSince(last) < 2.0 {
+            if Self.tapDeliveredSince(self.systemDeviceConfigChangeAt ?? changeAt, lastSample: self.systemDeviceCapture.lastSampleTime) {
                 diagLog("[ENGINE-SYSDEV-REBUILD] skipped (\(reason)) — tap is delivering")
                 return
             }
@@ -1586,7 +1639,12 @@ final class TranscriptionEngine {
             if let self {
                 let name = await MicCapture.deviceName(for: self.currentMicDeviceID)
                 let verdict = self.feederVerdict(forDeviceName: name)
-                if case .unfed = verdict {
+                if await self.micIsSilencedByClosedLid() {
+                    // Equally knowable now: a lid-closed built-in mic is off.
+                    self.postMicSilenceWarning(Self.micLidClosedText(
+                        deviceName: name, retryingSelection: self.micFallbackMessage != nil
+                    ))
+                } else if case .unfed = verdict {
                     self.postMicSilenceWarning(Self.micSilenceText(deviceName: name, verdict: verdict))
                 }
             }
@@ -1630,6 +1688,12 @@ final class TranscriptionEngine {
             return
         }
         let name = await MicCapture.deviceName(for: currentMicDeviceID)
+        if await micIsSilencedByClosedLid() {
+            postMicSilenceWarning(Self.micLidClosedText(
+                deviceName: name, retryingSelection: micFallbackMessage != nil
+            ))
+            return
+        }
         let verdict = feederVerdict(forDeviceName: name)
         switch verdict {
         case .fed:
@@ -1637,6 +1701,12 @@ final class TranscriptionEngine {
         case .unfed, .unknown:
             postMicSilenceWarning(Self.micSilenceText(deviceName: name, verdict: verdict))
         }
+    }
+
+    /// The bound mic is the Mac's built-in one and the lid is shut.
+    private func micIsSilencedByClosedLid() async -> Bool {
+        guard MicCapture.isLidClosed() == true else { return false }
+        return await MicCapture.isBuiltInDevice(currentMicDeviceID)
     }
 
     private func postMicSilenceWarning(_ msg: String) {
@@ -1691,16 +1761,17 @@ final class TranscriptionEngine {
     /// leave recovery to the stall watchdog).
     private func scheduleMicRebuild(reason: String) {
         guard isRunning else { return }
+        let changeAt = Date()
+        micConfigChangeAt = changeAt
         micRebuildTask?.cancel()
         micRebuildTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1200))
             guard !Task.isCancelled else { return }
             guard let self, self.isRunning else { return }
 
-            // Gate 1 — ground truth: a tap that delivered within the last 2s is
-            // alive; the notification was informational. Touch nothing.
-            if let last = self.micCapture.lastSampleTime,
-               Date().timeIntervalSince(last) < 2.0 {
+            // Gate 1 — ground truth: a tap that delivered AFTER the latest
+            // change is alive; the notification was informational. Touch nothing.
+            if Self.tapDeliveredSince(self.micConfigChangeAt ?? changeAt, lastSample: self.micCapture.lastSampleTime) {
                 diagLog("[ENGINE-MIC-REBUILD] skipped (\(reason)) — tap is delivering")
                 return
             }
@@ -1854,9 +1925,10 @@ final class TranscriptionEngine {
         case .failure(let bindError):
             let msg = "Mic restart failed: \(Self.bindFailureDetail(bindError))"
             if silent {
-                // Startup-gate fast retry: no user-facing alarm for this attempt.
-                // If the mic truly never binds, the stall watchdog owns the rescue.
-                diagLog("[MIC-STARTGATE] silent restart failed to bind — leaving rescue to the stall watchdog")
+                // Startup-gate fast retry or fallback retry: no user-facing alarm
+                // for this attempt. If the mic truly never binds, the stall
+                // watchdog owns the rescue; a fallback retry just tries again later.
+                diagLog("[MIC-SILENT-RETRY] silent restart failed to bind (\(msg))")
             } else {
                 lastError = msg
                 diagLog("[ENGINE-MIC-SWAP-FAIL] \(msg)")
@@ -1923,6 +1995,13 @@ final class TranscriptionEngine {
                 await reportMicFallback(boundDeviceID: targetMicID)
                 if !wasRaised, micFallbackMessage != nil {
                     emitDeparture(.micRouteChanged)
+                }
+                // Selection PRESENT but we're off it: the bind was refused, not
+                // the device removed. No device-list change will ever re-adopt
+                // it, so keep retrying on our own. (Absent selections stay with
+                // the device-list listener.)
+                if selectionResolvesTo != nil {
+                    scheduleMicFallbackRetry()
                 }
             } else {
                 clearMicFallback()
@@ -2323,6 +2402,57 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Retry loop for the emergency-fallback case (`micFallbackRetryInterval`).
+    /// Ticks every 5s; each tick re-reads whether the fallback is delivering
+    /// real audio, so the cadence follows the mic's actual state. Exits on its
+    /// own when the fallback clears (a successful attempt, a device-list
+    /// re-adoption, or the watchdog surrendering the pin), when the selection
+    /// leaves the device list (the device-list listener owns it from there),
+    /// or when the session ends.
+    ///
+    /// Attempts are `silent`: a failed one rebinds the fallback without a
+    /// notification or `lastError` — the fallback banner already tells the
+    /// story, and re-alarming every few seconds would bury it.
+    private func scheduleMicFallbackRetry() {
+        guard isRunning, micFallbackRetryTask == nil, !userSelectedDeviceUID.isEmpty else { return }
+        let generation = sessionGeneration
+        diagLog("[MIC-RETRY] selected mic is present but refused its bind — retrying it in the background")
+        micFallbackRetryTask = Task { [weak self] in
+            var attempts = 0
+            var lastAttempt = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled, let self else { return }
+                guard generation == self.sessionGeneration, self.isRunning,
+                      self.micFallbackMessage != nil else { break }
+                let interval = Self.micFallbackRetryInterval(
+                    attempts: attempts,
+                    fallbackIsSilent: !self.micCapture.sawNonzeroSample
+                )
+                guard Date().timeIntervalSince(lastAttempt) >= interval else { continue }
+                let selectedUID = self.userSelectedDeviceUID
+                let lookup = await MicCapture.deviceIDResult(forUID: selectedUID)
+                guard generation == self.sessionGeneration else { return }
+                if case .answered(nil) = lookup {
+                    diagLog("[MIC-RETRY] selected mic left the device list — handing off to device-list re-adoption")
+                    break
+                }
+                guard Self.shouldReadoptMicDevice(
+                    isRunning: self.isRunning,
+                    selectedUID: selectedUID,
+                    currentMicDeviceID: self.currentMicDeviceID,
+                    selectionLookup: lookup
+                ) else { continue }
+                attempts += 1
+                lastAttempt = Date()
+                diagLog("[MIC-RETRY] attempt \(attempts) — rebinding the selected mic (fallback silent=\(!self.micCapture.sawNonzeroSample))")
+                await self.restartMic(inputDeviceUID: selectedUID, updateSelection: false, silent: true)
+            }
+            guard let self, generation == self.sessionGeneration else { return }
+            self.micFallbackRetryTask = nil
+        }
+    }
+
     private func ensureMicrophonePermission() async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -2359,6 +2489,8 @@ final class TranscriptionEngine {
         deviceReadoptionTask = nil
         micReadoptionTask?.cancel()
         micReadoptionTask = nil
+        micFallbackRetryTask?.cancel()
+        micFallbackRetryTask = nil
         deviceRemovalCheckTask?.cancel()
         deviceRemovalCheckTask = nil
         inputReleaseShadowTask?.cancel()

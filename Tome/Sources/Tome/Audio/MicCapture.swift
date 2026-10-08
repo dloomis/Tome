@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
+import IOKit
 import ObjCExceptionGuard
 import os
 
@@ -936,6 +937,12 @@ final class MicCapture: @unchecked Sendable {
         await defaultInputDeviceIDResult().value(or: nil)
     }
 
+    /// An unanswered query reads as "not built-in": it only feeds wording and
+    /// warning timing, never a decision about which device to bind.
+    static func isBuiltInDevice(_ deviceID: AudioDeviceID) async -> Bool {
+        await HALQueue.query(label: "device-transport") { isBuiltInDevice(deviceID) }.value(or: false)
+    }
+
     /// See `deviceIDResult(forUID:)` — same distinction for the system default.
     static func defaultInputDeviceIDResult() async -> HALQueryResult<AudioDeviceID?> {
         await HALQueue.query(label: "default-input-device") { defaultInputDeviceID() }
@@ -1055,6 +1062,34 @@ final class MicCapture: @unchecked Sendable {
         var size = UInt32(MemoryLayout<CFString>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
         return status == noErr ? uid as String : nil
+    }
+
+    /// True when the device is the Mac's own hardware (`kAudioDeviceTransportTypeBuiltIn`)
+    /// — the MacBook Pro Microphone, as opposed to USB/Bluetooth/virtual inputs.
+    static func isBuiltInDevice(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport)
+        return status == noErr && transport == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    /// Whether the laptop lid is closed (clamshell mode, e.g. docked to an
+    /// external display). With the lid shut the built-in microphone stays
+    /// enumerated — it can even be the system default — but delivers exact
+    /// digital zeros (2026-10-07: a fallback onto it recorded a whole meeting
+    /// of silence). IOKit registry read, not a HAL call. `nil` = no clamshell
+    /// (desktop Mac) or the property couldn't be read.
+    static func isLidClosed() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+        let value = IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
+        return value?.takeRetainedValue() as? Bool
     }
 
     static func defaultInputDeviceID() -> AudioDeviceID? {
