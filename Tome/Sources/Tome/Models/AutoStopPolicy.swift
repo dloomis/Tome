@@ -51,6 +51,21 @@ struct AutoStopPolicy: Sendable {
         var judgedLegDelivering: Bool
         /// `settings.silenceAutoStopSeconds`; 0 = silence prompt off (and R3 off).
         var silencePromptLimit: Int
+        /// The user's own mic was audible at any point since the previous tick.
+        /// Once the far end has been heard, `silenceSeconds` judges call audio
+        /// alone (desk noise must not hold a finished call open), so by itself
+        /// it reads a user who is talking — giving an update, presenting — as
+        /// silence. R2's premise is that the user walked away, and their voice
+        /// contradicts it: near-end audio blocks and withdraws R2. R3 ignores
+        /// it — it must still catch a forgotten session at a noisy desk.
+        var nearEndAudible: Bool
+        /// Whether departure signals count as evidence right now. False in a
+        /// call capture until the far end has first been heard: route changes
+        /// before the call is live are the conferencing app setting up its
+        /// audio on join (2026-10-23: 11 output-route fires + a device removal
+        /// 13 s into a Teams session), not the user leaving. Signals arriving
+        /// while false are dropped, not deferred.
+        var departuresCredible: Bool
     }
 
     struct Countdown: Equatable, Sendable {
@@ -64,8 +79,11 @@ struct AutoStopPolicy: Sendable {
     }
 
     private(set) var countdown: Countdown?
-    /// Silence the app can vouch for (§3). R2 and R3 read this, never `silenceSeconds`.
+    /// Silence the app can vouch for (§3). R3 reads this, never `silenceSeconds`.
     private(set) var trustedSilenceSeconds: Int = 0
+    /// Trusted silence during which the user's own mic was quiet too. R2 reads
+    /// this: the call being quiet while the user talks is a live meeting.
+    private(set) var departureQuietSeconds: Int = 0
     private var latch: Latch?
     /// Signals arriving at or before this instant are dropped (not deferred).
     private var settleUntil: ContinuousClock.Instant?
@@ -102,7 +120,10 @@ struct AutoStopPolicy: Sendable {
         //    never stopped, not even by a one-second race. A leg that merely
         //    stopped delivering does NOT get this pass, or a wake would
         //    withdraw the countdown it is supposed to complete.
-        if let countdown, now >= countdown.deadline, inputs.silenceSeconds > 0 {
+        //    The user's own voice on this tick gets the same pass for a
+        //    departure countdown, since that is what withdraws one (step 8).
+        if let countdown, now >= countdown.deadline, inputs.silenceSeconds > 0,
+           !(countdown.reason.isDeparture && inputs.nearEndAudible) {
             return fire(countdown.reason)
         }
 
@@ -120,9 +141,16 @@ struct AutoStopPolicy: Sendable {
         } else {
             trustedSilenceSeconds = 0
         }
+        if trustedSilenceSeconds > 0 && !inputs.nearEndAudible {
+            departureQuietSeconds = min(departureQuietSeconds + 1, trustedSilenceSeconds)
+        } else {
+            departureQuietSeconds = 0
+        }
 
-        // 6. Latch signals unless inside the settle window opened by Keep.
-        if let first = signals.first {
+        // 6. Latch signals unless inside the settle window opened by Keep, or
+        //    while departures aren't credible (a call capture before the far
+        //    end is first heard — the join itself moves routes).
+        if let first = signals.first, inputs.departuresCredible {
             let settling = settleUntil.map { now <= $0 } ?? false
             if !settling {
                 let expires = now + .seconds(Self.latchSeconds)
@@ -142,10 +170,12 @@ struct AutoStopPolicy: Sendable {
         }
 
         // 8. Countdown running: audio (or a leg that stopped delivering)
-        //    withdraws it. The latch stays so it can re-arm after a fresh
-        //    `departureSilenceSeconds` of trusted silence.
-        if countdown != nil {
-            if trustedSilenceSeconds == 0 {
+        //    withdraws it — for a departure countdown, the user's own voice
+        //    too. The latch stays so it can re-arm after a fresh
+        //    `departureSilenceSeconds` of quiet.
+        if let running = countdown {
+            let quiet = running.reason.isDeparture ? departureQuietSeconds : trustedSilenceSeconds
+            if quiet == 0 {
                 countdown = nil
                 return .cancelCountdown
             }
@@ -153,7 +183,7 @@ struct AutoStopPolicy: Sendable {
         }
 
         // 9. Arm. A departure reason wins over the catch-all.
-        if let current = latch, trustedSilenceSeconds >= Self.departureSilenceSeconds {
+        if let current = latch, departureQuietSeconds >= Self.departureSilenceSeconds {
             return begin(.departure(current.reason), now: now)
         }
         if inputs.silencePromptLimit > 0,
@@ -172,6 +202,7 @@ struct AutoStopPolicy: Sendable {
         countdown = nil
         latch = nil
         trustedSilenceSeconds = 0
+        departureQuietSeconds = 0
         settleUntil = now + .seconds(Self.settleSeconds)
     }
 
@@ -179,6 +210,7 @@ struct AutoStopPolicy: Sendable {
     mutating func reset() {
         countdown = nil
         trustedSilenceSeconds = 0
+        departureQuietSeconds = 0
         latch = nil
         settleUntil = nil
     }
@@ -222,5 +254,12 @@ struct AutoStopPolicy: Sendable {
     private mutating func begin(_ reason: AutoStopReason, now: ContinuousClock.Instant) -> AutoStopAction {
         countdown = Countdown(reason: reason, deadline: now + .seconds(Self.countdownSeconds))
         return .beginCountdown(reason)
+    }
+}
+
+private extension AutoStopReason {
+    var isDeparture: Bool {
+        if case .departure = self { return true }
+        return false
     }
 }

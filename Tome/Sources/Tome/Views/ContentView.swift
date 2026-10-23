@@ -132,6 +132,9 @@ struct ContentView: View {
     @State private var autoStopPreviousTick: AutoStopPolicy.TickStamp?
     /// `silenceSeconds` as the previous step saw it — see the tick for why.
     @State private var autoStopPreviousSilence = 0
+    /// The mic was audible at some 100 ms poll since the last failsafe tick
+    /// (read-and-cleared there) — so a word between ticks still counts.
+    @State private var autoStopNearEndHeard = false
     /// ControlBar countdown row. Non-nil exactly while a countdown is shown.
     @State private var autoStopLine: String?
     @State private var autoStopRemainingSeconds = 0
@@ -480,6 +483,7 @@ struct ContentView: View {
                     audioLevel = engine.audioLevel
                     let farEnd = engine.farEndAudioLevel
                     if farEnd > SilenceSignal.audibleLevel { farEndHeard = true }
+                    if engine.micAudioLevel > SilenceSignal.audibleLevel { autoStopNearEndHeard = true }
                     silenceLevel = SilenceSignal.level(combined: audioLevel, farEnd: farEnd, farEndHeard: farEndHeard)
                     if silenceLevel > SilenceSignal.audibleLevel {
                         silenceSeconds = 0
@@ -1330,6 +1334,8 @@ struct ContentView: View {
         autoStopPreviousTick = stamp
         let signals = autoStopSignalQueue
         autoStopSignalQueue.removeAll()
+        let nearEndAudible = autoStopNearEndHeard
+        autoStopNearEndHeard = false
 
         // Audio between ticks must read as audio. The 100 ms poll (and
         // handleNewUtterance) zero `silenceSeconds` the moment anything is
@@ -1350,7 +1356,9 @@ struct ContentView: View {
             newSignals: signals,
             silenceSeconds: policySilence,
             judgedLegDelivering: engine.judgedLegIsDelivering(farEndHeard: farEndHeard),
-            silencePromptLimit: settings.silenceAutoStopSeconds
+            silencePromptLimit: settings.silenceAutoStopSeconds,
+            nearEndAudible: nearEndAudible,
+            departuresCredible: activeSessionType != .callCapture || farEndHeard
         ))
         switch action {
         case .none:
@@ -1444,6 +1452,7 @@ struct ContentView: View {
         autoStopSignalQueue.removeAll()
         autoStopPreviousTick = nil
         autoStopPreviousSilence = 0
+        autoStopNearEndHeard = false
         if autoStopLine != nil || autoStopPanel.isVisible {
             tearDownAutoStopSurfaces()
         }

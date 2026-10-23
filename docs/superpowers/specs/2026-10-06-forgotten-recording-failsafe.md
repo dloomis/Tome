@@ -125,6 +125,23 @@ what we are measuring.
 
 R2 and R3 both read `trusted`, never `silenceSeconds`. R1 reads neither.
 
+**Amendment 2026-10-23 (field incident).** In a live Teams call the R2
+countdown fired four times in five minutes and was cancelled each time by the
+next far-end speaker. Two gaps in the premise "a departure plus silence is not
+what a live meeting looks like":
+
+1. *The user talking is not silence.* Once `farEndHeard`, the judged leg is the
+   far end alone, so the user's own 20 s update counted as trusted silence. R2
+   now reads `departureQuietSeconds` — trusted silence during which the mic was
+   also quiet (`Inputs.nearEndAudible`, latched by the 100 ms poll between
+   ticks) — and near-end audio withdraws a departure countdown (including on
+   its deadline tick). R3 is unchanged: it must still catch a forgotten session
+   at a desk whose mic picks up typing.
+2. *Joining a call moves routes.* 13 s into the session, Teams joining fired 11
+   default-output changes and an input-device removal, latching a departure for
+   five minutes. In a call capture, signals are now dropped (not deferred) until
+   the far end is first heard (`Inputs.departuresCredible`). R1 is unaffected.
+
 ### 4. `AutoStopPolicy` — a pure reducer ⚠
 
 `Models/AutoStopPolicy.swift`, same shape as `SessionTypeResolver`: no clocks,

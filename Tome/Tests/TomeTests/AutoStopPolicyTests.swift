@@ -23,6 +23,7 @@ struct AutoStopPolicyTests {
         var delivering = true
         var enabled = true
         var limit = 120
+        var credible = true
 
         var now: ContinuousClock.Instant { base + .seconds(t) }
 
@@ -33,7 +34,8 @@ struct AutoStopPolicyTests {
             gap: Int = 1,
             signals: [DepartureSignal] = [],
             silent: Bool = true,
-            silenceOverride: Int? = nil
+            silenceOverride: Int? = nil,
+            nearEnd: Bool = false
         ) -> AutoStopAction {
             t += gap
             if let silenceOverride {
@@ -48,14 +50,18 @@ struct AutoStopPolicyTests {
                 newSignals: signals,
                 silenceSeconds: silence,
                 judgedLegDelivering: delivering,
-                silencePromptLimit: limit
+                silencePromptLimit: limit,
+                nearEndAudible: nearEnd,
+                departuresCredible: credible
             ))
         }
 
-        /// `n` ordinary 1 s ticks; returns every action in order.
+        /// `n` ordinary 1 s ticks; returns every action in order. `nearEnd`
+        /// is the user's own mic: audible, but (once the far end has been
+        /// heard) not something that resets the app's silence counter.
         @discardableResult
-        mutating func ticks(_ n: Int, silent: Bool = true) -> [AutoStopAction] {
-            (0..<n).map { _ in tick(silent: silent) }
+        mutating func ticks(_ n: Int, silent: Bool = true, nearEnd: Bool = false) -> [AutoStopAction] {
+            (0..<n).map { _ in tick(silent: silent, nearEnd: nearEnd) }
         }
 
         /// The user's Keep Recording: policy override + the caller zeroing
@@ -560,6 +566,122 @@ struct AutoStopPolicyTests {
         #expect(h.policy.latchExpiry == h.base + .seconds(601))
     }
 
+    // MARK: - 14. The user's own voice (2026-10-23 incident)
+
+    @Test func userTalkingAfterDepartureNeverArmsR2() {
+        // Far end quiet while the user gives a long update: trusted silence
+        // climbs (call audio alone is judged), but this is a live meeting.
+        var h = Harness()
+        h.tick(signals: [.outputRouteChanged], nearEnd: true)
+        #expect(allNone(h.ticks(120, nearEnd: true)))
+        #expect(h.policy.trustedSilenceSeconds == 121)
+        #expect(h.policy.departureQuietSeconds == 0)
+        #expect(h.policy.latchedSignal == .outputRouteChanged)
+    }
+
+    @Test func userPausingBetweenSentencesDoesNotAccumulate() {
+        // Speech with short breaths: quiet never runs 20 s, so nothing arms.
+        var h = Harness()
+        h.tick(signals: [.outputRouteChanged])
+        for _ in 0..<10 {
+            #expect(allNone(h.ticks(15, nearEnd: true)))
+            #expect(allNone(h.ticks(5)))
+        }
+    }
+
+    @Test func departureQuietArmsOnceTheUserStopsTalkingToo() {
+        var h = Harness()
+        h.tick(signals: [.displayRemoved], nearEnd: true)
+        h.ticks(30, nearEnd: true)
+        let actions = h.ticks(20)
+        #expect(allNone(Array(actions.dropLast())))
+        #expect(actions.last == .beginCountdown(.departure(.displayRemoved)))
+    }
+
+    @Test func userSpeakingDuringDepartureCountdownCancelsIt() {
+        var h = Harness()
+        h.tick(signals: [.screenLocked])
+        #expect(h.ticks(19).last == .beginCountdown(.departure(.screenLocked)))
+        #expect(allNone(h.ticks(10)))
+        #expect(h.tick(nearEnd: true) == .cancelCountdown)
+        #expect(h.policy.countdown == nil)
+        #expect(h.policy.latchedSignal == .screenLocked)
+    }
+
+    @Test func userSpeakingOnTheDeadlineTickCancelsInsteadOfStopping() {
+        var h = Harness()
+        h.tick(signals: [.screenLocked])
+        h.ticks(19)
+        #expect(allNone(h.ticks(29)))
+        #expect(h.tick(nearEnd: true) == .cancelCountdown)
+    }
+
+    @Test func r3StillJudgesCallAudioAlone() {
+        // R3 must still catch a forgotten session at a desk with mic noise.
+        var h = Harness()
+        h.limit = 120
+        let actions = h.ticks(720, nearEnd: true)
+        #expect(allNone(Array(actions.dropLast())))
+        #expect(actions.last == .beginCountdown(.unansweredSilence))
+        #expect(h.tick(nearEnd: true) == .none)   // mic doesn't withdraw R3
+    }
+
+    // MARK: - 15. Departures before the call is live
+
+    @Test func signalsBeforeTheCallIsLiveAreDroppedNotDeferred() {
+        var h = Harness()
+        h.credible = false
+        h.tick(signals: Array(repeating: .outputRouteChanged, count: 11))
+        h.tick(signals: [.audioDeviceRemoved])
+        #expect(allNone(h.ticks(60)))
+        #expect(h.policy.latchedSignal == nil)
+        h.credible = true   // far end heard
+        #expect(allNone(h.ticks(60)))
+        #expect(h.policy.latchedSignal == nil)
+    }
+
+    @Test func shortSleepBeforeTheCallIsLiveDoesNotLatch() {
+        var h = Harness()
+        h.credible = false
+        h.tick(gap: 60)
+        #expect(h.policy.latchedSignal == nil)
+    }
+
+    @Test func longSleepStopsEvenBeforeTheCallIsLive() {
+        var h = Harness()
+        h.credible = false
+        #expect(h.tick(gap: 600) == .stop(.slept(seconds: 600)))
+    }
+
+    @Test func signalsAfterTheCallIsLiveStillLatch() {
+        var h = Harness()
+        h.credible = false
+        h.ticks(10)
+        h.credible = true
+        h.tick(signals: [.outputRouteChanged])
+        #expect(h.policy.latchedSignal == .outputRouteChanged)
+    }
+
+    @Test func incidentReplay20261023() {
+        // Teams join 13 s in (route burst + device removal), 20 s of lobby
+        // silence, far end first heard at ~80 s, then the user's update with
+        // the far end quiet. Logged four countdowns; must log none.
+        var h = Harness()
+        h.credible = false
+        h.ticks(13, silent: false, nearEnd: true)
+        h.tick(signals: Array(repeating: .outputRouteChanged, count: 11))
+        h.ticks(2)
+        h.tick(signals: [.audioDeviceRemoved])
+        #expect(allNone(h.ticks(60)))            // pre-join silence
+        h.credible = true
+        #expect(allNone(h.ticks(5, silent: false)))  // "All right, let's get started"
+        #expect(allNone(h.ticks(25, nearEnd: true))) // the user's update
+        #expect(allNone(h.ticks(10, silent: false)))
+        #expect(allNone(h.ticks(30, nearEnd: true)))
+        #expect(h.policy.latchedSignal == nil)
+        #expect(h.policy.countdown == nil)
+    }
+
     // MARK: - reset
 
     @Test func resetClearsEverything() {
@@ -571,6 +693,7 @@ struct AutoStopPolicyTests {
         h.policy.reset()
         #expect(h.policy.countdown == nil)
         #expect(h.policy.trustedSilenceSeconds == 0)
+        #expect(h.policy.departureQuietSeconds == 0)
         #expect(h.policy.latchedSignal == nil)
         #expect(h.policy.latchExpiry == nil)
         // Settle window gone too: an immediate signal latches.

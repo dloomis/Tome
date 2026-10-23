@@ -65,6 +65,9 @@ final class TranscriptionEngine {
     /// Level of the "Them" leg alone (whichever source is bound) — the silence
     /// stop-confirmation judges this once the far end has been heard, so mic
     /// noise after a call ends can't keep the session alive (`SilenceSignal`).
+    /// The mic leg alone — the user's own voice, on the same scale.
+    var micAudioLevel: Float { micCapture.audioLevel }
+
     var farEndAudioLevel: Float {
         max(systemCapture.audioLevel, systemDeviceCapture.audioLevel)
     }
