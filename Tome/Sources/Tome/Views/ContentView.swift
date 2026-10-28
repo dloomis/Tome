@@ -1300,6 +1300,7 @@ struct ContentView: View {
         silencePromptActive = true
         let elapsed = silenceSeconds
         let farEnd = farEndHeard
+        diagLog("[SILENCE] stop prompt raised silence=\(elapsed)s farEndOnly=\(farEnd)")
         Task { await NotificationPresenter.shared.postSilencePrompt(silentForSeconds: elapsed, farEndOnly: farEnd) }
     }
 
@@ -1745,7 +1746,11 @@ struct ContentView: View {
                     inputDeviceUID: settings.inputDeviceUID,
                     recordingContext: recordingContext,
                     excludedAudioAppIDs: settings.excludedAudioAppIDs,
-                    systemAudioSourceUID: settings.systemAudioSourceUID
+                    systemAudioSourceUID: settings.systemAudioSourceUID,
+                    warnOnSilentSystemLeg: mode.warnsOnSilentSystemLeg(
+                        hasMeetingEvidence: hadMeetingEvidence,
+                        nativeConferencingAppAtStart: nativeConferencingApp
+                    )
                 )
             } else {
                 // Voice memos / in-person meetings are mic-only: skip system-audio

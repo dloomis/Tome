@@ -325,7 +325,8 @@ final class TranscriptionEngine {
         recordingContext: SessionRecordingContext? = nil,
         captureSystemAudio: Bool = true,
         excludedAudioAppIDs: [String] = [],
-        systemAudioSourceUID: String = ""
+        systemAudioSourceUID: String = "",
+        warnOnSilentSystemLeg: Bool = true
     ) async {
         diagLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning else { return }
@@ -585,7 +586,7 @@ final class TranscriptionEngine {
         // delivering (device pulled, HAL wedge) is silent loss of the user's own
         // side, and flowing system audio masks it from the level-based silence
         // detection entirely.
-        startCaptureWatchdog(systemLegActive: sysStream != nil)
+        startCaptureWatchdog(systemLegActive: sysStream != nil, warnOnSilentSystemLeg: warnOnSilentSystemLeg)
 
         let modelName = await asrCoordinator.activeModel?.displayName ?? "ASR"
         assetStatus = "Transcribing (\(modelName))"
@@ -2607,7 +2608,7 @@ final class TranscriptionEngine {
     /// (the Tome window is usually hidden behind the meeting app exactly when this
     /// matters). A stalled mic additionally gets one automatic restart attempt per
     /// stall episode.
-    private func startCaptureWatchdog(systemLegActive: Bool) {
+    private func startCaptureWatchdog(systemLegActive: Bool, warnOnSilentSystemLeg: Bool) {
         sysWatchdogTask?.cancel()
         let sysCapture = systemCapture
         let sysDeviceCapture = systemDeviceCapture
@@ -2654,7 +2655,10 @@ final class TranscriptionEngine {
                 // unfed mixer device. One warning per session at +60s with zero
                 // audible buffers; deliberately not the 8s startup-gate window,
                 // where a quiet meeting join would false-alarm every time.
-                if systemLegActive, !postedSystemSilent,
+                // Skipped for an `.auto` session with no call evidence at start
+                // (`RecordingMode.warnsOnSilentSystemLeg`): there a silent leg
+                // is the expected shape of an in-person conversation.
+                if systemLegActive, warnOnSilentSystemLeg, !postedSystemSilent,
                    now.timeIntervalSince(watchdogStart) >= 60,
                    (deviceMode ? sysDeviceCapture.audibleBufferCount : sysCapture.audibleBufferCount) == 0 {
                     postedSystemSilent = true

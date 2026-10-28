@@ -128,6 +128,26 @@ enum SessionTypeResolution: Equatable, Sendable {
     }
 }
 
+extension RecordingMode {
+    /// Whether the watchdog's mid-session "no system audio detected" warning
+    /// (+60s, zero audible buffers) should fire — the live twin of
+    /// `suppressesSilentLegNote`, decided from what is known at start.
+    ///
+    /// An `.auto` session with no call evidence at start is, until proven
+    /// otherwise, an in-person conversation or memo: a silent "Them" leg is the
+    /// expected outcome, and warning about it mid-recording reads as Tome
+    /// complaining the meeting is silent (incident 2026-10-27). With a meeting
+    /// name or a native conferencing app at start, a silent leg is the "is my
+    /// mix wired?" case and still warns, as does an explicit call capture.
+    func warnsOnSilentSystemLeg(hasMeetingEvidence: Bool, nativeConferencingAppAtStart: Bool) -> Bool {
+        switch self {
+        case .callCapture: return true
+        case .voiceMemo: return false
+        case .auto: return hasMeetingEvidence || nativeConferencingAppAtStart
+        }
+    }
+}
+
 /// Stop-time resolution of an `.auto` session's type. Pure — no engine access;
 /// `ContentView.stopSession` assembles the evidence and calls this before
 /// building the `SessionHandle`. Same house style as

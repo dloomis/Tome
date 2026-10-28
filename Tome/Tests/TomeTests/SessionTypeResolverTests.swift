@@ -373,6 +373,18 @@ struct SessionTypeResolverTests {
         #expect(!SessionTypeResolution.call(reason: .legUnavailable).suppressesSilentLegNote)
     }
 
+    @Test func midSessionSilentLegWarningNeedsCallEvidenceInAutoMode() {
+        // Incident 2026-10-27: an auto session recording an in-person
+        // conversation got "no system audio detected" 60s in. With no meeting
+        // name and no conferencing app at start, a silent leg is expected.
+        #expect(!RecordingMode.auto.warnsOnSilentSystemLeg(hasMeetingEvidence: false, nativeConferencingAppAtStart: false))
+        #expect(RecordingMode.auto.warnsOnSilentSystemLeg(hasMeetingEvidence: true, nativeConferencingAppAtStart: false))
+        #expect(RecordingMode.auto.warnsOnSilentSystemLeg(hasMeetingEvidence: false, nativeConferencingAppAtStart: true))
+        // Explicit modes ignore evidence.
+        #expect(RecordingMode.callCapture.warnsOnSilentSystemLeg(hasMeetingEvidence: false, nativeConferencingAppAtStart: false))
+        #expect(!RecordingMode.voiceMemo.warnsOnSilentSystemLeg(hasMeetingEvidence: true, nativeConferencingAppAtStart: true))
+    }
+
     // MARK: - RecordingMode
 
     @Test func explicitSessionTypeMapping() {

@@ -262,6 +262,11 @@ companion before choosing `preserveYou`. Schema 2 sidecars must keep decoding.
   outcome, not a fault. It still fires for `.call(.meetingEvidence)` /
   `.call(.conferencingApp)` with a silent leg (that IS the "is my mix wired?"
   case) and for explicit call captures.
+- The watchdog's **mid-session** twin (+60s "no system audio detected") follows
+  the same logic from start-time evidence (`RecordingMode.warnsOnSilentSystemLeg`):
+  an `.auto` session warns only with a meeting name or a native conferencing
+  app at start. Without either, a silent leg is the expected shape of an
+  in-person conversation (incident 2026-10-27, missed in the original §7).
 - **Settings ▸ Output**: `Record button: Single (auto-detect) | Call Capture +
   Voice Memo`, default Single. The split layout is today's UI verbatim — a
   one-toggle rollback with no code removed.
