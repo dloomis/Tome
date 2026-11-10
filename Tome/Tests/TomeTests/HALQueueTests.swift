@@ -24,6 +24,30 @@ struct HALQueueTests {
         #expect(!HALQueue.isWedged)
     }
 
+    /// Incident 2026-11-10: a Bluetooth headset (WH-1000XM4) needs 6–9s to
+    /// bind while it renegotiates A2DP→HFP. Under the 5s default every start
+    /// failed one second before the bind succeeded. The mic deadline must
+    /// clear the slowest observed healthy bind (9.1s) with real margin.
+    @Test func micBindDeadlineOutlastsABluetoothHeadsetBind() {
+        #expect(HALQueue.micBindDeadline >= .seconds(15))
+        #expect(HALQueue.micBindDeadline > HALQueue.defaultDeadline)
+    }
+
+    @Test func aSlowButHealthyBindCompletesInsideALongerDeadline() async {
+        // The same work that times out under a short deadline is a plain
+        // success under one that covers it — slow is not wedged.
+        let outcome = await HALQueue.run(label: "test-slow-healthy", deadline: .seconds(5)) { () -> Int in
+            Thread.sleep(forTimeInterval: 0.3)
+            return 9
+        }
+        guard case .completed(let value) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(value == 9)
+        #expect(!HALQueue.isWedged)
+    }
+
     @Test func slowWorkTimesOutLatchesRefusesThenClears() async throws {
         // Fault injection: a "bind" that blocks past the deadline, standing in
         // for AVAudioEngine.start() against a wedged driver.

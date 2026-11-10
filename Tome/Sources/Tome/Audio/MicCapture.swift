@@ -34,6 +34,16 @@ final class MicCapture: @unchecked Sendable {
     /// time. Only touched from the HAL queue (2026-07-25 hang fix — bind and
     /// teardown both run there; the main actor must never wait on a HAL call).
     private var engine = AVAudioEngine()
+
+    /// How long `bufferStream` waits for the HAL bring-up before abandoning
+    /// it. Per instance because the two legs have different alternatives —
+    /// see `HALQueue.micBindDeadline`.
+    private let bindDeadline: Duration
+
+    init(bindDeadline: Duration = HALQueue.defaultDeadline) {
+        self.bindDeadline = bindDeadline
+    }
+
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
 
@@ -269,7 +279,7 @@ final class MicCapture: @unchecked Sendable {
     ///
     /// The bring-up runs on the HAL queue with a deadline (2026-07-25 hang
     /// fix): a driver that wedges `engine.start()` costs the caller a
-    /// `.timedOut` after ~5s instead of freezing its actor forever. A
+    /// `.timedOut` after `bindDeadline` instead of freezing its actor forever. A
     /// timed-out bind is torn down and its engine parked the moment the driver
     /// releases it (`teardownAbandonedBind`); until then every further HAL
     /// call fails fast with `.halWedged`.
@@ -281,6 +291,7 @@ final class MicCapture: @unchecked Sendable {
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         let outcome = await HALQueue.run(
             label: "capture-bind",
+            deadline: bindDeadline,
             work: { self.performBind(continuation: continuation, deviceID: deviceID, recordOutputURL: recordOutputURL, adoptExistingRecording: adoptExistingRecording) },
             onAbandoned: { setupError in
                 self.teardownAbandonedBind(continuation: continuation, setupError: setupError)

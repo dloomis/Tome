@@ -65,6 +65,18 @@ enum HALQueue {
     /// "Start" to respond.
     static let defaultDeadline: Duration = .seconds(5)
 
+    /// Deadline for binding the MICROPHONE leg. Longer than the default
+    /// because slow is not wedged: a Bluetooth headset has to renegotiate
+    /// A2DP→HFP before it can deliver input, and that bind takes a steady
+    /// 6–9s (incident 2026-11-10 — a WH-1000XM4 bound successfully at ~6.07s
+    /// on every one of 13 attempts, each one second after the 5s deadline had
+    /// already failed the start and thrown the working capture away). The mic
+    /// has no HAL-free alternative, so giving up early buys nothing — the only
+    /// way to record is to wait for the driver. The device-backed system leg
+    /// keeps the short default: it has SCK to fall back to, and every second
+    /// spent waiting there is far-end audio not captured.
+    static let micBindDeadline: Duration = .seconds(20)
+
     /// Which serial lane an operation runs on. Each lane has its own queue and
     /// its own wedge latch — a wedge on one must not disable the other.
     enum Lane: Sendable {

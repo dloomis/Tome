@@ -43,7 +43,7 @@ final class TranscriptionEngine {
     var lastError: String?
 
     private let systemCapture = SystemAudioCapture()
-    private let micCapture = MicCapture()
+    private let micCapture = MicCapture(bindDeadline: HALQueue.micBindDeadline)
 
     /// Device-backed system leg ("lean-in" mode): when the user points the call
     /// audio source at a mixer's virtual input device, the "Them" leg is captured
@@ -447,9 +447,13 @@ final class TranscriptionEngine {
             SessionSidecar.emit(forWAV: micURL, context: ctx, sampleRate: 48_000)
         }
 
+        // A Bluetooth headset takes 6–9s to bind (A2DP→HFP); say what the wait
+        // is so the button doesn't look dead. Not "Loading…"/"Initializing…" —
+        // the API string-matches those.
+        assetStatus = "Connecting to microphone…"
         let micBind = await micCapture.bufferStream(deviceID: targetMicID, recordOutputURL: currentMicBufferURL)
 
-        // The bind now suspends (HAL queue + 5s deadline — 2026-07-25 hang
+        // The bind now suspends (HAL queue + deadline — 2026-07-25 hang
         // fix); a stop() could have run while it was in flight.
         guard isRunning else {
             diagLog("[ENGINE-3-ABORT] stopped during mic bind — unwinding")
